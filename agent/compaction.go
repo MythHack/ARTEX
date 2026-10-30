@@ -518,13 +518,13 @@ func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByI
 		MaxTokens: 1500,
 		Thinking:  "disabled",
 	}
-	msg, _, _, err := c.prov.Complete(ctx, req)
+	msg, stopReason, usage, err := c.prov.Complete(ctx, req)
 	if err != nil {
 		return "", err
 	}
 	body := strings.TrimSpace(msg.Text())
 	if body == "" {
-		return "", fmt.Errorf("empty body from model")
+		return "", fmt.Errorf("empty body from model (stop_reason=%q, output_tokens=%d, requested_max_tokens=%d)", stopReason, usage.OutputTokens, req.MaxTokens)
 	}
 	return body, nil
 }
