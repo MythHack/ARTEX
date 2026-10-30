@@ -146,6 +146,9 @@ func (c *Compactor) maintain(ts *db.ExplorationStore) (round int64, uncompressed
 // minor folds the not-yet-covered eligible-cold set into new digest segments
 // (tiered append, §5). Existing digests are untouched.
 func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
+	if ctx.Err() != nil {
+		return
+	}
 	round, err := ts.RoundNo()
 	if err != nil {
 		return
@@ -179,7 +182,13 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 		return // this batch has no ≥2 connected/shared-parent block — nothing to fold (§7)
 	}
 	for _, b := range blocks {
+		if ctx.Err() != nil {
+			return
+		}
 		c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, nil))
+	}
+	if ctx.Err() != nil {
+		return
 	}
 	// A minor may have pushed the segment count over M → merge in the same run.
 	if ad, e := ts.ActiveDigests(); e == nil && len(ad) >= c.m {
@@ -193,6 +202,9 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 // new/changed blocks are compressed afresh. This is where tiered fragments of one
 // direction merge and where "later became connected" blocks unify (§5.2).
 func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
+	if ctx.Err() != nil {
+		return
+	}
 	round, err := ts.RoundNo()
 	if err != nil {
 		return
@@ -241,10 +253,16 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 			stale = append(stale, d.ID)
 		}
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	if err := ts.SupersedeDigests(stale); err != nil {
 		log.Printf("[compaction] supersede exp=%d: %v", ts.ID(), err)
 	}
 	for _, b := range toCreate {
+		if ctx.Err() != nil {
+			return
+		}
 		c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, active))
 	}
 }
@@ -254,6 +272,9 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 // changed, so any member that has since gone hot (revived) is dropped from the
 // covers set. If the block dissolves below K it is skipped.
 func (c *Compactor) foldBlock(ctx context.Context, ts *db.ExplorationStore, g *coldGraph, b block, nodeByID map[int64]*db.Node, cvers map[int64]int, generation int) {
+	if ctx.Err() != nil {
+		return
+	}
 	body, err := c.compress(ctx, g, b, nodeByID)
 	if err != nil {
 		log.Printf("[compaction] compress exp=%d block=%v: %v", ts.ID(), b.Members, err)
@@ -276,6 +297,9 @@ func (c *Compactor) foldBlock(ctx context.Context, ts *db.ExplorationStore, g *c
 	}
 	final := block{Members: members, Anchors: b.Anchors}
 	payload := digestPayload(body, final, nodeByID, generation, blockSignature(final, cvers))
+	if ctx.Err() != nil {
+		return
+	}
 	if _, err := ts.AddDigest(payload, members); err != nil {
 		log.Printf("[compaction] add digest exp=%d: %v", ts.ID(), err)
 	}
@@ -510,8 +534,11 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 }
 
 // compress runs the §4 body LLM call on one block. Uses the same model the agent
-// runs on; thinking disabled (a pure summarization step).
+// runs on; requests thinking disabled (adapter support varies).
 func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByID map[int64]*db.Node) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	req := llm.CompletionRequest{
 		System:    []string{compressionSystemPrompt},
 		Messages:  []llm.Message{llm.UserText(buildCompressionInput(g, b, nodeByID))},
@@ -521,6 +548,14 @@ func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByI
 	msg, stopReason, usage, err := c.prov.Complete(ctx, req)
 	if err != nil {
 		return "", err
+	}
+	// A provider can finish concurrently with cancellation, or ignore it. Never
+	// accept that late result for persistence or treat a truncated summary as final.
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if stopReason == "max_tokens" {
+		return "", fmt.Errorf("incomplete model response: output token limit reached (stop_reason=%q, output_tokens=%d, requested_max_tokens=%d)", stopReason, usage.OutputTokens, req.MaxTokens)
 	}
 	body := strings.TrimSpace(msg.Text())
 	if body == "" {
