@@ -529,6 +529,7 @@ export interface Finding {
   summary: string;
   evidence: string;
   report?: string; // 详细报告(Markdown);仅详情接口返回,列表为空
+  report_conversation_id?: number;
   intent_id?: string;
   param_id?: string;
   task_id?: string;
