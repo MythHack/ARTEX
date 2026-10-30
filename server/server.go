@@ -3553,6 +3553,9 @@ func (s *Server) settingsPayload() map[string]any {
 		// 实验功能:noa 模型驱动上下文压缩(默认关)。开启后平台接入的四类 agent 由 noa
 		// 接管上下文压缩,取代内置 compaction;每 run 读一次,对之后启动的 run 生效。
 		"noa_compaction": s.m.NoaCompactionEnabled(),
+		// 改完即对下一次压缩生效,无需重建 agent。
+		"compaction_max_tokens": s.m.CompactionMaxTokens(),
+		"compaction_thinking":   s.m.CompactionThinking(),
 		// 漏洞 IM 推送的全局项。渠道本身是独立资源，走 /api/notify/* 管理；
 		// 这里只放「作用于全部渠道」的三项。
 		"notify_enabled":             s.m.pg.GetBool(settingNotifyEnabled, true),
@@ -3635,6 +3638,10 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		ConstraintsInjectWorker  *bool `json:"constraints_inject_worker"`
 		// 实验功能:noa 上下文压缩开关(默认关);每 run 读,对之后启动的 run 生效,无需重建 agent。
 		NoaCompaction *bool `json:"noa_compaction"`
+		// 内置 compaction 的 body 调用预算(输出上限/思考模式);每次 compress 调用
+		// 都重读,改完即对下一次压缩生效,无需重建 agent。
+		CompactionMaxTokens *int    `json:"compaction_max_tokens"`
+		CompactionThinking  *string `json:"compaction_thinking"`
 		// 漏洞 IM 推送的全局项。三者都由投递引擎每轮读一次，改完即时生效，
 		// 不需要重建 agent 或重启。
 		NotifyEnabled    *bool   `json:"notify_enabled"`
@@ -3661,6 +3668,19 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		// 每 run 读的解析器,切换即时对之后启动的 run 生效,无需 applyLLM 重建。
 		if err := s.m.SetNoaCompaction(*req.NoaCompaction); err != nil {
 			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.CompactionMaxTokens != nil {
+		// 校验/入库都在 Manager;compactor 每次 compress 都重读,无需 applyLLM 重建。
+		if err := s.m.SetCompactionMaxTokens(*req.CompactionMaxTokens); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+	}
+	if req.CompactionThinking != nil {
+		if err := s.m.SetCompactionThinking(*req.CompactionThinking); err != nil {
+			writeErr(w, 400, err.Error())
 			return
 		}
 	}

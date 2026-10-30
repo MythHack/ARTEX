@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 // Settings is a tiny key-value store for global app config the UI toggles at
@@ -93,4 +95,22 @@ func (d *DB) SetBool(key string, val bool) error {
 		return d.SetSetting(key, "true")
 	}
 	return d.SetSetting(key, "false")
+}
+
+// GetInt returns the integer setting, or def when unset/unparseable.
+func (d *DB) GetInt(key string, def int) int {
+	v, ok, err := d.GetSetting(key)
+	if err != nil || !ok {
+		return def
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// SetInt stores an integer setting.
+func (d *DB) SetInt(key string, val int) error {
+	return d.SetSetting(key, strconv.Itoa(val))
 }

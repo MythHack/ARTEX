@@ -34,7 +34,9 @@ func TestCompactionRejectsReasoningOnlyTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Reproduce the old hard-wired 1500 cap so the diagnostic numbers stay pinned.
 	c := NewCompactor(prov, "fixture-model")
+	c.SetBodyBudget(func() int { return 1500 }, nil)
 	body, err := c.compress(context.Background(), &coldGraph{}, block{}, nil)
 	if err == nil || body != "" {
 		t.Fatalf("body=%q err=%v; expected an empty-body diagnostic", body, err)
@@ -60,7 +62,10 @@ func TestCompactionRejectsTruncatedText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err := NewCompactor(prov, "fixture").compress(t.Context(), &coldGraph{}, block{}, nil)
+	// Same: cap the call at the output the fixture burned.
+	c2 := NewCompactor(prov, "fixture")
+	c2.SetBodyBudget(func() int { return 1500 }, nil)
+	body, err := c2.compress(t.Context(), &coldGraph{}, block{}, nil)
 	if err == nil || body != "" {
 		t.Fatalf("truncated text accepted: body=%q err=%v", body, err)
 	}
