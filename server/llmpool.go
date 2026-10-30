@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"log"
 	"time"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/norma/llm"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // LLM 轮询(故障转移)的服务端接线。设计见 docs/LLM轮询设计.md：
@@ -15,6 +17,16 @@ import (
 //   - 绑定/pin 的路径默认独占该配置,失败即失败(可由 llm_pool_bind_fallback 打开兜底);
 //   - 链序 = 激活配置 → 其余按 priority DESC,排除 pool_exclude 的;
 //   - 熔断状态进程级共享(s.llmHealth),重建 pool 不清空。
+
+// isProfileRowGone reports whether err is the FK violation from persisting
+// circuit-breaker state for a profile that has been deleted (SQLSTATE 23503 on
+// llm_profile_health_profile_id_fkey). The running in-memory chain may keep
+// reporting against the ghost id until it is rebuilt; the row was already
+// cascaded away, so there is nothing left to persist.
+func isProfileRowGone(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503"
+}
 
 // newLLMHealthRegistry builds the process-wide circuit-breaker registry, mirroring
 // state into PG so a cooling-off window survives a restart. Writes are async and
@@ -31,6 +43,11 @@ func newLLMHealthRegistry(pg *db.DB) *llmpool.Registry {
 		}
 		go func() {
 			if err := pg.SaveLLMHealth(h); err != nil {
+				// 删除 LLM 配置后,运行中任务的内存在链仍会按旧 id 上报熔断;
+				// 该行已被 FK 级联清掉,状态无处落也无需落 — 静默丢弃,不刷屏。
+				if isProfileRowGone(err) {
+					return
+				}
 				log.Printf("[llmpool] 熔断状态落库失败: %v", err)
 			}
 		}()

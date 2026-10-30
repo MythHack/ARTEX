@@ -20,14 +20,13 @@ func TestChatUnavailableReasonDistinguishesStates(t *testing.T) {
 	td := t.TempDir()
 	s := New(context.Background(), m, td, td, td)
 
-	// Start from a clean profile table; other tests in the shared DB may have left rows.
-	existing, _ := m.pg.ListProfiles()
-	for _, p := range existing {
-		if p.IsDefault {
-			// The active profile cannot be deleted directly; clear the flag first.
-			_, _ = m.pg.Exec(`UPDATE llm_profiles SET is_default=false WHERE id=$1`, p.ID)
-		}
-		_ = m.pg.DeleteProfile(p.ID)
+	// This test must observe a genuinely empty profile table. That precondition
+	// is NOT ours to create: an earlier revision wiped every pre-existing row
+	// here and, run against a live database, deleted an operator's real LLM
+	// profiles (2026-10-30 incident). Skip instead — CI's fresh DB still runs
+	// the test, a shared/live database is left untouched.
+	if existing, _ := m.pg.ListProfiles(); len(existing) > 0 {
+		t.Skipf("llm_profiles has %d row(s); refusing to wipe a shared database", len(existing))
 	}
 
 	if reason := s.chatUnavailableReason(); !strings.Contains(reason, "尚未配置") {
@@ -38,10 +37,18 @@ func TestChatUnavailableReasonDistinguishesStates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_, _ = m.pg.Exec(`UPDATE llm_profiles SET is_default=false WHERE id=$1`, id)
-		_ = m.pg.DeleteProfile(id)
-	})
+	// defer (NOT t.Cleanup): t.Cleanup runs after the test's deferred m.Close(),
+	// so the original cleanup silently hit "database is closed" and leaked this
+	// fixture on every run — on a live install that leak looked like a real
+	// (bogus) default profile. A defer registered after m.Close's runs first.
+	defer func() {
+		if _, err := m.pg.Exec(`UPDATE llm_profiles SET is_default=false WHERE id=$1`, id); err != nil {
+			t.Errorf("cleanup deactivate fixture #%d: %v", id, err)
+		}
+		if err := m.pg.DeleteProfile(id); err != nil {
+			t.Errorf("cleanup delete fixture #%d: %v", id, err)
+		}
+	}()
 
 	// Profile exists but is not activated.
 	if reason := s.chatUnavailableReason(); !strings.Contains(reason, "没有已激活") {
@@ -81,7 +88,12 @@ func TestResolveChatAgentHonoursConversationProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = m.pg.DeleteProfile(id) })
+	// defer, not t.Cleanup — same close-ordering reason as above.
+	defer func() {
+		if err := m.pg.DeleteProfile(id); err != nil {
+			t.Errorf("cleanup delete fixture #%d: %v", id, err)
+		}
+	}()
 
 	// A conversation that pinned this profile resolves a chat agent despite the
 	// nil global fallback; without the fix the send precheck rejected it outright.
