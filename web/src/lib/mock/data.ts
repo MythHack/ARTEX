@@ -3357,6 +3357,8 @@ export const settings: Settings = {
   llm_pool_enabled: true,
   llm_pool_bind_fallback: false,
   noa_compaction: false,
+  compaction_max_tokens: 6000,
+  compaction_thinking: "disabled",
 };
 
 // ── LLM 轮询（故障转移）──────────────────────────────────────────────────────

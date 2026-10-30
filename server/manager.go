@@ -294,6 +294,11 @@ const (
 	// agent(planner/worker/主 agent/对话)由 noa 接管上下文压缩,取代内置 compaction。
 	// 每 run 读一次,切换只影响之后启动的 run。
 	settingNoaCompaction = "noa_compaction"
+	// 内置 compaction(冷节点压缩)的 §4 body 调用预算:输出上限 + 思考模式。
+	// 默认 max_tokens=6000(推理模型会把推理 token 计入输出预算,1500 会在大块
+	// 上截断成空正文)、thinking=disabled。每次 compress 调用都重读,改完即生效。
+	settingCompactionMaxTokens = "compaction_max_tokens"
+	settingCompactionThinking  = "compaction_thinking"
 	// defaultWebSearchBackend is used when web search is on but no backend was picked.
 	defaultWebSearchBackend = "ddgs"
 	// deepSeekWebSearchBackend borrows the active LLM profile instead of its own
@@ -683,6 +688,55 @@ func (m *Manager) NoaCompactionEnabled() bool {
 // the resolver reads it per run, so no rebuild is needed.
 func (m *Manager) SetNoaCompaction(on bool) error {
 	return m.pg.SetBool(settingNoaCompaction, on)
+}
+
+// CompactionMaxTokens returns the built-in compaction body-call output cap
+// (settings.compaction_max_tokens, 默认 agent.DefaultCompactionMaxTokens=6000).
+// Read on every compress call, so a change takes effect immediately.
+func (m *Manager) CompactionMaxTokens() int {
+	if m.pg == nil {
+		return agent.DefaultCompactionMaxTokens
+	}
+	return m.pg.GetInt(settingCompactionMaxTokens, agent.DefaultCompactionMaxTokens)
+}
+
+// SetCompactionMaxTokens persists the compaction output cap. Bounds keep a typo
+// from silently disabling compaction (too small → reasoning eats the whole
+// budget) or from requesting an absurd cap the gateway would reject.
+func (m *Manager) SetCompactionMaxTokens(n int) error {
+	if n < 512 || n > 128000 {
+		return fmt.Errorf("compaction 输出上限需在 512 到 128000 之间")
+	}
+	return m.pg.SetInt(settingCompactionMaxTokens, n)
+}
+
+// CompactionThinking returns the compaction body-call thinking mode
+// (settings.compaction_thinking): "disabled"(默认,抑制思考) or "enabled"
+// (anthropic 开思考;responses 发 profile 配置的 reasoning effort)。未设置或
+// 越界值一律回落 disabled。
+func (m *Manager) CompactionThinking() string {
+	if m.pg == nil {
+		return agent.DefaultCompactionThinking
+	}
+	v, ok, _ := m.pg.GetSetting(settingCompactionThinking)
+	if !ok {
+		return agent.DefaultCompactionThinking
+	}
+	switch t := strings.TrimSpace(v); t {
+	case "disabled", "enabled":
+		return t
+	}
+	return agent.DefaultCompactionThinking
+}
+
+// SetCompactionThinking persists the compaction thinking mode. Effective on the
+// next compress call.
+func (m *Manager) SetCompactionThinking(v string) error {
+	switch strings.TrimSpace(v) {
+	case "disabled", "enabled":
+		return m.pg.SetSetting(settingCompactionThinking, strings.TrimSpace(v))
+	}
+	return fmt.Errorf("compaction 思考模式仅支持 disabled/enabled")
 }
 
 // LLMPoolEnabled reports whether LLM failover ("轮询") is on (默认关；

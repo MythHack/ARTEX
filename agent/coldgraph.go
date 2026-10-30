@@ -40,9 +40,16 @@ type cgEdge struct {
 type coldParams struct {
 	R int // debounce: a node must be continuously inactive ≥R planner rounds (§7 R=6)
 	K int // min block size to fold; K=2 skips only degenerate singletons (§7 K=2)
+	// MaxMembers caps one block's member count (0 = unlimited). Without it a
+	// giant connected component yields one digest whose input — and a reasoning
+	// model's thinking budget — grows without bound, truncating to an empty
+	// body no matter the output cap (observed: 73 members burning 6000 tokens
+	// of pure reasoning). The trimmed tail stays uncovered and is folded on a
+	// later minor pass (tiered append), so coverage is chunked, not lost.
+	MaxMembers int
 }
 
-func defaultColdParams() coldParams { return coldParams{R: 6, K: 2} }
+func defaultColdParams() coldParams { return coldParams{R: 6, K: 2, MaxMembers: 24} }
 
 // coldGraph is an in-memory adjacency view over real exploration edges. The
 // derived view layer (kind=digest nodes, rel=covers edges) is filtered out at
@@ -248,6 +255,12 @@ func (g *coldGraph) group(set map[int64]bool, p coldParams) []block {
 			continue
 		}
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		if p.MaxMembers > 0 && len(ids) > p.MaxMembers {
+			// Keep the smallest ids (deterministic, so major's re-derivation
+			// reproduces the same trim and digest signatures stay reusable);
+			// the dropped tail stays uncovered and is folded on a later pass.
+			ids = ids[:p.MaxMembers]
+		}
 		memberSet := make(map[int64]bool, len(ids))
 		for _, m := range ids {
 			memberSet[m] = true
