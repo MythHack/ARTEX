@@ -84,6 +84,10 @@ export default function SystemSettingsPage() {
   const [injectWorker, setInjectWorker] = React.useState(true);
   // 实验功能:noa 上下文压缩(默认关)。
   const [noaCompaction, setNoaCompaction] = React.useState(false);
+  // 内置 compaction(冷节点压缩)的 body 调用预算;每次压缩调用都重读。
+  const [compactionMaxTokens, setCompactionMaxTokens] = React.useState("6000");
+  const [compactionThinking, setCompactionThinking] = React.useState("disabled");
+  const [savingCompaction, setSavingCompaction] = React.useState(false);
   // 纯前端偏好：不走 /api/settings，直接读写 localStorage。
   const sendMode = useChatSendMode();
   const {
@@ -117,6 +121,8 @@ export default function SystemSettingsPage() {
     setInjectPlanner(s.constraints_inject_planner !== false);
     setInjectWorker(s.constraints_inject_worker !== false);
     setNoaCompaction(!!s.noa_compaction);
+    setCompactionMaxTokens(String(s.compaction_max_tokens ?? 6000));
+    setCompactionThinking(s.compaction_thinking === "enabled" ? "enabled" : "disabled");
   }, []);
 
   const saveWorkers = () => {
@@ -340,6 +346,28 @@ export default function SystemSettingsPage() {
         setNoaCompaction(!v); // revert on failure
         toast.error(`保存失败：${(e as Error).message}`);
       });
+  };
+
+  // 保存内置 compaction 的 body 预算;compactor 每次 compress 都重读,即时生效。
+  const saveCompactionBudget = () => {
+    const n = Number(compactionMaxTokens);
+    if (!Number.isInteger(n) || n < 512 || n > 128000) {
+      toast.error("压缩输出上限需为 512 到 128000 之间的整数");
+      return;
+    }
+    if (compactionThinking !== "disabled" && compactionThinking !== "enabled") {
+      toast.error("压缩思考模式仅支持 关闭/开启");
+      return;
+    }
+    setSavingCompaction(true);
+    api
+      .setSettings({ compaction_max_tokens: n, compaction_thinking: compactionThinking })
+      .then((s) => {
+        apply(s);
+        toast.success("已保存冷节点压缩预算（对下一次压缩即时生效）");
+      })
+      .catch((e) => toast.error(`保存失败：${(e as Error).message}`))
+      .finally(() => setSavingCompaction(false));
   };
 
   const toggleAutoTitle = (key: "task_auto_title_enabled" | "chat_auto_title_enabled", value: boolean) => {
@@ -935,6 +963,60 @@ export default function SystemSettingsPage() {
                   disabled={!loaded}
                   onCheckedChange={toggleNoaCompaction}
                 />
+              </CardContent>
+            </Card>
+
+            <Card
+              className={`${isSettingVisible("agent", "冷节点压缩 compaction 摘要预算") ? "" : "hidden"} mb-4 break-inside-avoid md:mb-6`}
+            >
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <CpuIcon className="size-4" />
+                  冷节点压缩预算
+                </CardTitle>
+                <CardDescription>
+                  内置 compaction（冷节点压缩）把久未访问的探索结论折叠成摘要，供规划者快速掌握已探明的方向。
+                  这里的输出上限<b>包含推理 token</b>：推理模型会先消耗思考预算再产出正文，上限过低时大块压缩会在
+                  正文开始前被截断成空摘要（早期 1500 上限曾导致约九成压缩失败）。默认 6000；
+                  修改对下一次压缩即时生效，无需重启或重建 Agent。
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="flex flex-wrap items-end gap-3">
+                <div className="min-w-40 flex-1">
+                  <Label htmlFor="compaction-max-tokens" className="text-sm font-normal text-muted-foreground">
+                    输出上限（max tokens，含推理）
+                  </Label>
+                  <Input
+                    id="compaction-max-tokens"
+                    className="mt-1"
+                    inputMode="numeric"
+                    value={compactionMaxTokens}
+                    disabled={!loaded || savingCompaction}
+                    onChange={(e) => setCompactionMaxTokens(e.target.value)}
+                    placeholder="6000"
+                  />
+                </div>
+                <div className="w-48">
+                  <Label htmlFor="compaction-thinking" className="text-sm font-normal text-muted-foreground">
+                    压缩时思考
+                  </Label>
+                  <Select
+                    value={compactionThinking}
+                    disabled={!loaded || savingCompaction}
+                    onValueChange={setCompactionThinking}
+                  >
+                    <SelectTrigger id="compaction-thinking" className="mt-1 w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="disabled">关闭（默认）</SelectItem>
+                      <SelectItem value="enabled">开启</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <Button onClick={saveCompactionBudget} disabled={!loaded || savingCompaction}>
+                  {savingCompaction ? "保存中…" : "保存"}
+                </Button>
               </CardContent>
             </Card>
 

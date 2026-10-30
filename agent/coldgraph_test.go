@@ -174,3 +174,49 @@ func TestStampOps(t *testing.T) {
 		t.Fatalf("node 3 revived (not cold) → stamp must be cleared, got %+v", got[3])
 	}
 }
+
+// TestGrouping_OversizedComponentIsChunked pins the MaxMembers cap: one giant
+// connected component folds at most MaxMembers members per block, keeping the
+// smallest ids, and the uncovered tail forms its own block on the next pass —
+// a reasoning model otherwise burns the entire output budget thinking about a
+// 70+ node block and never emits a visible digest body.
+func TestGrouping_OversizedComponentIsChunked(t *testing.T) {
+	p := defaultColdParams()
+	if p.MaxMembers <= 0 {
+		t.Fatal("default params must cap block size")
+	}
+	// 101..130 chained into ONE connected component of 30 cold facts.
+	var nodes []cgNode
+	var edges []cgEdge
+	stamps := map[int64]*int64{}
+	for id := int64(101); id <= 130; id++ {
+		nodes = append(nodes, fact(id))
+		stamps[id] = ptr(1)
+		if id > 101 {
+			edges = append(edges, derived(id-1, id))
+		}
+	}
+	g := newColdGraph(nodes, edges)
+	elig := g.eligibleCold(g.structuralCold(g.hotSet()), stamps, 100, p)
+
+	blocks := g.group(elig, p)
+	if len(blocks) != 1 || len(blocks[0].Members) != p.MaxMembers {
+		t.Fatalf("want 1 capped block of %d members, got %+v", p.MaxMembers, blocks)
+	}
+	if blocks[0].Members[0] != 101 || blocks[0].Members[len(blocks[0].Members)-1] != int64(100+p.MaxMembers) {
+		t.Fatalf("cap must keep the smallest ids, got %v..%v", blocks[0].Members[0], blocks[0].Members[len(blocks[0].Members)-1])
+	}
+
+	// Simulate the next minor pass: covered members leave the cold set, the
+	// tail re-enters grouping and folds as its own block.
+	for _, m := range blocks[0].Members {
+		delete(elig, m)
+	}
+	next := g.group(elig, p)
+	if len(next) != 1 || len(next[0].Members) != 30-p.MaxMembers {
+		t.Fatalf("tail should fold into one block of %d, got %+v", 30-p.MaxMembers, next)
+	}
+	if next[0].Members[0] != int64(101+p.MaxMembers) {
+		t.Fatalf("tail block should start where the capped one ended, got %v", next[0].Members)
+	}
+}

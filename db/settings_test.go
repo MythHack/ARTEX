@@ -26,3 +26,29 @@ func TestSetSettingsAtomic(t *testing.T) {
 		}
 	}
 }
+
+func TestIntSettings(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	defer d.Close()
+	key := fmt.Sprintf("test.int_settings.%d", time.Now().UnixNano())
+	defer func() { _, _ = d.Exec(`DELETE FROM settings WHERE key=$1`, key) }()
+
+	if got := d.GetInt(key, 6000); got != 6000 {
+		t.Fatalf("unset GetInt=%d, want default 6000", got)
+	}
+	if err := d.SetInt(key, 8000); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.GetInt(key, 6000); got != 8000 {
+		t.Fatalf("GetInt=%d, want 8000", got)
+	}
+	if err := d.SetSetting(key, "not-a-number"); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.GetInt(key, 6000); got != 6000 {
+		t.Fatalf("unparseable GetInt=%d, want default 6000", got)
+	}
+}

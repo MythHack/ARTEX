@@ -40,10 +40,24 @@ type Compactor struct {
 	cooldown time.Duration // min gap between compactions per task (§7 60s)
 	maxDur   time.Duration // hard cap on one background compaction
 
+	// bodyMaxTokens/bodyThinking resolve the §4 compress-call budget per call, so
+	// a settings change takes effect on the next block without rebuilding the
+	// planner (nil → package defaults).
+	bodyMaxTokens func() int
+	bodyThinking  func() string
+
 	mu      sync.Mutex
 	running map[int64]bool
 	lastRun map[int64]time.Time
 }
+
+// Defaults for the §4 compress call. MaxTokens must cover the reasoning tokens a
+// model burns before its first visible token: a reasoning model capped too low
+// (the old hard-wired 1500) truncates to an empty body on every large block.
+const (
+	DefaultCompactionMaxTokens = 6000
+	DefaultCompactionThinking  = "disabled"
+)
 
 // NewCompactor builds a compactor. prov/model are used for the §4 body LLM call
 // (same model the agent runs on, per §4). A nil Compactor is a safe no-op.
@@ -59,6 +73,31 @@ func NewCompactor(prov llm.Provider, model string) *Compactor {
 		running:  map[int64]bool{},
 		lastRun:  map[int64]time.Time{},
 	}
+}
+
+// SetBodyBudget injects resolvers for the §4 compress-call output budget. Both
+// are read on every compress call (nil resolver or non-positive/empty value
+// falls back to the package defaults), so settings changes apply immediately.
+func (c *Compactor) SetBodyBudget(maxTokens func() int, thinking func() string) {
+	c.bodyMaxTokens = maxTokens
+	c.bodyThinking = thinking
+}
+
+// resolveBodyBudget returns the effective compress-call budget.
+func (c *Compactor) resolveBodyBudget() (int, string) {
+	maxTokens := DefaultCompactionMaxTokens
+	if c.bodyMaxTokens != nil {
+		if n := c.bodyMaxTokens(); n > 0 {
+			maxTokens = n
+		}
+	}
+	thinking := DefaultCompactionThinking
+	if c.bodyThinking != nil {
+		if s := strings.TrimSpace(c.bodyThinking()); s != "" {
+			thinking = s
+		}
+	}
+	return maxTokens, thinking
 }
 
 // OnPlannerRound is the single entry the planner calls each wake-up. It bumps the
@@ -146,6 +185,9 @@ func (c *Compactor) maintain(ts *db.ExplorationStore) (round int64, uncompressed
 // minor folds the not-yet-covered eligible-cold set into new digest segments
 // (tiered append, §5). Existing digests are untouched.
 func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
+	if ctx.Err() != nil {
+		return
+	}
 	round, err := ts.RoundNo()
 	if err != nil {
 		return
@@ -179,7 +221,13 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 		return // this batch has no ≥2 connected/shared-parent block — nothing to fold (§7)
 	}
 	for _, b := range blocks {
+		if ctx.Err() != nil {
+			return
+		}
 		c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, nil))
+	}
+	if ctx.Err() != nil {
+		return
 	}
 	// A minor may have pushed the segment count over M → merge in the same run.
 	if ad, e := ts.ActiveDigests(); e == nil && len(ad) >= c.m {
@@ -193,6 +241,9 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 // new/changed blocks are compressed afresh. This is where tiered fragments of one
 // direction merge and where "later became connected" blocks unify (§5.2).
 func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
+	if ctx.Err() != nil {
+		return
+	}
 	round, err := ts.RoundNo()
 	if err != nil {
 		return
@@ -241,10 +292,16 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 			stale = append(stale, d.ID)
 		}
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	if err := ts.SupersedeDigests(stale); err != nil {
 		log.Printf("[compaction] supersede exp=%d: %v", ts.ID(), err)
 	}
 	for _, b := range toCreate {
+		if ctx.Err() != nil {
+			return
+		}
 		c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, active))
 	}
 }
@@ -254,6 +311,9 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 // changed, so any member that has since gone hot (revived) is dropped from the
 // covers set. If the block dissolves below K it is skipped.
 func (c *Compactor) foldBlock(ctx context.Context, ts *db.ExplorationStore, g *coldGraph, b block, nodeByID map[int64]*db.Node, cvers map[int64]int, generation int) {
+	if ctx.Err() != nil {
+		return
+	}
 	body, err := c.compress(ctx, g, b, nodeByID)
 	if err != nil {
 		log.Printf("[compaction] compress exp=%d block=%v: %v", ts.ID(), b.Members, err)
@@ -276,6 +336,9 @@ func (c *Compactor) foldBlock(ctx context.Context, ts *db.ExplorationStore, g *c
 	}
 	final := block{Members: members, Anchors: b.Anchors}
 	payload := digestPayload(body, final, nodeByID, generation, blockSignature(final, cvers))
+	if ctx.Err() != nil {
+		return
+	}
 	if _, err := ts.AddDigest(payload, members); err != nil {
 		log.Printf("[compaction] add digest exp=%d: %v", ts.ID(), err)
 	}
@@ -510,21 +573,34 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 }
 
 // compress runs the §4 body LLM call on one block. Uses the same model the agent
-// runs on; thinking disabled (a pure summarization step).
+// runs on; the output cap and thinking mode come from the injected budget
+// resolvers (settings-backed; defaults above).
 func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByID map[int64]*db.Node) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	maxTokens, thinking := c.resolveBodyBudget()
 	req := llm.CompletionRequest{
 		System:    []string{compressionSystemPrompt},
 		Messages:  []llm.Message{llm.UserText(buildCompressionInput(g, b, nodeByID))},
-		MaxTokens: 1500,
-		Thinking:  "disabled",
+		MaxTokens: maxTokens,
+		Thinking:  thinking,
 	}
-	msg, _, _, err := c.prov.Complete(ctx, req)
+	msg, stopReason, usage, err := c.prov.Complete(ctx, req)
 	if err != nil {
 		return "", err
 	}
+	// A provider can finish concurrently with cancellation, or ignore it. Never
+	// accept that late result for persistence or treat a truncated summary as final.
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if stopReason == "max_tokens" {
+		return "", fmt.Errorf("incomplete model response: output token limit reached (stop_reason=%q, output_tokens=%d, requested_max_tokens=%d)", stopReason, usage.OutputTokens, req.MaxTokens)
+	}
 	body := strings.TrimSpace(msg.Text())
 	if body == "" {
-		return "", fmt.Errorf("empty body from model")
+		return "", fmt.Errorf("empty body from model (stop_reason=%q, output_tokens=%d, requested_max_tokens=%d)", stopReason, usage.OutputTokens, req.MaxTokens)
 	}
 	return body, nil
 }
