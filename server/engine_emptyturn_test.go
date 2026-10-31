@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/norma/llm"
 )
 
@@ -143,4 +144,37 @@ func TestSteerHooksStopNudgesEmptyTurn(t *testing.T) {
 			t.Fatalf("无计数器时不应注入: %v", blocking)
 		}
 	})
+}
+
+func TestCanCoalesceTriggersOnlyBatchesSmallRoutineDoneEvents(t *testing.T) {
+	task := &Task{ID: "t1", notify: make(chan struct{}, 1)}
+	if task.canCoalesceTriggers(plannerCoalesceBatch) {
+		t.Fatal("empty trigger list should not enter coalesce wait")
+	}
+
+	task.NotifyDone(101)
+	if !task.canCoalesceTriggers(plannerCoalesceBatch) {
+		t.Fatal("1 routine done trigger should be coalescible")
+	}
+	task.NotifyDone(102)
+	if !task.canCoalesceTriggers(plannerCoalesceBatch) {
+		t.Fatal("2 routine done triggers should be coalescible")
+	}
+	task.NotifyDone(103)
+	if task.canCoalesceTriggers(plannerCoalesceBatch) {
+		t.Fatal("reaching plannerCoalesceBatch should flush immediately")
+	}
+
+	_ = task.drainTriggers()
+	task.NotifyDone(104)
+	task.NotifyFinding(104, "high vuln")
+	if task.canCoalesceTriggers(plannerCoalesceBatch) {
+		t.Fatal("finding trigger must bypass coalesce wait")
+	}
+
+	_ = task.drainTriggers()
+	task.pendingTriggers = []agent.TriggerEvent{{Kind: "hint", Hints: []string{"focus auth"}}}
+	if task.canCoalesceTriggers(plannerCoalesceBatch) {
+		t.Fatal("human hint trigger must bypass coalesce wait")
+	}
 }

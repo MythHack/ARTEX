@@ -196,6 +196,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// override row, agents keep their built-in defaults — behavior is unchanged.
 	if m.pg != nil {
 		agent.OpsecEnabled = func() bool { return m.pg.GetBool(settingOpsecEnabled, false) }
+		agent.CVSSEnabled = m.CVSSEnabled
 		agent.PromptOverride = func(key string) (string, bool) {
 			a, err := m.pg.GetAgentByKey(key)
 			if err != nil || a == nil {
@@ -800,6 +801,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/workspace/download", s.wsDownload)
 	mux.HandleFunc("GET /api/workspace/preview", s.wsPreview)
 	mux.HandleFunc("POST /api/workspace/upload", s.wsUpload)
+	mux.HandleFunc("GET /api/tasks/{id}/identities", s.listTaskIdentities)
+	mux.HandleFunc("POST /api/tasks/{id}/identities", s.createTaskIdentity)
+	mux.HandleFunc("PUT /api/tasks/{id}/identities/{identity_id}", s.updateTaskIdentity)
+	mux.HandleFunc("DELETE /api/tasks/{id}/identities/{identity_id}", s.deleteTaskIdentity)
 	mux.HandleFunc("GET /api/tasks/{id}/scope", s.taskScopeList)
 	mux.HandleFunc("POST /api/tasks/{id}/scope", s.taskScopeAdd)
 	mux.HandleFunc("DELETE /api/tasks/{id}/scope/{sid}", s.taskScopeDelete)
@@ -3553,8 +3558,8 @@ func (s *Server) settingsPayload() map[string]any {
 		// 实验功能:noa 模型驱动上下文压缩(默认关)。开启后平台接入的四类 agent 由 noa
 		// 接管上下文压缩,取代内置 compaction;每 run 读一次,对之后启动的 run 生效。
 		"noa_compaction": s.m.NoaCompactionEnabled(),
-		// 改完即对下一次压缩生效,无需重建 agent。
-		"compaction_max_tokens": s.m.CompactionMaxTokens(),
+		// CVSS v3.1 + CWE 定级校准开关(默认开)。report_finding 自动算分并校准 severity。
+		"cvss_enabled": s.m.CVSSEnabled(),
 		"compaction_thinking":   s.m.CompactionThinking(),
 		// 漏洞 IM 推送的全局项。渠道本身是独立资源，走 /api/notify/* 管理；
 		// 这里只放「作用于全部渠道」的三项。
@@ -3642,6 +3647,8 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		// 都重读,改完即对下一次压缩生效,无需重建 agent。
 		CompactionMaxTokens *int    `json:"compaction_max_tokens"`
 		CompactionThinking  *string `json:"compaction_thinking"`
+		// CVSS v3.1 + CWE 定级校准开关(默认开);report_finding 自动算分并校准 severity。
+		CVSSEnabled *bool `json:"cvss_enabled"`
 		// 漏洞 IM 推送的全局项。三者都由投递引擎每轮读一次，改完即时生效，
 		// 不需要重建 agent 或重启。
 		NotifyEnabled    *bool   `json:"notify_enabled"`
@@ -3681,6 +3688,12 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	if req.CompactionThinking != nil {
 		if err := s.m.SetCompactionThinking(*req.CompactionThinking); err != nil {
 			writeErr(w, 400, err.Error())
+			return
+		}
+	}
+	if req.CVSSEnabled != nil {
+		if err := s.m.SetCVSSEnabled(*req.CVSSEnabled); err != nil {
+			writeErr(w, 500, err.Error())
 			return
 		}
 	}

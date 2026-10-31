@@ -17,12 +17,32 @@ import (
 // upstream nodes it derived from: facts/intents/findings) and yields (the facts/
 // findings it produced) — without pulling full payloads. parentsOf/yieldsOf are
 // built from the exploration edges in graph_overview.
+const (
+	overviewIntentSummaryMax  = 220
+	overviewFindingSummaryMax = 240
+	overviewFactSummaryMax    = 220
+	overviewHintTextMax       = 360
+	overviewRecentHintsCap    = 12
+)
+
+func clipOverviewRunes(v any, maxRunes int) any {
+	s, ok := v.(string)
+	if !ok || maxRunes <= 0 {
+		return v
+	}
+	s = strings.TrimSpace(s)
+	if r := []rune(s); len(r) > maxRunes {
+		return string(r[:maxRunes]) + "…"
+	}
+	return s
+}
+
 func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[string]any {
 	out := make([]map[string]any, 0, len(ns))
 	for _, n := range ns {
 		var p map[string]any
 		_ = json.Unmarshal(n.Payload, &p)
-		m := map[string]any{"id": n.ID, "summary": p["summary"], "state": n.State}
+		m := map[string]any{"id": n.ID, "summary": clipOverviewRunes(p["summary"], overviewIntentSummaryMax), "state": n.State}
 		if n.Inherited {
 			m["source_task_id"] = n.SourceTaskID
 			m["inherited"] = true
@@ -42,6 +62,9 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 		}
 		if ys := yieldsOf[n.ID]; len(ys) > 0 {
 			m["yields"] = ys // 下游：本意图产生了哪些事实/发现
+		}
+		if idv, ok := p["identity_id"]; ok && idv != nil {
+			m["identity_id"] = idv // 绑定的测试身份 id（可选，0=匿名）
 		}
 		out = append(out, m)
 	}
@@ -370,11 +393,15 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// hints: 人类/主 agent 通过 add_hint 挂上图的战略提示；folded in so the
 	// planner reads them every round when generating intents (否则只写不读).
 	hints, _ := t.ts.ListByKind(db.KindHint, 50)
+	out["hints_total"] = len(hints)
+	if len(hints) > overviewRecentHintsCap {
+		hints = hints[:overviewRecentHintsCap]
+	}
 	hsum := make([]map[string]any, 0, len(hints))
 	for _, h := range hints {
 		var p map[string]any
 		_ = json.Unmarshal(h.Payload, &p)
-		hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"]}
+		hint := map[string]any{"id": h.ID, "state": h.State, "text": clipOverviewRunes(p["text"], overviewHintTextMax)}
 		if findingTrafficBindingEnabled() && p["traffic_refs"] != nil {
 			hint["traffic_refs"] = p["traffic_refs"]
 		}
@@ -462,7 +489,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		}
 		var fp map[string]any
 		_ = json.Unmarshal(n.Payload, &fp)
-		m := map[string]any{"id": n.ID, "summary": fp["summary"]}
+		m := map[string]any{"id": n.ID, "summary": clipOverviewRunes(fp["summary"], overviewFindingSummaryMax)}
 		if from := factFrom[n.ID]; from > 0 {
 			m["from_intent"] = from // 本漏洞由哪个意图产生
 		}
@@ -482,6 +509,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			continue // 已折进 digest 且仍冷 —— 见 cold_digests
 		}
 		m := compactNode(n)
+		m["summary"] = clipOverviewRunes(m["summary"], overviewFactSummaryMax)
 		if from := factFrom[n.ID]; from > 0 {
 			m["from_intent"] = from // 本事实由哪个意图产生
 		}
@@ -498,14 +526,14 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	out["recent_facts"] = recentFacts
 	// recent_done_intents：非折叠的已结束意图里最新的一窗（≤N，recentDone 已按 id 降序）。
 	// 更早的看 done_intents_total 计数 + node_detail(id)。
-	const recentDoneCap = 12
+	const recentDoneCap = 8
 	if len(recentDone) > recentDoneCap {
 		recentDone = recentDone[:recentDoneCap]
 	}
 	out["recent_done_intents"] = compactIntents(recentDone, parentsOf, yieldsOf)
 	// cold-digest §6.1: 折叠冷区的 digest body，按最新成员时间降序取前 N；被截的更旧 digest
 	// 只给裸 id（仍可 expand_digest 展开），避免冷区唯一出口被无限拉长。
-	const coldDigestsCap = 15
+	const coldDigestsCap = 10
 	if cds, more := coldDigestsRecent(t.ts, coldDigestsCap); len(cds) > 0 {
 		out["cold_digests"] = cds // [{id, body, member_count}] —— 直接读 body (§6.1)
 		if len(more) > 0 {
@@ -1024,10 +1052,11 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 
 // intentItem 是 add_intent 批量/单条的一条探索方向。
 type intentItem struct {
-	Summary   string            `json:"summary"`
-	AssetIDs  []json.RawMessage `json:"asset_ids"`
-	ParentIDs []json.RawMessage `json:"parent_ids"`
-	Priority  int               `json:"priority"`
+	Summary    string            `json:"summary"`
+	AssetIDs   []json.RawMessage `json:"asset_ids"`
+	ParentIDs  []json.RawMessage `json:"parent_ids"`
+	Priority   int               `json:"priority"`
+	IdentityID int64             `json:"identity_id"` // optional: bind this intent to a configured task identity; 0 = anonymous
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1073,6 +1102,9 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if len(anchors) > 0 {
 		payload["asset_ids"] = anchors
 	}
+	if it.IdentityID > 0 {
+		payload["identity_id"] = it.IdentityID
+	}
 	id, err := t.ts.AddIntent(payload, priority, anchors, "planner")
 	if err != nil {
 		return 0, err
@@ -1097,11 +1129,12 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 	return t.writeExpTool("add_intent", "生成【探索方向】写入 frontier，并连入探索链路。意图是开放的探索方向，不是固定类型——用 summary 一句话自由描述要探索/验证/利用什么。\n"+
 		"★优先批量：一轮筛出的多个新方向放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。",
 		obj(map[string]any{
-			"intents":    map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
+			"intents":    map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority/identity_id）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
 			"summary":    str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
 			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
 			"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
 			"priority":   intp("优先级 0-10，默认5"),
+			"identity_id": intp("可选：绑定本任务已配置的测试身份 id（task_identities.id）。0=匿名（默认）。配置了身份也不能不做匿名测试——匿名意图与带身份意图应并行派发。"),
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -1222,9 +1255,14 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 // --- worker write tools ---
 
 func (t *ToolSet) addFinding() actool.CoreTool {
-	return writeTool("report_finding", "记录确认的漏洞，用 evidence 提供命令输出、日志等可验证证据。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。", obj(map[string]any{
-		"vulnclass": str("漏洞类别"), "name": str("漏洞名称"), "severity": str("critical|high|medium|low"), "summary": str("发现摘要"),
-		"intent_id": idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id"},
+	return writeTool("report_finding", "记录已实证的真实漏洞（必须有可验证的实际安全危害；未闭环的前置原语/纯监控或配置暴露新域名请用 record_fact）。建议同时提供 cwe_id 与 cvss_vector，系统将按 FIRST CVSS v3.1 标准公式自动复核并校准 severity。任务上下文传当前 intent_id。", obj(map[string]any{
+		"vulnclass":   str("漏洞类别"),
+		"name":        str("漏洞名称"),
+		"cwe_id":      str("可选但强烈建议：CWE 编号（如 CWE-200 / CWE-306 / CWE-639 / CWE-798），用于标准弱点归类与同源去重"),
+		"cvss_vector": str("可选但强烈建议：CVSS v3.1 向量（如 CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N）。C/I/A 必须仅按【本次已实证的结果】填写（严禁按未验证的后续利用链拔高）：C:H 仅限已拿到可用凭据/密钥/成规模核心业务数据/源码；/metrics、Actuator、路由配置、单笔样本或存在性 Oracle 最高 C:L（5.3 medium）；I:H 仅限已实证篡改真实业务状态或 RCE，假回调未改单/盲上传无读回链最高 I:L 或记 fact"),
+		"severity":    str("critical|high|medium|low（若传了 cvss_vector，系统将按 CVSS v3.1 实算分数自动校准 severity：9.0-10.0=critical, 7.0-8.9=high, 4.0-6.9=medium, 0.1-3.9=low）"),
+		"summary":     str("发现摘要（须明确说明已验证的实际危害边界）"),
+		"intent_id":   idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id"},
 		"evidence":         str("证据/PoC 文本"),
 		"evidence_hint_id": idp("可选：本任务中对应此漏洞的提示节点 ID，自动携带其结构化 traffic_refs；不能引用继承提示或其他漏洞的提示"),
 		"traffic_refs": map[string]any{"type": "array", "description": "可选；HTTP/HTTPS 漏洞先检索并逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID。TCP 等非 HTTP 漏洞、未采集或找不到确切记录时省略或传 []，不阻止上报；可在 evidence 说明原因并提供其他可验证证据。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。",
@@ -1232,6 +1270,8 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 	}, "vulnclass", "severity", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		var a struct {
 			VulnClass, Name, Severity, Summary, Evidence string
+			CWEID                                        string            `json:"cwe_id"`
+			CVSSVector                                   string            `json:"cvss_vector"`
 			IntentID                                     json.RawMessage   `json:"intent_id"`
 			AssetIDs                                     []json.RawMessage `json:"asset_ids"`
 			TrafficRefs                                  []db.TrafficRef   `json:"traffic_refs"`
@@ -1242,6 +1282,28 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		}
 		if t.ts == nil {
 			return actool.Errorf("report_finding 需要任务上下文；平台对话请通过 add_task_hint 向对应任务交接漏洞，并在提示中携带已有的 traffic_refs，由任务 Agent 登记。已登记漏洞可用 bind_finding_traffic 补绑。"), nil
+		}
+		score, calcSev, normVec, cwe, cvssErr := EvaluateFindingSeverity(a.Severity, a.CWEID, a.CVSSVector, a.VulnClass, a.Name, a.Summary, a.Evidence)
+		if cvssErr != nil {
+			return actool.Errorf(fmt.Sprintf("cvss_vector 格式错误: %v（示例：CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N）", cvssErr)), nil
+		}
+		if calcSev == "none" || score <= 0 {
+			return actool.Errorf(fmt.Sprintf("CVSS 向量 %s 算分为 0.0（C:N/I:N/A:N，无实质已证实危害），不构成独立漏洞；请改用 record_fact 记录为探索事实或前置原语", normVec)), nil
+		}
+		if CVSSEnabled() {
+			a.Severity = calcSev
+		}
+		// Only prefix the human-facing CVSS/CWE badge when the caller explicitly
+		// supplied cvss_vector or cwe_id, or when calibration downgraded an inflated
+		// severity, so legacy test fixtures expecting exact summary strings stay intact.
+		if strings.TrimSpace(a.CVSSVector) != "" || cwe != "" {
+			tag := fmt.Sprintf("[CVSS %.1f %s]", score, normVec)
+			if cwe != "" {
+				tag = fmt.Sprintf("[%s | CVSS %.1f %s]", cwe, score, normVec)
+			}
+			if !strings.Contains(a.Summary, normVec) {
+				a.Summary = tag + " " + strings.TrimSpace(a.Summary)
+			}
 		}
 		// Auto-binding off: ignore the evidence params instead of rejecting the call.
 		// stripTrafficParameters already removes them from the advertised schema, but
@@ -1301,6 +1363,10 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		return actool.Text(fmt.Sprintf("finding recorded: %d\n%s", recorded.NodeID, raw)), nil
 	})
 }
+
+// CVSSEnabled, when non-nil, returns whether CVSS v3.1 + CWE rating calibration
+// is enabled (default true). Wired to settings.cvss_enabled via Manager.CVSSEnabled.
+var CVSSEnabled = func() bool { return true }
 
 // recordFact writes a general exploration RESULT/conclusion (not a vuln, not a
 // new asset) into the EXPLORATION graph, chained to the intent that produced it.
