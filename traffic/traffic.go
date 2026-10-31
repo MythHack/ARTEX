@@ -170,6 +170,12 @@ type Traffic struct {
 	// transparent-passthrough paths honor it (go-mitmproxy's getUpstreamConn),
 	// so no host escapes it. Hot-swappable at runtime via SetUpstreamProxy.
 	upstream atomic.Pointer[url.URL]
+	// pool 非空时代理池优先于 upstream:per-request 按策略轮换上游,
+	// 失败(RequestError)计数熔断。见 pool.go。
+	pool atomic.Pointer[selector]
+	// lastPick 记录 host → 最近一次为它选中的池上游(Pick 时写,错误上报时读;
+	// host 粒度足够熔断统计,并发同 host 偶尔错位可接受)。
+	lastPick sync.Map // host(string) -> proxy URL string
 }
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
@@ -218,7 +224,15 @@ func Open(dir, addr string) (*Traffic, error) {
 	// a direct dial. When a global egress proxy IS configured (SetUpstreamProxy),
 	// every captured request — intercepted AND transparently tunneled — is
 	// forwarded through it instead, so no host leaks the real source IP.
-	p.SetUpstreamProxy(func(*http.Request) (*url.URL, error) { return t.upstream.Load(), nil })
+	p.SetUpstreamProxy(func(req *http.Request) (*url.URL, error) {
+		if pool := t.pool.Load(); pool != nil {
+			if u := pool.Pick(req.Host); u != nil {
+				t.lastPick.Store(hostOnly(req.Host), u.String())
+				return u, nil
+			}
+		}
+		return t.upstream.Load(), nil
+	})
 	// Fail-open: MITM every host by default, EXCEPT ones a prior request proved we
 	// can't intercept without breaking (see maybePassthrough). Those are tunneled
 	// transparently so the request still reaches the target instead of being killed.
@@ -309,6 +323,12 @@ func (t *Traffic) ProxyAddr() string {
 	return "http://" + t.addr
 }
 
+// ProxyPoolEnabled reports whether the proxy pool is configured and running.
+func (t *Traffic) ProxyPoolEnabled() bool {
+	return t.pool.Load() != nil
+}
+
+
 // SetUpstreamProxy points every captured request at a global egress proxy
 // (http/https/socks5, optional user:pass in the URL). An empty raw string clears
 // it, restoring direct dialing. The change is atomic and takes effect on the next
@@ -346,7 +366,51 @@ func ValidateProxyURL(raw string) (*url.URL, error) {
 	if u.Host == "" {
 		return nil, fmt.Errorf("代理 %q 缺少主机地址", raw)
 	}
+	// url.Parse 对「坏行这不是地址」这类不含空格的垃圾串几乎不报错（它当成
+	// 一个 path），于是批量导入会把明显的乱码当成合法代理收进来。补一道
+	// 主机名形状检查：必须是 host[:port]，主机名只允许字母数字点横线下划线。
+	host := u.Hostname()
+	if host == "" {
+		return nil, fmt.Errorf("代理 %q 缺少主机地址", raw)
+	}
+	if strings.ContainsAny(host, " \t\r\n") {
+		return nil, fmt.Errorf("代理 %q 的主机名含非法字符", raw)
+	}
+	if !isProxyHost(host) {
+		return nil, fmt.Errorf("代理 %q 的主机名 %q 不是合法的 IP 或域名", raw, host)
+	}
+	if p := u.Port(); p != "" {
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return nil, fmt.Errorf("代理 %q 的端口 %q 不是数字", raw, p)
+			}
+		}
+	}
 	return u, nil
+}
+
+// isProxyHost reports whether host looks like an IPv4/IPv6 literal or a DNS
+// name. It rejects prose and paths (spaces, non-ASCII letters, slashes), but
+// deliberately accepts single-label names like "proxy" — intranet setups do
+// use them, and a wrong host is caught later by the connectivity check rather
+// than at import time.
+func isProxyHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if strings.Contains(host, ":") {
+		// IPv6 literal
+		return net.ParseIP(host) != nil
+	}
+	for _, c := range host {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '.', c == '-', c == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // CACertPath returns the PEM CA cert clients must trust to verify HTTPS through
@@ -393,6 +457,14 @@ func (s *sink) Response(f *mproxy.Flow) {
 	if f.Request == nil || f.Response == nil {
 		return
 	}
+	// 代理池:一次完整响应 = 出口活着,清该上游的连败计数。
+	if pool := s.t.pool.Load(); pool != nil && f.Request.URL != nil {
+		host := hostOnly(f.Request.URL.Host)
+		if raw, ok := s.t.lastPick.Load(host); ok {
+			raws, _ := raw.(string)
+			pool.ReportResult(raws, true)
+		}
+	}
 	s.t.record(f)
 }
 
@@ -400,7 +472,17 @@ func (s *sink) Response(f *mproxy.Flow) {
 // the failure looks proxy/protocol-caused (h2 quirks, HEAD-with-body, protocol
 // errors) — not a plain target-unreachable error — we flag the host for
 // transparent passthrough so future requests to it succeed instead of dying.
-func (s *sink) RequestError(f *mproxy.Flow, err error) { s.t.maybePassthrough(f, err) }
+func (s *sink) RequestError(f *mproxy.Flow, err error) {
+	// 代理池:上游拨号/交换失败按代理计连败(达阈值熔断 10 分钟)。
+	if pool := s.t.pool.Load(); pool != nil && f.Request != nil && f.Request.URL != nil {
+		host := hostOnly(f.Request.URL.Host)
+		if raw, ok := s.t.lastPick.Load(host); ok {
+			raws, _ := raw.(string)
+			pool.ReportResult(raws, false)
+		}
+	}
+	s.t.maybePassthrough(f, err)
+}
 
 // maybePassthrough marks a host to be tunneled transparently on the next
 // connection, but only for errors the proxy itself caused — a target that is
