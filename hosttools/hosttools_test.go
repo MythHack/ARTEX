@@ -115,3 +115,24 @@ func containsAll(s string, subs ...string) bool {
 	}
 	return true
 }
+
+func TestPipLibraryAndSecListsDetection(t *testing.T) {
+	secDir := filepath.Join(t.TempDir(), "tools", "SecLists")
+	if err := os.MkdirAll(filepath.Join(secDir, "Discovery"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	SetDataDirResolver(func() string { return filepath.Dir(filepath.Dir(secDir)) })
+	defer SetDataDirResolver(nil)
+
+	if got := ResolveSecListsDir(); got != secDir {
+		t.Fatalf("ResolveSecListsDir=%q, want %q", got, secDir)
+	}
+	sec, ok := Lookup("seclists")
+	if !ok || !sec.AvailableInPath() {
+		t.Fatalf("seclists should be detected as available at %s", secDir)
+	}
+	txt := SummaryText()
+	if !strings.Contains(txt, secDir) {
+		t.Fatalf("SummaryText should surface SecLists path %s: %s", secDir, txt)
+	}
+}
