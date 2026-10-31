@@ -49,6 +49,25 @@ func EnsureTemplates(ctx context.Context, dir, proxy string) error {
 		}
 		return nil
 	}
+	// Directory already exists without .git (e.g. extracted from zip or nuclei -ut):
+	// initialize git in-place and fast-forward to origin/main so it becomes a true
+	// incremental-update git working tree without deleting existing templates.
+	if st, err := os.Stat(dir); err == nil && st.IsDir() {
+		if hasAnyYAMLTemplate(dir) {
+			for _, args := range [][]string{
+				{"-C", dir, "init", "-q"},
+				{"-C", dir, "remote", "add", "origin", "https://github.com/projectdiscovery/nuclei-templates.git"},
+				{"-C", dir, "fetch", "--depth", "1", "--quiet", "origin", "main"},
+				{"-C", dir, "reset", "--hard", "-q", "origin/main"},
+			} {
+				c := exec.CommandContext(ctx, "git", args...)
+				c.Env = env
+				_ = c.Run()
+			}
+			return nil
+		}
+		_ = os.RemoveAll(dir)
+	}
 	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 		return err
 	}
@@ -60,6 +79,24 @@ func EnsureTemplates(ctx context.Context, dir, proxy string) error {
 		return fmt.Errorf("nuclei templates clone: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+func hasAnyYAMLTemplate(dir string) bool {
+	if _, err := os.Stat(filepath.Join(dir, ".templates-index")); err == nil {
+		return true
+	}
+	found := false
+	_ = filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() && strings.HasSuffix(strings.ToLower(d.Name()), ".yaml") {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
 }
 
 // NucleiInstalled reports whether the nuclei binary is on PATH.
@@ -85,7 +122,7 @@ func BuildNucleiCmd(ctx context.Context, templatesDir string, a ScanArgs) (*exec
 	if strings.TrimSpace(a.Target) == "" {
 		return nil, nil, fmt.Errorf("target 不能为空")
 	}
-	if _, err := os.Stat(filepath.Join(templatesDir, ".git")); err != nil {
+	if !hasAnyYAMLTemplate(templatesDir) {
 		return nil, nil, fmt.Errorf("模板树不可用(%s):先等同步器完成初始化", templatesDir)
 	}
 	timeout := a.TimeoutTotal
