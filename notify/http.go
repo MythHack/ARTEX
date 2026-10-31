@@ -82,14 +82,20 @@ func blockInternalDial(_, address string, _ syscall.RawConn) error {
 }
 
 // notifyTransport 在默认 Transport 的基础上只加一个拨号守卫。
-// 用 Clone 保留默认的全部调优（连接池、HTTP/2、超时、proxy 等），
-// 避免为了加一个检查而改动其它行为。
+// 用 Clone 保留默认的全部调优（连接池、HTTP/2、超时等），避免为了加一个
+// 检查而改动其它行为。
+//
+// Proxy 必须显式清掉：http.DefaultTransport 会读环境变量 HTTP_PROXY /
+// HTTPS_PROXY，而服务进程带着这些变量启动，克隆出来的 transport 依然带着
+// 代理——于是「IM 推送直连」这句注释就成了假的，通知会被送进目标网络的
+// 隧道里。agent/provider.go 的 quotaAwareHTTPClient 本来就这么处理。
 var notifyTransport = func() *http.Transport {
 	t, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
-		return &http.Transport{}
+		return &http.Transport{Proxy: nil}
 	}
 	clone := t.Clone()
+	clone.Proxy = nil
 	clone.DialContext = (&net.Dialer{Timeout: 10 * time.Second, Control: blockInternalDial}).DialContext
 	return clone
 }()
