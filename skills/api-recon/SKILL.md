@@ -1,6 +1,10 @@
 ---
 name: api-recon
 description: 收集网站API接口时调用该skill。
+tags:
+  cwe: [CWE-200]
+  attack: [T1595.002]
+  class: [recon, api-surface]
 ---
 
 # API Recon（前端接口侦察）
@@ -152,6 +156,27 @@ python3 recon/spider_mpa.py <BASE_URL> <OUTDIR> [--cookie "session=..."] [--max 
 ```
 
 产出 `forms.txt`、`links.txt`、`api_inline.txt`。SPA 若 forms ≈ 0 → 切 Phase 1。
+
+---
+
+## Phase 0b — API 契约（先试这个，可能直接省掉 Phase 1）
+
+**先试契约文件，再考虑爬 JS。** 契约（OpenAPI/Swagger/Postman）直接给出「后端支持哪些接口、哪些参数、哪些方法、哪些要鉴权」——比爬虫准、比静态分析快（一次 GET vs 下载全部 chunk）。目标暴露 `/swagger-ui/`、`/api-docs` 时，契约往往**一次就够**。
+
+用 `api_contract` 工具（它会探测常见契约路径并解析出清单）：
+
+```
+api_contract(base_url="https://target.example.com")
+```
+
+**拿到契约后**：
+- 契约里的接口清单 → 直接进 Phase 4（权限树还原）与参数分析，**可以跳过 Phase 1/3**；
+- 契约里的 `auth_required` 标记 → **需要鉴权的那批接口是越权挖掘的核心对象**，单独列出来看；
+- 契约里没有的接口（后端支持但没写进契约的）→ 仍要靠 Phase 1/3 补。
+
+**没找到契约很常见**（很多站点不暴露）→ 直接进 Phase 1，不要在这里耗时间。
+
+> 契约是**接口清单，不是漏洞**。拿到清单后是否可打、怎么打，交回 vuln-hunting 的方法论判断。
 
 ---
 
