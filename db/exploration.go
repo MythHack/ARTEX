@@ -194,6 +194,17 @@ func (s *ExplorationStore) Root() (description, goal string, err error) {
 }
 
 // AddNode writes a typed reasoning node with optional anchors to asset ids.
+//
+// Anchors that point at assets which no longer exist are **skipped**, not fatal.
+// Why: exploration_anchors.asset_id is FK REFERENCES assets(id), and the anchor
+// insert shares a transaction with the node insert. A dangling asset id (the
+// model guessed an id, or the asset was deleted between the model's list_assets
+// call and its write-back) therefore used to abort the WHOLE transaction — the
+// fact/intent node was rolled back with it and the model's findings silently
+// vanished, so the planner re-explored the same direction for nothing.
+//
+// An anchor is a provenance edge, not the payload. Losing a dangling edge is
+// correct; losing the node is not.
 func (s *ExplorationStore) AddNode(kind string, payload map[string]any, priority int, state, origin string, anchors []int64) (int64, error) {
 	raw, _ := json.Marshal(payload)
 	tx, err := s.db.Begin()
@@ -208,12 +219,54 @@ VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 		s.expID, kind, string(raw), priority, state, origin).Scan(&id); err != nil {
 		return 0, err
 	}
-	for _, a := range anchors {
+	for _, a := range s.existingAssetIDs(tx, anchors) {
 		if _, err := tx.Exec(`INSERT INTO exploration_anchors(node_id, asset_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, id, a); err != nil {
 			return 0, err
 		}
 	}
 	return id, tx.Commit()
+}
+
+// existingAssetIDs filters the requested anchor ids down to the ones that
+// actually exist in `assets`. Unknown ids are dropped (the FK would reject
+// them); duplicates are collapsed so the same asset is not anchored twice.
+func (s *ExplorationStore) existingAssetIDs(tx *sql.Tx, ids []int64) []int64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	uniq := make([]int64, 0, len(ids))
+	seen := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		if id <= 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		uniq = append(uniq, id)
+	}
+	if len(uniq) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(uniq))
+	args := make([]any, len(uniq))
+	for i, id := range uniq {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+	rows, err := tx.Query(`SELECT id FROM assets WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		// 校验失败不能挡住节点写入——退化成「全部锚点都跳过」。
+		return nil
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return out
+		}
+		out = append(out, id)
+	}
+	return out
 }
 
 // AddIntent is a convenience: an open intent.
@@ -267,6 +320,23 @@ ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, from, re
 // so a folded member's state flip invalidates its digest's cached body (§5.3).
 func (s *ExplorationStore) SetNodeState(id int64, state string) error {
 	_, err := s.db.Exec(`UPDATE exploration_nodes SET state=$1, blocked_reason=NULL, content_version=content_version+1 WHERE id=$2 AND exploration_id=$3`, state, id, s.expID)
+	return err
+}
+
+// MarkGoalUnverified 给目标打上「未经逐条证据证明」的标记。
+//
+// planner 的 goal_met 允许在没有逐个 prove_goal 的情况下整体收官（避免空转烧
+// token，有实测依据），但那本质是"声称达成"而不是"被证据证明"。把区别写进
+// payload 的合并字段里，报告与界面才能如实呈现，而不是让一次偷懒的收官看起来
+// 和验证过的达成一样。
+func (s *ExplorationStore) MarkGoalUnverified(id int64, reason string) error {
+	raw, _ := json.Marshal(map[string]any{
+		"unverified":        true,
+		"unverified_reason": reason,
+	})
+	_, err := s.db.Exec(`UPDATE exploration_nodes
+SET payload = COALESCE(payload,'{}'::jsonb) || $1::jsonb
+WHERE id=$2 AND exploration_id=$3 AND kind='goal'`, string(raw), id, s.expID)
 	return err
 }
 
@@ -816,6 +886,59 @@ func (s *ExplorationStore) CountOpenIntents() (int, error) {
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM exploration_nodes
 WHERE exploration_id=$1 AND kind='intent' AND state='open'`, s.expID).Scan(&n)
 	return n, err
+}
+
+// FindSimilarOpenIntent 在同任务的 open/running 意图里找与 summary 高度相似的一条，
+// 用于派发去重：planner 偶尔会把同一方向重复下发，两条并行跑纯属浪费。
+//
+// 判重刻意保守——只有【归一化后完全相同】或【互相包含且都足够长】才算相似，
+// 避免误杀"同一资产上的不同路线"这类合法细分意图。
+func (s *ExplorationStore) FindSimilarOpenIntent(summary string) (id int64, existing string, ok bool, err error) {
+	norm := normalizeIntentText(summary)
+	if len([]rune(norm)) < 6 {
+		return 0, "", false, nil // 太短的描述没有判重意义
+	}
+	rows, err := s.db.Query(`SELECT id, COALESCE(payload->>'summary','') FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='intent' AND state IN ('open','running')
+ORDER BY id DESC LIMIT 200`, s.expID)
+	if err != nil {
+		return 0, "", false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var nid int64
+		var sum string
+		if err := rows.Scan(&nid, &sum); err != nil {
+			return 0, "", false, err
+		}
+		n := normalizeIntentText(sum)
+		if n == "" {
+			continue
+		}
+		if n == norm {
+			return nid, sum, true, nil
+		}
+		// 包含关系：都够长才认，短串包含太容易误判。
+		if len([]rune(n)) >= 12 && len([]rune(norm)) >= 12 &&
+			(strings.Contains(n, norm) || strings.Contains(norm, n)) {
+			return nid, sum, true, nil
+		}
+	}
+	return 0, "", false, rows.Err()
+}
+
+// normalizeIntentText 归一化意图描述用于判重：小写、去掉空白与常见中英文标点。
+func normalizeIntentText(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		switch r {
+		case ' ', '\t', '\n', '\r', '，', '。', '、', '；', '：', '！', '？', '“', '”', '‘', '’',
+			',', '.', ';', ':', '!', '?', '"', '\'', '(', ')', '（', '）', '[', ']', '【', '】', '-', '_', '/':
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // GetNode returns one node of this exploration by id (nil, nil if not found).
@@ -2018,4 +2141,22 @@ func (s *ExplorationStore) ActivityByIDsForTerminalIntents(ids []int64) ([]Activ
 // exploration node is deleted). taskID and nodeID may be 0 (stored as NULL).
 func (s *ExplorationStore) AddStandaloneFinding(taskID, nodeID int64, vulnclass, name, severity, summary, evidence, worker string, assetIDs []int64) (int64, error) {
 	return s.db.AddFinding(taskID, nodeID, vulnclass, name, severity, summary, evidence, worker, assetIDs)
+}
+
+// StallOverview 收官态势的字段(group activity round 边界 + 最近产出窗口)。
+// 由 agent 包的 stallOverview 调用,per-round 一次;数据都在本探索范围内,
+// 查询形状固定且便宜。
+func (s *ExplorationStore) StallOverview() (rounds, recentNew, openCnt int, err error) {
+	if err = s.db.QueryRow(`SELECT count(*) FROM activity
+		WHERE kind='round' AND exploration_id=$1`, s.expID).Scan(&rounds); err != nil {
+		return
+	}
+	if err = s.db.QueryRow(`SELECT count(*) FROM exploration_nodes
+		WHERE exploration_id=$1 AND kind IN ('fact','finding')
+		AND created_at > now() - interval '6 hours'`, s.expID).Scan(&recentNew); err != nil {
+		return
+	}
+	err = s.db.QueryRow(`SELECT count(*) FROM exploration_nodes
+		WHERE exploration_id=$1 AND kind='intent' AND state='open'`, s.expID).Scan(&openCnt)
+	return
 }

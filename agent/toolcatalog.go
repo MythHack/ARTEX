@@ -56,9 +56,10 @@ func builtinToolsByAgent() map[string][]actool.CoreTool {
 // 之所以仍留在某个 agent 的 base 工具集里(如 goal_met 在 PlannerTools):一是让 seed 能
 // 构造它拿到 desc/schema,二是用户手动绑回后运行时 base 里有它、ToolResolve 才留得住。
 //
-// goal_met：绕过逐个 prove_goal、直接从全局宣布【整个任务完成】,权重大且有误判风险,又与
-// 「prove_goal 标记最后一个目标 → 自动收官」重复,故默认不给任何 agent,需要时再手动绑。
-var defaultUnbound = map[string]bool{"goal_met": true}
+// goal_met 已改默认【绑 planner】:收官门槛落地后(goal 边际收益态势 + 提示词护栏),
+// 空转烧 token 的代价远大于误收官的代价(用户实测:14 亿 token 的任务,收官无量化准绳
+// 是主因)。误判兜底:goal_met 的 reason 有提示词约束,人工可从归档/已修复再发起复测翻案。
+var defaultUnbound = map[string]bool{}
 
 // BuiltinToolSeeds 把各 agent 的内置工具集去重合并成 seed 列表：同名工具（如 list_assets
 // 多个 agent 都有）合成一条，Agents 取并集；defaultUnbound 里的工具则强制绑定为空。

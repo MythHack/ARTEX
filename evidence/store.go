@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -107,12 +108,23 @@ func (s *Store) writeBody(r io.Reader, expectedLength int64, expectedHash string
 	if err = os.Rename(f.Name(), path); err != nil {
 		return "", err
 	}
-	d, err := os.Open(filepath.Dir(path))
+	return hash, syncDir(filepath.Dir(path))
+}
+
+// syncDir 刷掉目录项（rename 落盘的崩溃一致性语义）。Windows 的目录句柄
+// 不支持 FlushFileBuffers——os.Open 目录成功但 Sync() 必然 "Access is
+// denied"（实测 2026-10-29，evidence 全部测试因此挂）——目录项由 NTFS
+// 自行保证；d.Sync() 的持久化语义只在类 Unix 平台成立。
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(dir)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer d.Close()
-	return hash, d.Sync()
+	return d.Sync()
 }
 
 // StageFindingsExport freezes bindings/report versions and makes private body
@@ -143,14 +155,27 @@ func (s *Store) StageFindingsExport(ctx context.Context, findings []*db.DBFindin
 	})
 }
 
-func (s *Store) prepare(ctx context.Context, refs []db.TrafficRef) ([]db.PreparedTrafficEvidence, error) {
+// prepare resolves every ref individually.
+//
+// A ref whose traffic id does not exist is reported in skipped instead of
+// failing the whole call: a wrong id guessed by the model must never discard
+// a confirmed finding. The caller decides what to do with skipped — Record
+// keeps the finding and reports the gap, Bind keeps the existing bindings and
+// reports the gap.
+//
+// Only "this id does not exist" is a per-ref problem. A storage failure
+// (unwritable evidence dir, unreadable body, database down) is a system
+// fault and still fails the whole call — silently dropping evidence because
+// the disk is full would be worse than an explicit error.
+func (s *Store) prepare(ctx context.Context, refs []db.TrafficRef) ([]db.PreparedTrafficEvidence, []db.TrafficRef, error) {
 	refs, err := db.NormalizeTrafficRefs(refs)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	out := make([]db.PreparedTrafficEvidence, 0, len(refs))
+	skipped := make([]db.TrafficRef, 0)
 	if len(refs) == 0 {
-		return out, nil
+		return out, skipped, nil
 	}
 	ids := make([]string, len(refs))
 	byID := map[string]db.TrafficRef{}
@@ -158,25 +183,43 @@ func (s *Store) prepare(ctx context.Context, refs []db.TrafficRef) ([]db.Prepare
 		ids[i] = ref.TrafficID
 		byID[ref.TrafficID] = ref
 	}
-	err = s.Traffic.ReadEvidence(ctx, ids, func(e traffic.EvidenceExchange) error {
-		rh, err := s.writeBody(e.Request, e.ReqLen, e.ReqHash)
+	// One id at a time: ReadEvidence aborts on the first bad id, so a batch
+	// would let a single typo discard the other, valid references.
+	for _, id := range ids {
+		ref := byID[id]
+		err := s.Traffic.ReadEvidence(ctx, []string{id}, func(e traffic.EvidenceExchange) error {
+			rh, err := s.writeBody(e.Request, e.ReqLen, e.ReqHash)
+			if err != nil {
+				return err
+			}
+			ph, err := s.writeBody(e.Response, e.RespLen, e.RespHash)
+			if err != nil {
+				return err
+			}
+			v := db.TrafficEvidenceSnapshot{SourceTrafficID: e.ID, CapturedAt: e.TS, URL: e.URL, Method: e.Method, Status: e.Status, ContentType: e.ContentType,
+				ReqHead: e.ReqHead, RespHead: e.RespHead, ReqHash: rh, RespHash: ph, ReqLen: e.ReqLen, RespLen: e.RespLen}
+			// Raw wire bytes: normalize once here so the ID, the stored row and every
+			// downstream consumer (archive, API responses) all see the same text.
+			v = v.Normalize()
+			v.ID = db.TrafficSnapshotID(v)
+			out = append(out, db.PreparedTrafficEvidence{Ref: ref, Snapshot: v})
+			return nil
+		})
 		if err != nil {
-			return err
+			if ctx.Err() != nil {
+				return nil, nil, err
+			}
+			// The exchange row is gone: the id simply does not exist. A body that
+			// exists but cannot be read is a storage fault, not a bad reference.
+			if !errors.Is(err, sql.ErrNoRows) {
+				return nil, nil, fmt.Errorf("流量 %s 读取失败: %w", id, err)
+			}
+			skipped = append(skipped, ref)
+			log.Printf("[evidence] 流量 %s 不存在，跳过该引用", id)
+			continue
 		}
-		ph, err := s.writeBody(e.Response, e.RespLen, e.RespHash)
-		if err != nil {
-			return err
-		}
-		v := db.TrafficEvidenceSnapshot{SourceTrafficID: e.ID, CapturedAt: e.TS, URL: e.URL, Method: e.Method, Status: e.Status, ContentType: e.ContentType,
-			ReqHead: e.ReqHead, RespHead: e.RespHead, ReqHash: rh, RespHash: ph, ReqLen: e.ReqLen, RespLen: e.RespLen}
-		// Raw wire bytes: normalize once here so the ID, the stored row and every
-		// downstream consumer (archive, API responses) all see the same text.
-		v = v.Normalize()
-		v.ID = db.TrafficSnapshotID(v)
-		out = append(out, db.PreparedTrafficEvidence{Ref: byID[e.ID], Snapshot: v})
-		return nil
-	})
-	return out, err
+	}
+	return out, skipped, nil
 }
 
 func (s *Store) Record(ctx context.Context, in db.RecordFindingInput, refs []db.TrafficRef) (out *db.RecordedFinding, err error) {
@@ -184,31 +227,42 @@ func (s *Store) Record(ctx context.Context, in db.RecordFindingInput, refs []db.
 		if err := db.LockTaskEvidenceTx(tx, in.TaskID); err != nil {
 			return err
 		}
-		prepared, err := s.prepare(ctx, refs)
+		prepared, skipped, err := s.prepare(ctx, refs)
 		if err != nil {
 			return err
 		}
 		out, err = db.RecordFindingTx(ctx, tx, in, prepared)
-		return err
+		if err != nil {
+			return err
+		}
+		if out != nil {
+			out.SkippedRefs = skipped
+		}
+		return nil
 	})
 	return
 }
 
 func (s *Store) Bind(ctx context.Context, findingID int64, refs []db.TrafficRef) (out *db.FindingTraffic, err error) {
+	var skipped []db.TrafficRef
 	err = s.DB.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
 		if err := db.LockFindingEvidenceTx(tx, findingID, nil); err != nil {
 			return err
 		}
-		prepared, err := s.prepare(ctx, refs)
+		prepared, skip, err := s.prepare(ctx, refs)
 		if err != nil {
 			return err
 		}
+		skipped = skip
 		if err = db.AddFindingTrafficTx(tx, findingID, prepared); err != nil {
 			return err
 		}
 		out, err = db.FindingTrafficTx(tx, findingID)
 		return err
 	})
+	if out != nil && len(skipped) > 0 {
+		out.SkippedRefs = skipped
+	}
 	return
 }
 

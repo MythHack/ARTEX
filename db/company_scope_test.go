@@ -334,14 +334,26 @@ func TestCompanyScopeAttribution(t *testing.T) {
 	uniq := startMax + 1
 	root := fmt.Sprintf("scopetest%d.com", uniq)
 	sub := "api." + root
-	ipIn := "198.51.100.9"
-	ipOut := "203.0.113.9"
+	// The in-scope CIDR must be unique per run. A fixed segment (198.51.100.0/24)
+	// collides with every earlier run of this test: scope rows survive in the
+	// dev database, and company attribution picks the most specific match first,
+	// then the LOWEST company_id — so a stale company from a previous run wins
+	// and the freshly created company never gets the asset. Deriving the segment
+	// from the run's unique id keeps each run independent.
+	seg := fmt.Sprintf("198.18.%d.0/24", uniq%256)
+	ipIn := fmt.Sprintf("198.18.%d.9", uniq%256)
+	// The out-of-scope IP must also be unique: a stale scope from an earlier
+	// run covering it would attribute the "unattributed" asset and fail.
+	ipOut := fmt.Sprintf("198.19.%d.9", uniq%256)
 	outDomain := fmt.Sprintf("other%d.net", uniq)
 
 	cid, _, err := cs.UpsertCompany(fmt.Sprintf("ScopeCo %d", uniq), "")
 	if err != nil {
 		t.Fatalf("UpsertCompany: %v", err)
 	}
+	// Clean up the company and its scope rows: they outlive the test otherwise
+	// and keep influencing attribution for later runs.
+	t.Cleanup(func() { cleanupCompany(d, cid) })
 
 	// a pre-existing asset (inserted BEFORE any scope) — must be back-filled.
 	preID, err := as.UpsertSubdomain(UpsertSubdomainReq{Domain: sub})
@@ -354,7 +366,7 @@ func TestCompanyScopeAttribution(t *testing.T) {
 		t.Fatalf("pre-scope asset should be unattributed, got %v", *preCompanyID)
 	}
 
-	cs.AddScope(cid, []string{root, "198.51.100.0/24"}, "unit test")
+	cs.AddScope(cid, []string{root, seg}, "unit test")
 
 	mustCid := func(id int64, want int64, label string) {
 		var cID *int64

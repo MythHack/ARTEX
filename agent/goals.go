@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	acperm "github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
+	"github.com/Autumn-27/artex/db"
 )
 
 // goalsDefaultTmpl is the built-in EDITABLE body (段 [A]) of the goals-decomposer
@@ -36,6 +36,8 @@ const goalsDefaultTmpl = `你是渗透测试目标分解器。你的职责是从
 - 漏洞分析与验证过程
 - 攻击步骤、利用手段
 - 结果验证步骤
+
+**空泛目标必须改写**：目标无法落到可核验结果时（如「提升整体安全性」「全面检测漏洞」），改写为最接近的具体可验证形态（如「发现至少 1 个 high 及以上漏洞并给出可复现 PoC」），并在 reason 里注明是改写——下游 prove_goal 阶段需要对它做量化核对，悬空目标会无从证明。
 
 **拆分原则**：
 - 用户描述的最终目标只有一个 → 输出一个

@@ -177,7 +177,7 @@ func TestEvidenceAtomicFailuresAndLegacy(t *testing.T) {
 		s.DB.QueryRow(`SELECT count(*) FROM exploration_nodes WHERE exploration_id=$1 AND kind='finding'`, in.ExplorationID).Scan(&nodes)
 		return
 	}
-	for _, kind := range []string{"missing_id", "missing_body", "disk_failure", "database_failure"} {
+	for _, kind := range []string{"missing_body", "disk_failure", "database_failure"} {
 		t.Run(kind, func(t *testing.T) {
 			input := in
 			refs := []db.TrafficRef{{TrafficID: "valid"}, {TrafficID: "absent"}}
@@ -205,6 +205,36 @@ func TestEvidenceAtomicFailuresAndLegacy(t *testing.T) {
 			}
 		})
 	}
+	// A missing traffic id is NOT a failure: the model guessed an id that does
+	// not exist. The confirmed finding must still land, the valid reference
+	// must still bind, and the bad one must be reported back as skipped.
+	t.Run("missing_id_is_skipped_not_fatal", func(t *testing.T) {
+		r, err := s.Record(ctx, in, []db.TrafficRef{{TrafficID: "valid"}, {TrafficID: "absent"}})
+		if err != nil {
+			t.Fatal("a wrong traffic id must not discard the finding:", err)
+		}
+		if r.FindingID == 0 {
+			t.Fatal("finding was not recorded")
+		}
+		if len(r.Traffic.Bindings) != 1 || r.Traffic.Bindings[0].Snapshot.SourceTrafficID != "valid" {
+			t.Fatalf("valid reference was not bound: %+v", r.Traffic.Bindings)
+		}
+		if len(r.SkippedRefs) != 1 || r.SkippedRefs[0].TrafficID != "absent" {
+			t.Fatalf("skipped refs not reported: %+v", r.SkippedRefs)
+		}
+		// Bind must behave the same: existing bindings survive, only the bad
+		// reference is reported.
+		again, err := s.Bind(ctx, r.FindingID, []db.TrafficRef{{TrafficID: "absent"}})
+		if err != nil {
+			t.Fatal("bind with a wrong id must not fail:", err)
+		}
+		if len(again.Bindings) != 1 {
+			t.Fatalf("existing bindings were lost: %+v", again.Bindings)
+		}
+		if len(again.SkippedRefs) != 1 || again.SkippedRefs[0].TrafficID != "absent" {
+			t.Fatalf("skipped refs not reported on bind: %+v", again.SkippedRefs)
+		}
+	})
 	legacy := filepath.Join(dir, "traffic", "legacy")
 	os.MkdirAll(legacy, 0o700)
 	os.WriteFile(filepath.Join(legacy, "request.http"), []byte("GET / HTTP/1.1\nHost: old.local\n"), 0o600)
@@ -218,6 +248,67 @@ func TestEvidenceAtomicFailuresAndLegacy(t *testing.T) {
 	}
 	if _, err = s.Record(ctx, in, nil); err != nil {
 		t.Fatal("legacy no-traffic report failed:", err)
+	}
+}
+
+func TestEvidenceDuplicateReportBindsNewTraffic(t *testing.T) {
+	s, in, _ := evidenceFixture(t)
+	ctx := context.Background()
+	seedExchange(t, s, "dup-first", []byte("first payload"), false)
+	seedExchange(t, s, "dup-second", []byte("second payload"), false)
+
+	// Dedup only engages for reports anchored to an asset (the fingerprint is
+	// (vulnclass, name, assets)); without one the two reports are different
+	// findings by design.
+	var assetID int64
+	if err := s.DB.QueryRow(`INSERT INTO assets (type, domain, root_domain) VALUES ('service','dup.evidence.test','evidence.test') RETURNING id`).Scan(&assetID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = s.DB.Exec(`DELETE FROM assets WHERE id=$1`, assetID) })
+	in.AssetIDs = []int64{assetID}
+
+	first, err := s.Record(ctx, in, []db.TrafficRef{{TrafficID: "dup-first", Role: "proof"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Duplicate {
+		t.Fatal("first report must not be a duplicate")
+	}
+	if len(first.Traffic.Bindings) != 1 {
+		t.Fatalf("first report bindings: %+v", first.Traffic.Bindings)
+	}
+
+	// Second report of the same fingerprint: the text evidence merges into the
+	// original record, and the traffic it brings must be bound to that same
+	// record — dropping it would leave the merged evidence pointing at packets
+	// nobody can see.
+	again := in
+	again.Worker = "work#2"
+	again.Evidence = "second confirmation with a different response"
+	second, err := s.Record(ctx, again, []db.TrafficRef{{TrafficID: "dup-second", Role: "verification"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Duplicate || second.FindingID != first.FindingID {
+		t.Fatalf("second report: duplicate=%v id=%d want duplicate of %d", second.Duplicate, second.FindingID, first.FindingID)
+	}
+	if len(second.Traffic.Bindings) != 2 {
+		t.Fatalf("duplicate report must bind the new traffic too: %+v", second.Traffic.Bindings)
+	}
+	seen := map[string]bool{}
+	for _, b := range second.Traffic.Bindings {
+		seen[b.Snapshot.SourceTrafficID] = true
+	}
+	if !seen["dup-first"] || !seen["dup-second"] {
+		t.Fatalf("bindings lost a traffic: %v", seen)
+	}
+	// The original record must carry both, not just the returned view.
+	list, err := s.DB.GetFindingTraffic(ctx, first.FindingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Bindings) != 2 {
+		t.Fatalf("stored bindings: %+v", list.Bindings)
 	}
 }
 

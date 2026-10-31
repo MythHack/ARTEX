@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"runtime/debug"
+	"strings"
 
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -85,6 +86,37 @@ func AugmentTools(ctx context.Context, agentKey string, base []actool.CoreTool) 
 // down, and on restart the agent replays the same call and crashes again. Applied
 // last, so it covers every tool the agent can reach: domain, SDK, MCP and skill.
 func guardPanic(t actool.CoreTool) actool.CoreTool { return &guardedTool{CoreTool: t} }
+
+// localExecToolNames are the SDK default tools that actually *do* something on this
+// host (run commands / mutate files). Dropped for agents whose local_exec is off.
+// Read-only inspection tools (Read/LS/Glob/Grep) are deliberately kept: 编排 agent
+// 看 skill 目录、翻产物是合理的，能跑命令才是问题。
+var localExecToolNames = map[string]bool{
+	"Bash":         true,
+	"Write":        true,
+	"Edit":         true,
+	"MultiEdit":    true,
+	"NotebookEdit": true,
+}
+
+// DropLocalExecTools returns tools minus the local-execution ones, for agents whose
+// local_exec is off: they keep read-only inspection + platform tools, so the only
+// way to get real work done is to dispatch a task (spawn_task). Enforced in the
+// server's ToolResolve hook — the SDK DefaultTools have no tools-table rows, so the
+// usual per-agent binding filter can't reach them.
+//
+// 除按名字摘，还整族摘掉 `shell_*`（持久 PTY 会话工具）：它等价于一条不受管的命令
+// 执行通道，跟 Bash 是同一件事的两种入口，只摘 Bash 等于没摘。
+func DropLocalExecTools(tools []actool.CoreTool) []actool.CoreTool {
+	out := make([]actool.CoreTool, 0, len(tools))
+	for _, t := range tools {
+		if localExecToolNames[t.Name()] || strings.HasPrefix(t.Name(), "shell_") {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
 
 type guardedTool struct{ actool.CoreTool }
 

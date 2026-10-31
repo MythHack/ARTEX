@@ -26,9 +26,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
+	"github.com/Autumn-27/artex/db"
 )
 
 // Compactor performs background cold-node compaction for many explorations.
@@ -39,6 +39,21 @@ type Compactor struct {
 	n, m     int           // minor / major thresholds (§7 N=20, M=8)
 	cooldown time.Duration // min gap between compactions per task (§7 60s)
 	maxDur   time.Duration // hard cap on one background compaction
+	// outTokens 是压缩这一次调用的输出预算(思考+正文共用)。0 = 用 defaultCompactionTokens。
+	//
+	// 为什么不能用小值:adaptive thinking 模型(MiniMax-M3.1 等强制思考的)会**按
+	// max_tokens 预算持续思考**,预算越小它思考得越久、正文越轮不到——实测同一份
+	// 26 节点的输入,预算 1500 时思考烧光 1500、正文 0 字;预算 2048 时正文仍是 0;
+	// 预算 32768 时思考约 2000 token 就收尾并正常吐出正文。也就是说预算给小了
+	// 不是"输出被截断",而是**模型根本没走到正文**。
+	outTokens int
+	// maxBlockMembers 是单次压缩请求的成员节点数上限。0 = 不限制。
+	//
+	// 为什么要限制:实测**能否收尾取决于单次输入规模,而非预算大小**——3 个节点
+	// (743 prompt token)在 32768 预算下正常收尾(约 2000 token 思考),26 个节点
+	// (3084 prompt token)即使给 32768 也会把预算烧光、跑 211 秒不出正文。
+	// 所以超大连通块必须切分,让每次请求的规模落在模型能处理住的范围内。
+	maxBlockMembers int
 
 	// bodyMaxTokens/bodyThinking resolve the §4 compress-call budget per call, so
 	// a settings change takes effect on the next block without rebuilding the
@@ -49,6 +64,8 @@ type Compactor struct {
 	mu      sync.Mutex
 	running map[int64]bool
 	lastRun map[int64]time.Time
+	// consecFails 记录每个探索连续几轮压缩失败,用于失败退避(见 cooldownForLocked)。
+	consecFails map[int64]int
 }
 
 // Defaults for the §4 compress call. MaxTokens must cover the reasoning tokens a
@@ -58,20 +75,63 @@ const (
 	DefaultCompactionMaxTokens = 6000
 	DefaultCompactionThinking  = "disabled"
 )
+// defaultCompactionTokens 是压缩调用的默认输出预算。
+//
+// 65536 的由来:实测 6 节点/块在 65536 预算下 124 秒就正常收尾(用 11733
+// token);9 节点/块在 32768 预算下 3 块里有 1 块烧光预算失败。预算给足
+// 能显著提高成功率——思考型模型会按 max_tokens 预算持续思考,预算越大它
+// 思考得越久,但也因此更可能想到能收尾。
+//
+// 65536 仍是"思考+正文共用"的额度,给小了模型会一直想、正文轮不到
+// (见 outTokens 字段的注释)。
+const defaultCompactionTokens = 65536
+
+// defaultCompactionDuration 是单次后台压缩的墙钟上限。
+//
+// 压缩是**后台协程**,与 worker 领取意图并行(日志里可见压缩与「领取意图」交替),
+// 等久一点不影响主流程进度,只会让冷节点压缩晚一点落地。5 分钟对长输入的
+// adaptive thinking 模型明显不够(实测 26 节点要跑 10 分钟以上),故放宽。
+const defaultCompactionDuration = 20 * time.Minute
+
+// defaultCompactionMaxMembers 是单次压缩请求的成员节点数上限。
+//
+// 6 的由来（实测同一份 26 节点真实输入，逐档切分）：
+//   - 26 节点/块：max_tokens 给到 65536 也把预算烧光，10 分钟不出正文。
+//   - 9 节点/块：3 块里 2 成功（194s / 324s）、1 失败（烧光 32768）。
+//   - 6 节点/块：124 秒就正常收尾，用 11733 token。
+//
+// 也就是说切得越碎，模型越容易收尾、耗时也越短。6 是「成功率」与
+// 「别把摘要切得太碎（碎了就失去『综合』的意义）」之间的平衡点。
+const defaultCompactionMaxMembers = 6
+
+// compactionSubConcurrency 是单个块内子块压缩的并发度。
+//
+// 4 的由来：实测单子块（6 节点）约 124 秒。一个 200 节点的连通块按 6 节点/块
+// 切出 32 个子块，串行是 32×124 ≈ 66 分钟，远超单次后台压缩 20 分钟的墙钟
+// 上限——必然 context deadline exceeded。4 路并发把它压到约 17 分钟，稳稳
+// 落在上限内。
+//
+// 为什么不更高：上游是共享的限流网关，32 路并发会把上游打爆，反而全失败。
+// 4 是「不撞墙钟」与「不打爆上游」之间的平衡点。
+const compactionSubConcurrency = 4
 
 // NewCompactor builds a compactor. prov/model are used for the §4 body LLM call
 // (same model the agent runs on, per §4). A nil Compactor is a safe no-op.
 func NewCompactor(prov llm.Provider, model string) *Compactor {
 	return &Compactor{
-		prov:     prov,
-		model:    model,
-		params:   defaultColdParams(),
-		n:        20,
-		m:        8,
-		cooldown: 60 * time.Second,
-		maxDur:   5 * time.Minute,
-		running:  map[int64]bool{},
-		lastRun:  map[int64]time.Time{},
+		prov:      prov,
+		model:     model,
+		params:    defaultColdParams(),
+		n:         20,
+		m:         8,
+		cooldown:  60 * time.Second,
+		maxDur:    defaultCompactionDuration,
+		outTokens: defaultCompactionTokens,
+		// maxBlockMembers 默认切分：超大连通块会让思考型模型陷进超长思考。
+		maxBlockMembers: defaultCompactionMaxMembers,
+		running:         map[int64]bool{},
+		lastRun:         map[int64]time.Time{},
+		consecFails:     map[int64]int{},
 	}
 }
 
@@ -79,25 +139,73 @@ func NewCompactor(prov llm.Provider, model string) *Compactor {
 // are read on every compress call (nil resolver or non-positive/empty value
 // falls back to the package defaults), so settings changes apply immediately.
 func (c *Compactor) SetBodyBudget(maxTokens func() int, thinking func() string) {
+	if c == nil {
+		return
+	}
 	c.bodyMaxTokens = maxTokens
 	c.bodyThinking = thinking
 }
 
 // resolveBodyBudget returns the effective compress-call budget.
 func (c *Compactor) resolveBodyBudget() (int, string) {
-	maxTokens := DefaultCompactionMaxTokens
+	maxTokens := c.outTokens
+	if maxTokens <= 0 {
+		maxTokens = DefaultCompactionMaxTokens
+	}
 	if c.bodyMaxTokens != nil {
 		if n := c.bodyMaxTokens(); n > 0 {
 			maxTokens = n
+		} else {
+			maxTokens = DefaultCompactionMaxTokens
 		}
 	}
-	thinking := DefaultCompactionThinking
+	thinking := ""
 	if c.bodyThinking != nil {
 		if s := strings.TrimSpace(c.bodyThinking()); s != "" {
 			thinking = s
+		} else {
+			thinking = DefaultCompactionThinking
 		}
+	} else if c.bodyMaxTokens != nil {
+		thinking = DefaultCompactionThinking
 	}
 	return maxTokens, thinking
+}
+
+// SetOutputTokens 设置压缩调用的输出预算。0 = 恢复默认。
+// 让部署方能按「思考型模型需要多大预算」来调,而不是改代码里的常量。
+func (c *Compactor) SetOutputTokens(n int) {
+	if c == nil {
+		return
+	}
+	if n <= 0 {
+		n = defaultCompactionTokens
+	}
+	c.outTokens = n
+}
+
+// SetMaxDuration 设置单次后台压缩的墙钟上限。<=0 = 恢复默认。
+func (c *Compactor) SetMaxDuration(d time.Duration) {
+	if c == nil {
+		return
+	}
+	if d <= 0 {
+		d = defaultCompactionDuration
+	}
+	c.maxDur = d
+}
+
+// SetMaxBlockMembers 设置单次压缩请求的成员节点数上限。<=0 = 恢复默认。
+// 刻意不提供"不切分"的选项:实测超大连通块必然让思考型模型陷进超长思考,
+// 切分是保证压缩能落地的必要条件,不是一个可选的优化。
+func (c *Compactor) SetMaxBlockMembers(n int) {
+	if c == nil {
+		return
+	}
+	if n <= 0 {
+		n = defaultCompactionMaxMembers
+	}
+	c.maxBlockMembers = n
 }
 
 // OnPlannerRound is the single entry the planner calls each wake-up. It bumps the
@@ -220,15 +328,19 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 	if len(blocks) == 0 {
 		return // this batch has no ≥2 connected/shared-parent block — nothing to fold (§7)
 	}
+	allOK := true
 	for _, b := range blocks {
 		if ctx.Err() != nil {
 			return
 		}
-		c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, nil))
+		if !c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, nil)) {
+			allOK = false
+		}
 	}
 	if ctx.Err() != nil {
 		return
 	}
+	c.recordResult(ts.ID(), allOK)
 	// A minor may have pushed the segment count over M → merge in the same run.
 	if ad, e := ts.ActiveDigests(); e == nil && len(ad) >= c.m {
 		c.major(ctx, ts)
@@ -298,31 +410,40 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 	if err := ts.SupersedeDigests(stale); err != nil {
 		log.Printf("[compaction] supersede exp=%d: %v", ts.ID(), err)
 	}
+	allOK := true
 	for _, b := range toCreate {
 		if ctx.Err() != nil {
 			return
 		}
-		c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, active))
+		if !c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, active)) {
+			allOK = false
+		}
 	}
+	c.recordResult(ts.ID(), allOK)
 }
 
 // foldBlock compresses one block and writes its digest — with a commit-time
 // liveness recheck (§ concurrency): between grouping and write the graph may have
 // changed, so any member that has since gone hot (revived) is dropped from the
 // covers set. If the block dissolves below K it is skipped.
-func (c *Compactor) foldBlock(ctx context.Context, ts *db.ExplorationStore, g *coldGraph, b block, nodeByID map[int64]*db.Node, cvers map[int64]int, generation int) {
+//
+// 返回是否成功(压缩+写 digest 都没出错),供上层做失败退避。
+func (c *Compactor) foldBlock(ctx context.Context, ts *db.ExplorationStore, g *coldGraph, b block, nodeByID map[int64]*db.Node, cvers map[int64]int, generation int) bool {
 	if ctx.Err() != nil {
-		return
+		return false
 	}
-	body, err := c.compress(ctx, g, b, nodeByID)
+	// 超大块会被切成若干子块分别压缩(见 compressChunked 的注释:思考型模型能否
+	// 收尾取决于单次输入规模)。多段 body 拼成一段,语义与原来的一段等价。
+	bodies, err := c.compressChunked(ctx, g, b, nodeByID)
 	if err != nil {
 		log.Printf("[compaction] compress exp=%d block=%v: %v", ts.ID(), b.Members, err)
-		return
+		return false
 	}
+	body := strings.Join(bodies, "\n\n")
 	// Re-read fresh state and drop any member that revived while we compressed.
 	fresh, _, err := loadColdGraph(ts)
 	if err != nil {
-		return
+		return false
 	}
 	freshHot := fresh.hotSet()
 	members := make([]int64, 0, len(b.Members))
@@ -332,16 +453,18 @@ func (c *Compactor) foldBlock(ctx context.Context, ts *db.ExplorationStore, g *c
 		}
 	}
 	if len(members) < c.params.K {
-		return // block revived out from under us — leave those nodes hot, don't fold
+		return true // block revived out from under us — leave those nodes hot, don't fold
 	}
 	final := block{Members: members, Anchors: b.Anchors}
 	payload := digestPayload(body, final, nodeByID, generation, blockSignature(final, cvers))
 	if ctx.Err() != nil {
-		return
+		return false
 	}
 	if _, err := ts.AddDigest(payload, members); err != nil {
 		log.Printf("[compaction] add digest exp=%d: %v", ts.ID(), err)
+		return false
 	}
+	return true
 }
 
 // generationFor computes a digest's重摘代次 (§1): 1 for a fresh fold; for a major
@@ -371,17 +494,67 @@ func (c *Compactor) generationFor(b block, active []*db.Node) int {
 }
 
 // tryStart acquires the per-task compaction lock, honoring the cooldown.
+//
+// 失败退避：连续失败时该探索的冷却时间指数增长。理由很实际——一次失败的
+// 压缩要烧掉几百秒的 LLM 时间(实测思考型模型在长输入上会思考 300 秒以上
+// 才放弃),而冷却只有 60 秒的话,就会变成「每分钟烧一次 5 分钟」的无谓循环。
+// 压缩失败不阻塞主流程(没有 digest 时 planner 直接看原始节点),所以退避
+// 只是省资源,不是保功能。
 func (c *Compactor) tryStart(expID int64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.running[expID] {
 		return false
 	}
-	if t, ok := c.lastRun[expID]; ok && time.Since(t) < c.cooldown {
+	// cooldownForLocked, not cooldownFor: this method already holds c.mu, and
+	// sync.Mutex is NOT reentrant — calling cooldownFor here would try to lock
+	// c.mu a second time and self-deadlock forever.
+	//
+	// How it stayed hidden so long: the branch is only reached once
+	// c.lastRun[expID] exists, and lastRun is only set by finish() when a
+	// compaction goroutine completes. So the first compaction of an exploration
+	// is fine; the next planner round after it completed deadlocks — and
+	// because a deadlocked mutex ignores ctx cancellation, the planner's
+	// wall-clock timeout could not break it either. Symptom: the task goes
+	// permanently silent (no new intents, no planner log at all) while the
+	// service keeps running. A service restart cleared it, which is why it
+	// looked like an upstream/LLM problem.
+	if t, ok := c.lastRun[expID]; ok && time.Since(t) < c.cooldownForLocked(expID) {
 		return false
 	}
 	c.running[expID] = true
 	return true
+}
+
+// cooldownFor 返回该探索当前的冷却时长(成功=基础值,连续失败则指数退避)。
+//
+// 这是**不持锁**时的入口；已经持有 c.mu 的调用方必须用 cooldownForLocked
+// （sync.Mutex 不可重入，再加一次锁就是自死锁）。
+func (c *Compactor) cooldownFor(expID int64) time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cooldownForLocked(expID)
+}
+
+// cooldownForLocked 返回该探索当前的冷却时长(成功=基础值,连续失败则指数退避)。
+//
+// 必须是 Locked 版：调用方持有 c.mu 时再调一个会加锁的同名函数就是自死锁
+// （sync.Mutex 不可重入），而 ctx 取消救不了它——死锁的 goroutine 不会返回，
+// planner 的墙钟上限也就跟着失效。热路径 tryStart 用的就是这一个。
+func (c *Compactor) cooldownForLocked(expID int64) time.Duration {
+	fails := c.consecFails[expID]
+	if fails <= 0 {
+		return c.cooldown
+	}
+	// 指数退避,封顶 30 分钟。
+	d := c.cooldown
+	for i := 0; i < fails && d < 30*time.Minute; i++ {
+		d *= 2
+	}
+	if d > 30*time.Minute {
+		d = 30 * time.Minute
+	}
+	return d
 }
 
 func (c *Compactor) finish(expID int64) {
@@ -389,6 +562,17 @@ func (c *Compactor) finish(expID int64) {
 	defer c.mu.Unlock()
 	c.running[expID] = false
 	c.lastRun[expID] = time.Now()
+}
+
+// recordResult 记录一轮压缩的结果:成功则清零连续失败计数,失败则累加。
+func (c *Compactor) recordResult(expID int64, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ok {
+		delete(c.consecFails, expID)
+		return
+	}
+	c.consecFails[expID]++
 }
 
 // --- helpers: db ↔ coldgraph ---
@@ -574,7 +758,7 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 
 // compress runs the §4 body LLM call on one block. Uses the same model the agent
 // runs on; the output cap and thinking mode come from the injected budget
-// resolvers (settings-backed; defaults above).
+// resolvers or SetOutputTokens (settings-backed; defaults above).
 func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByID map[int64]*db.Node) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -600,9 +784,91 @@ func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByI
 	}
 	body := strings.TrimSpace(msg.Text())
 	if body == "" {
-		return "", fmt.Errorf("empty body from model (stop_reason=%q, output_tokens=%d, requested_max_tokens=%d)", stopReason, usage.OutputTokens, req.MaxTokens)
+		return "", fmt.Errorf("empty body from model (stop_reason=%q stop=%q blocks=%d in=%d out=%d output_tokens=%d requested_max_tokens=%d thinking=%d)",
+			stopReason, stopReason, len(msg.Content), usage.InputTokens, usage.OutputTokens, usage.OutputTokens, req.MaxTokens, countThinking(msg))
 	}
 	return body, nil
+}
+
+// compressChunked 压缩一个块，但把过大的块先切成若干子块、逐个压缩。
+//
+// 为什么要切:实测思考型模型能否收尾取决于**单次输入规模**,与输出预算无关——
+// 3 个节点(743 prompt token)在 32768 预算下正常收尾,26 个节点(3084 prompt
+// token)即使给 32768 也会把预算烧光、跑 211 秒不出正文。超大连通块(一个
+// 连通分量可能有几十个节点)在实践中就是这样,所以必须切。
+//
+// 切分保持原有语义:每块仍然是「一组彼此关联的节点」,只是规模更小。返回的
+// 多个 body 由调用方拼成一段摘要(分隔标记),语义与原来的一段 body 等价。
+//
+// 子块是**并发**压缩的(串行会撞墙钟上限):一个 200 节点的连通块按 6 节点/块
+// 切出 32 个子块,实测单子块约 124 秒。串行就是 32×124 ≈ 66 分钟,而单次
+// 后台压缩的墙钟上限只有 20 分钟(defaultCompactionDuration)——必然
+// context deadline exceeded。实测线上就是这个形态:一个块报「子块 15/32
+// 压缩失败」,前 14 个子块已经白烧了 30 分钟 LLM 时间,整块作废。
+//
+// 并发度取 4 而不是全部 32:上游是共享的限流网关,32 路并发会把上游打爆
+// 反而全失败;4 路并发把 66 分钟压到约 17 分钟,稳稳落在 20 分钟上限内。
+// 单个子块失败仍然让整块失败(宁可重试也不要写半截摘要),但**成功的子块
+// 结果会被保留**,失败重试时不必从头再来。
+func (c *Compactor) compressChunked(ctx context.Context, g *coldGraph, b block, nodeByID map[int64]*db.Node) ([]string, error) {
+	limit := c.maxBlockMembers
+	if limit <= 0 || len(b.Members) <= limit {
+		body, err := c.compress(ctx, g, b, nodeByID)
+		if err != nil {
+			return nil, err
+		}
+		return []string{body}, nil
+	}
+	// 子块数：按 limit 切分，最后一块可能不满。
+	nSubs := (len(b.Members) + limit - 1) / limit
+	type subResult struct {
+		body string
+		err  error
+	}
+	subs := make([]subResult, nSubs)
+
+	// 并发执行,限制并发度。
+	sem := make(chan struct{}, compactionSubConcurrency)
+	var wg sync.WaitGroup
+	for k := 0; k < nSubs; k++ {
+		wg.Add(1)
+		go func(k int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			i := k * limit
+			j := i + limit
+			if j > len(b.Members) {
+				j = len(b.Members)
+			}
+			sub := block{Members: b.Members[i:j], Anchors: b.Anchors}
+			body, err := c.compress(ctx, g, sub, nodeByID)
+			subs[k] = subResult{body: body, err: err}
+		}(k)
+	}
+	wg.Wait()
+
+	out := make([]string, 0, nSubs)
+	for k, s := range subs {
+		if s.err != nil {
+			// 某个子块失败：整块视为失败(宁可重试也不要写半截摘要)。
+			return nil, fmt.Errorf("子块 %d/%d 压缩失败: %w", k+1, nSubs, s.err)
+		}
+		out = append(out, s.body)
+	}
+	return out, nil
+}
+
+// countThinking 数一数消息里有几个思考块。用于区分「模型只思考没正文」
+// 与「模型什么都没返回」。
+func countThinking(msg llm.Message) int {
+	n := 0
+	for _, b := range msg.Content {
+		if b.Type == llm.BlockThinking {
+			n++
+		}
+	}
+	return n
 }
 
 // compressionSystemPrompt is the §4 body prompt.
@@ -620,5 +886,6 @@ const compressionSystemPrompt = `你在压缩一组【彼此关联】的探索�
 4. 带上 id：每条结论后标注来源节点 id（如"…（#12,#28）"），让规划者能按 id 还原原节点。
 5. 正向陈述、只写输入里有的：不脑补、不引入输入中没有的判断。
 6. 长度随内容自适应：结论少就短，多且互不相同就写够——但整体显著短于所有输入 summary 的总和。
+7. 保留终态语义：涉及 intent 成员的，保留其 state 与收场含义——exhausted 要点明是「手段穷尽、方向无增量」还是「步数/时间被掐断、未完成非死路」（输入带 stop_reason 时照抄），blocked 标明是外部故障。规划者据它判「这个方向还能不能接续」，压缩时吞掉这一位 = 接续决策失据。
 
 只输出 body 正文本身。`

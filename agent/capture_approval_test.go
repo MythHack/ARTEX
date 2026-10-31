@@ -44,7 +44,13 @@ func TestCaptureApprovalLifecycle(t *testing.T) {
 		name, action, status, execution string
 		manual, approve, toolError      bool
 	}{
-		{"model_fallback", "invalid", "allowed", "succeeded", false, false, false},
+		// An unusable verdict is a JUDGE FAILURE, not an allow: the configured
+		// fail action is "ask" (a downed model must not silently allow), so the
+		// call goes to the human queue, expires after AskTimeoutSeconds, and
+		// only then releases through AskTimeoutAction. The row therefore
+		// records "timeout", not "allowed" — the effective action is allow but
+		// the approval path it travelled is the timeout one.
+		{"model_fallback", "invalid", "timeout", "succeeded", false, false, false},
 		{"model_allow", "allow", "allowed", "succeeded", false, false, false},
 		{"model_deny", "deny", "denied", "not_executed", false, false, false},
 		{"human_allow_tool_error", "ask", "allowed", "failed", true, true, true},
@@ -114,18 +120,24 @@ func TestCaptureApprovalLifecycle(t *testing.T) {
 			a := detail.Audit
 			initialAction := tc.action
 			if tc.action == "invalid" {
-				initialAction = "allow"
+				// An unusable verdict is a judge failure, and the fail action is
+				// "ask": the recorded initial action is the ask it escalated to,
+				// not an allow. The eventual allow comes from the ask timeout.
+				initialAction = "ask"
 			}
 			wantUserMessage := "record this review"
-			if initialAction == "allow" {
-				// Routine automatic allows keep decision/execution metadata but
-				// intentionally omit the bulky replay context from the audit row.
+			// A routine automatic allow (the model itself returned allow) keeps
+			// decision/execution metadata but intentionally omits the bulky
+			// replay context. Every other path — ask, deny, and the timeout
+			// that releases a failed judge — keeps it, because a human looked
+			// at the queue and the context is what they audit.
+			if tc.status == "allowed" && initialAction == "allow" {
 				wantUserMessage = ""
 			}
 			if detail.Status != tc.status || detail.DecisionSource != "model" || a == nil || a.ExecutionStatus != tc.execution || a.ToolUseID != "probe-call" || a.UserMessage != wantUserMessage || a.InitialAction != initialAction || a.ModelFallback != (tc.action == "invalid") || a.ProfileID != 7 {
 				t.Fatalf("unexpected review: row=%+v audit=%+v", detail.InterceptApprovalRow, a)
 			}
-			if initialAction == "allow" && (len(a.Context) != 0 || a.UserTruncated || a.ContextTruncated) {
+			if tc.status == "allowed" && initialAction == "allow" && (len(a.Context) != 0 || a.UserTruncated || a.ContextTruncated) {
 				t.Fatalf("routine allow retained replay context: %+v", a)
 			}
 			wantCalls := 1

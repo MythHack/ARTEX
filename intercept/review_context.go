@@ -68,6 +68,17 @@ func WithReviewWorkingDirectory(ctx context.Context, workingDir string) context.
 	return context.WithValue(ctx, reviewContextKey{}, env)
 }
 
+// ReviewWorkingDirectory returns the working directory bound to this run, or
+// "" when none is bound.
+//
+// 用途：工具需要把脚本/中间产物写进「本次 run 的工作目录」（平台的规约要求
+// 中间产物不落 /tmp），但工具本身拿不到 run 的目录——它只在自己的 context 里
+// 看到调用参数。这个读取器是那个目录的唯一出口。
+func ReviewWorkingDirectory(ctx context.Context) string {
+	env, _ := ctx.Value(reviewContextKey{}).(reviewEnvironment)
+	return env.workingDir
+}
+
 func BuildReviewInput(ctx context.Context, tool string, arguments json.RawMessage) (ReviewInput, error) {
 	if !json.Valid(arguments) {
 		return ReviewInput{}, fmt.Errorf("工具参数不是有效 JSON")
