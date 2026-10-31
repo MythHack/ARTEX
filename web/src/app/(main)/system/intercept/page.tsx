@@ -64,8 +64,8 @@ import type {
 
 // fmtTokens 把 token 数压成紧凑写法(1.2k / 3.4M),用于审批用量统计。
 function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
-  if (n >= 1000) return (n / 1000).toFixed(1) + "k";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
   return String(n);
 }
 
@@ -74,7 +74,7 @@ function JudgeStat({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg border bg-muted/20 px-3 py-2">
       <div className="text-[10px] text-muted-foreground">{label}</div>
-      <div className="mt-0.5 text-lg font-semibold tabular-nums">{value}</div>
+      <div className="mt-0.5 font-semibold text-lg tabular-nums">{value}</div>
     </div>
   );
 }
@@ -169,8 +169,8 @@ const defaultForm = (): RuleForm => ({
   action: "deny",
   message: "",
   timeout_enabled: true,
-  timeout_seconds: 60,
-  timeout_action: "deny",
+  timeout_seconds: 180,
+  timeout_action: "allow",
 });
 
 // ---- small components ----
@@ -178,13 +178,14 @@ const defaultForm = (): RuleForm => ({
 function ActionBadge({ action }: { action: InterceptAction }) {
   if (action === "allow") return <Badge variant="secondary">允许</Badge>;
   if (action === "deny")  return <Badge variant="destructive">禁止</Badge>;
+  if (action === "judge") return <Badge variant="default">Agent 研判</Badge>;
   return <Badge variant="outline" className="border-amber-400 text-amber-600">申请</Badge>;
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="space-y-1.5">
-      <Label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+      <Label className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
         {label}
       </Label>
       {children}
@@ -200,12 +201,12 @@ const defaultJudge = (): JudgeConfig => ({
   enabled: false,
   profile_id: 0,
   prompt: "",
-  timeout_seconds: 15,
+  timeout_seconds: 180,
   retry_count: 3,
   retry_interval_ms: 1000,
   fail_action: "ask",
-  ask_timeout_seconds: 300,
-  ask_timeout_action: "deny",
+  ask_timeout_seconds: 180,
+  ask_timeout_action: "allow",
   incomplete_script_action: "model",
 });
 
@@ -232,7 +233,7 @@ function JudgeCard() {
       setCfg(j);
       setProfiles(ps);
     } catch (e) {
-      toast.error("加载模型兜底配置失败: " + (e as Error).message);
+      toast.error(`加载模型兜底配置失败: ${(e as Error).message}`);
     } finally {
       setLoading(false);
     }
@@ -258,7 +259,7 @@ function JudgeCard() {
       toast.success("模型兜底配置已保存");
       await load(); // 回读:提示词若清空则回填内置模板
     } catch (e) {
-      toast.error("保存失败: " + (e as Error).message);
+      toast.error(`保存失败: ${(e as Error).message}`);
     } finally {
       setSaving(false);
     }
@@ -273,7 +274,7 @@ function JudgeCard() {
       setCfg(j);
       toast.success("已恢复内置默认模板");
     } catch (e) {
-      toast.error("恢复失败: " + (e as Error).message);
+      toast.error(`恢复失败: ${(e as Error).message}`);
     } finally {
       setSaving(false);
     }
@@ -290,14 +291,14 @@ function JudgeCard() {
         <div className="flex items-center gap-2.5">
           <BotIcon className={`h-5 w-5 shrink-0 ${cfg.enabled ? "text-violet-600" : "text-muted-foreground"}`} />
           <div>
-            <p className="text-sm font-semibold leading-tight">模型兜底审批</p>
-            <p className="text-xs text-muted-foreground mt-0.5">
+            <p className="font-semibold text-sm leading-tight">模型兜底审批</p>
+            <p className="mt-0.5 text-muted-foreground text-xs">
               在<span className="font-medium text-foreground">拦截范围</span>内、且<span className="font-medium text-foreground">没有任何拦截规则命中</span>的命令，才由模型做语义判断（放行 / 转人工 / 拦截）
             </p>
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <span className="text-xs text-muted-foreground">{cfg.enabled ? "已启用" : "未启用"}</span>
+          <span className="text-muted-foreground text-xs">{cfg.enabled ? "已启用" : "未启用"}</span>
           <Switch checked={cfg.enabled} disabled={loading} onCheckedChange={(v) => patch({ enabled: v })} />
         </div>
       </div>
@@ -308,8 +309,8 @@ function JudgeCard() {
           <CardContent className="p-4">
             <div className="mb-3 flex items-center justify-between">
               <div>
-                <p className="text-sm font-medium">审批 Token 消耗</p>
-                <p className="text-xs text-muted-foreground">
+                <p className="font-medium text-sm">审批 Token 消耗</p>
+                <p className="text-muted-foreground text-xs">
                   模型兜底审批累计用量,单独计量(worker=judge),不与各模型配置的统计混在一起
                 </p>
               </div>
@@ -326,7 +327,7 @@ function JudgeCard() {
             </div>
             {usage.daily.length > 0 && (
               <div className="mt-4">
-                <p className="mb-2 text-[10px] uppercase tracking-wider text-muted-foreground">
+                <p className="mb-2 text-[10px] text-muted-foreground uppercase tracking-wider">
                   近 30 天每日消耗(输入 + 输出)
                 </p>
                 <JudgeSparkbars daily={usage.daily} />
@@ -343,8 +344,8 @@ function JudgeCard() {
             <CardContent className="flex min-h-0 flex-1 flex-col gap-2 p-4">
               <div className="flex items-center justify-between">
                 <div>
-                  <p className="text-sm font-medium">审批提示词</p>
-                  <p className="text-xs text-muted-foreground">模型据此判定 ALLOW / ASK / DENY，可直接编辑</p>
+                  <p className="font-medium text-sm">审批提示词</p>
+                  <p className="text-muted-foreground text-xs">模型据此判定 ALLOW / ASK / DENY，可直接编辑</p>
                 </div>
                 <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={restorePrompt} disabled={saving}>
                   恢复默认模板
@@ -365,7 +366,7 @@ function JudgeCard() {
           <Card className="lg:col-span-2">
             <CardContent className="space-y-5 p-4">
               <div className="space-y-4">
-                <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">判定模型与策略</p>
+                <p className="font-semibold text-[10px] text-muted-foreground uppercase tracking-wider">判定模型与策略</p>
                 <Field label="审批模型">
                   <Select value={String(cfg.profile_id || 0)} onValueChange={(v) => patch({ profile_id: Number(v) })}>
                     <SelectTrigger><SelectValue /></SelectTrigger>
@@ -389,6 +390,11 @@ function JudgeCard() {
                       if (n > 0) patch({ timeout_seconds: n });
                     }}
                   />
+                  <p className="text-muted-foreground mt-1 text-xs">
+                    思考型模型（强制 adaptive thinking 的那些）的判定耗时随命令长度而变：
+                    短命令几秒，长命令（几百上千字符的 shell 脚本）明显更久；正文为空时还会
+                    升预算重试。给短了会把「模型其实能判定」误判成超时失败——默认 180 秒。
+                  </p>
                 </Field>
                 <FieldGroup>
                   <FormField>
@@ -435,11 +441,15 @@ function JudgeCard() {
                   <Select value={cfg.fail_action} onValueChange={(v) => patch({ fail_action: v as JudgeConfig["fail_action"] })}>
                     <SelectTrigger><SelectValue /></SelectTrigger>
                     <SelectContent>
+                      <SelectItem value="ask">转人工审批（推荐）</SelectItem>
                       <SelectItem value="allow">放行</SelectItem>
-                      <SelectItem value="ask">转人工审批</SelectItem>
                       <SelectItem value="deny">拦截</SelectItem>
                     </SelectContent>
                   </Select>
+                  <span className="text-muted-foreground text-xs">
+                    模型挂掉时「放行」等于关卡自动敞开（多半是配置问题：thinking 不兼容、额度耗尽、上游 5xx），
+                    推荐转人工——至少会留下一条待办记录。
+                  </span>
                 </Field>
                 <Field label="脚本快照不完整时">
                   <Select
@@ -458,7 +468,7 @@ function JudgeCard() {
               <Separator />
 
               <div className="space-y-4">
-                <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">人工审批（模型判为「转人工」时）</p>
+                <p className="font-semibold text-[10px] text-muted-foreground uppercase tracking-wider">人工审批（模型判为「转人工」时）</p>
                 <Field label="审批等待超时（秒）">
                   <Input
                     type="number"
@@ -474,10 +484,15 @@ function JudgeCard() {
                   <Select value={cfg.ask_timeout_action} onValueChange={(v) => patch({ ask_timeout_action: v as JudgeConfig["ask_timeout_action"] })}>
                     <SelectTrigger><SelectValue /></SelectTrigger>
                     <SelectContent>
+                      <SelectItem value="allow">放行（推荐 · 人不在时不卡死）</SelectItem>
                       <SelectItem value="deny">拦截</SelectItem>
-                      <SelectItem value="allow">放行</SelectItem>
                     </SelectContent>
                   </Select>
+                  <span className="text-muted-foreground text-xs">
+                    人工审批会【同步阻塞】执行它的 worker。选「拦截」时，你人不在电脑前
+                    整条渗透链就停在这一条命令上；选「放行」则继续跑，事后仍可在
+                    「拦截审批」页看到记录并追认。
+                  </span>
                 </Field>
               </div>
             </CardContent>
@@ -590,7 +605,7 @@ export default function InterceptPage() {
         toast.success("规则已创建");
       }
       setOpen(false);
-      load();
+      await load();
     } catch (e) {
       toast.error((e as Error).message);
     } finally {
@@ -602,7 +617,7 @@ export default function InterceptPage() {
     try {
       await api.deleteInterceptRule(id);
       toast.success("规则已删除");
-      load();
+      await load();
     } catch (e) {
       toast.error((e as Error).message);
     }
@@ -611,7 +626,7 @@ export default function InterceptPage() {
   async function handleToggle(rule: InterceptRule) {
     try {
       await api.toggleInterceptRule(rule.id, !rule.enabled);
-      load();
+      await load();
     } catch (e) {
       toast.error((e as Error).message);
     }
@@ -627,7 +642,7 @@ export default function InterceptPage() {
       setAllTools(tools);
       setEnabledTools(new Set(cfg.enabled_tools));
     } catch (e) {
-      toast.error("加载失败: " + (e as Error).message);
+      toast.error(`加载失败: ${(e as Error).message}`);
     } finally {
       setScopeLoading(false);
     }
@@ -649,7 +664,7 @@ export default function InterceptPage() {
       setScopeTools([...enabledTools]);
       setScopeOpen(false);
     } catch (e) {
-      toast.error("保存失败: " + (e as Error).message);
+      toast.error(`保存失败: ${(e as Error).message}`);
     } finally {
       setScopeSaving(false);
     }
@@ -666,8 +681,8 @@ export default function InterceptPage() {
       <div className="flex items-center gap-2.5">
         <ShieldAlertIcon className="h-5 w-5 shrink-0" />
         <div>
-          <h1 className="text-lg font-semibold leading-tight">命令拦截</h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
+          <h1 className="font-semibold text-lg leading-tight">命令拦截</h1>
+          <p className="mt-0.5 text-muted-foreground text-sm">
             工具执行前先按拦截规则匹配；未命中的命令可交由模型兜底判定
           </p>
         </div>
@@ -717,7 +732,7 @@ export default function InterceptPage() {
         {/* ---- tab: 拦截规则 ---- */}
         <TabsContent value="rules" className="mt-4 flex flex-col gap-4">
           <div className="flex items-center justify-between gap-3">
-            <p className="text-xs text-muted-foreground">
+            <p className="text-muted-foreground text-xs">
               按优先级（数字越大越先）逐条匹配，首条命中的规则生效
             </p>
             <Button onClick={openNew} size="sm" className="shrink-0">
@@ -729,11 +744,11 @@ export default function InterceptPage() {
           <Card>
             <CardContent className="p-0">
           {loading ? (
-            <p className="p-6 text-sm text-muted-foreground">加载中…</p>
+            <p className="p-6 text-muted-foreground text-sm">加载中…</p>
           ) : rules.length === 0 ? (
             <div className="flex flex-col items-center justify-center gap-2 py-16 text-center">
               <ShieldAlertIcon className="h-8 w-8 text-muted-foreground/40" />
-              <p className="text-sm text-muted-foreground">暂无规则</p>
+              <p className="text-muted-foreground text-sm">暂无规则</p>
               <Button size="sm" variant="outline" onClick={openNew}>
                 <PlusIcon className="h-4 w-4" />
                 新建第一条规则
@@ -761,22 +776,36 @@ export default function InterceptPage() {
                     </TableCell>
                     <TableCell className="font-medium text-sm">{rule.name}</TableCell>
                     <TableCell>
-                      <span className="text-xs text-muted-foreground">
+                      <span className="text-muted-foreground text-xs">
                         {rule.match_target === "tool_name" ? "工具名" : "输入内容"}
                       </span>
                     </TableCell>
                     <TableCell>
-                      <span className="text-xs text-muted-foreground">
+                      <span className="text-muted-foreground text-xs">
                         {rule.match_type === "regex" ? "正则" : "字符串"}
                       </span>
                     </TableCell>
                     <TableCell className="max-w-[220px]">
-                      <code className="block truncate rounded bg-muted px-1.5 py-0.5 text-xs font-mono">
+                      <code className="block truncate rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
                         {rule.pattern}
                       </code>
                     </TableCell>
                     <TableCell>
                       <ActionBadge action={rule.action} />
+                      {/*
+                        超时策略要显式展示，因为它现在**真的生效**了。
+
+                        2026-10-22 之前，规则的 timeout_enabled/seconds/action
+                        是死字段：界面显示「超时 60s / 超时后 deny」，实际生效的
+                        却是全局的「180s / 失败转人工」——用户看到的和实际做的
+                        不一致。现在规则自己的声明优先于全局，所以必须让用户
+                        看得到「这条规则自己是怎么算的」。
+                      */}
+                      <div className="mt-1 whitespace-nowrap text-[10px] text-muted-foreground">
+                        {rule.timeout_enabled
+                          ? `超时 ${rule.timeout_seconds}s → ${rule.timeout_action === "allow" ? "放行" : "拒绝"}`
+                          : "超时用全局配置"}
+                      </div>
                     </TableCell>
                     <TableCell className="text-center">
                       <Switch
@@ -826,7 +855,7 @@ export default function InterceptPage() {
             </SheetDescription>
           </SheetHeader>
 
-          <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5 space-y-5">
+          <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 py-5">
             <Field label="名称">
               <Input
                 placeholder="给规则起个名字"
@@ -839,7 +868,7 @@ export default function InterceptPage() {
               <Input
                 type="number"
                 value={form.priority}
-                onChange={(e) => set({ priority: parseInt(e.target.value) || 0 })}
+                onChange={(e) => set({ priority: parseInt(e.target.value, 10) || 0 })}
               />
             </Field>
 
@@ -879,10 +908,10 @@ export default function InterceptPage() {
                 className={regexErr ? "border-destructive focus-visible:ring-destructive" : ""}
               />
               {regexErr && (
-                <p className="text-xs text-destructive mt-1">{regexErr}</p>
+                <p className="mt-1 text-destructive text-xs">{regexErr}</p>
               )}
               {regexWarn && (
-                <p className="text-xs text-amber-600 mt-1">包含 Go RE2 扩展语法（如 <code className="font-mono">(?i)</code>），浏览器无法预览，提交后由服务端验证</p>
+                <p className="mt-1 text-amber-600 text-xs">包含 Go RE2 扩展语法（如 <code className="font-mono">(?i)</code>），浏览器无法预览，提交后由服务端验证</p>
               )}
             </Field>
 
@@ -898,11 +927,23 @@ export default function InterceptPage() {
                   <SelectItem value="allow">允许 — 直接放行，跳过后续规则</SelectItem>
                   <SelectItem value="deny">禁止 — 阻断，返回拒绝消息给模型</SelectItem>
                   <SelectItem value="ask">向用户申请 — 等待审批</SelectItem>
+                  <SelectItem value="judge">Agent 研判 — 命中后由模型判断风险再决定</SelectItem>
                 </SelectContent>
               </Select>
             </Field>
 
-            {form.action !== "allow" && (
+            {form.action === "judge" && (
+              <div className="rounded-md border border-blue-500/30 bg-blue-500/5 p-3 text-xs">
+                <p className="mb-1 font-medium text-blue-600 dark:text-blue-400">Agent 研判</p>
+                <p className="text-muted-foreground">
+                  命中后调用「模型配置」里的裁决模型：只读/正常渗透动作放行，直接破坏真实资产的动作拦截，
+                  判不准才转人工。会多一次 LLM 调用（超时、失败策略、用量统计都走「模型配置」）。
+                  即使全局兜底审批开关关闭，本规则仍会生效。
+                </p>
+              </div>
+            )}
+
+            {form.action !== "allow" && form.action !== "judge" && (
               <Field label={form.action === "deny" ? "拒绝消息（返回给模型）" : "审批说明（可选）"}>
                 <Textarea
                   placeholder={form.action === "deny" ? "操作被安全策略阻止" : ""}
@@ -919,8 +960,8 @@ export default function InterceptPage() {
                 <Separator />
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="text-sm font-medium">启用审批超时</p>
-                    <p className="text-xs text-muted-foreground">超时后自动处置，不再等待</p>
+                    <p className="font-medium text-sm">启用审批超时</p>
+                    <p className="text-muted-foreground text-xs">超时后自动处置，不再等待</p>
                   </div>
                   <Switch
                     checked={form.timeout_enabled}
@@ -970,7 +1011,7 @@ export default function InterceptPage() {
             </div>
           </div>
 
-          <SheetFooter className="border-t px-6 py-4 flex-row justify-end gap-2">
+          <SheetFooter className="flex-row justify-end gap-2 border-t px-6 py-4">
             <Button variant="outline" onClick={() => setOpen(false)}>取消</Button>
             <Button onClick={handleSave} disabled={saving || !!regexErr}>
               {saving ? "保存中…" : "保存"}
@@ -981,7 +1022,7 @@ export default function InterceptPage() {
 
       {/* ---- scope dialog ---- */}
       <Dialog open={scopeOpen} onOpenChange={setScopeOpen}>
-        <DialogContent className="sm:max-w-lg flex flex-col overflow-hidden p-0 gap-0" style={{ maxHeight: "min(80vh, 560px)" }}>
+        <DialogContent className="flex flex-col gap-0 overflow-hidden p-0 sm:max-w-lg" style={{ maxHeight: "min(80vh, 560px)" }}>
           <DialogHeader className="shrink-0 border-b px-6 py-4">
             <DialogTitle className="flex items-center gap-2">
               <ListFilterIcon className="h-4 w-4" />
@@ -992,14 +1033,14 @@ export default function InterceptPage() {
             </DialogDescription>
           </DialogHeader>
 
-          <div className="flex-1 min-h-0 overflow-y-auto px-6 py-4 space-y-5">
+          <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 py-4">
             {scopeLoading ? (
-              <p className="text-sm text-muted-foreground py-4">加载中…</p>
+              <p className="py-4 text-muted-foreground text-sm">加载中…</p>
             ) : (
               toolGroups.map((group, gi) => (
                 <div key={group.label}>
                   {gi > 0 && <Separator className="mb-5" />}
-                  <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-2">
+                  <p className="mb-2 font-semibold text-[10px] text-muted-foreground uppercase tracking-wider">
                     {group.label}
                   </p>
                   <div className="space-y-0.5">
@@ -1010,7 +1051,7 @@ export default function InterceptPage() {
                           checked={enabledTools.has(t.key)}
                           onCheckedChange={(v) => toggleTool(t.key, v)}
                         />
-                        <label htmlFor={`scope-${t.key}`} className="flex-1 min-w-0 cursor-pointer">
+                        <label htmlFor={`scope-${t.key}`} className="min-w-0 flex-1 cursor-pointer">
                           <div className="flex items-center gap-1.5">
                             <span className="font-mono text-sm">{t.key}</span>
                             {(t.kind && t.kind !== "builtin") && (
@@ -1018,7 +1059,7 @@ export default function InterceptPage() {
                             )}
                           </div>
                           {t.description && (
-                            <p className="text-[11px] text-muted-foreground line-clamp-1">{t.description}</p>
+                            <p className="line-clamp-1 text-[11px] text-muted-foreground">{t.description}</p>
                           )}
                         </label>
                       </div>
@@ -1029,7 +1070,7 @@ export default function InterceptPage() {
             )}
           </div>
 
-          <div className="shrink-0 border-t px-6 py-3 flex justify-end gap-2">
+          <div className="flex shrink-0 justify-end gap-2 border-t px-6 py-3">
             <Button variant="outline" size="sm" onClick={() => setScopeOpen(false)}>取消</Button>
             <Button size="sm" onClick={saveScope} disabled={scopeSaving || scopeLoading}>
               {scopeSaving ? "保存中…" : "保存"}

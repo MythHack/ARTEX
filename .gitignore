@@ -1,13 +1,31 @@
-# backend
-/data/
-*.db
-*.db-wal
-*.db-shm
+# 编译产物
+/artex
+/artex.exe
+/artex-*
+/dist/
+*.zip
+SHA256SUMS
+
+# 前端开发产物
+/web/node_modules/
+/web/.next/
+/web/src/.next/
+/web/out/
+/web/.turbo/
+/web/.vercel/
+
+# Go embed 编译产物（构建时生成，不提交）
+/server/webui/dist/
+/server/web/
+
+# 环境与敏感配置
+.env
+*.pem
+*.key
+*.crt
 config.json
-scheduler_state.json
-__pycache__/
-*.pyc
-*.pyo
+*.sqlite
+*.db
 
 # frontend
 web/node_modules/
@@ -17,46 +35,30 @@ web/next-env.d.ts
 .vercel/
 web/public/demo-version.json
 *.local
+# 数据目录
+/data/
+/pgdata/
+*.sqlite
+*.db
 
-# development tools
-.playwright-mcp/
-.playwright-cli/
+# IDE/编辑器
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
 
-# docs
-/docs/
-
-# os
+# OS 生成
 .DS_Store
 Thumbs.db
 
-# claude code local state
-.claude/
-
-# 内嵌前端的单二进制产物
-/artex
-# 一键更新在可执行文件旁留下的中间产物（暂存件 / 备份 / 失败版本 / 升级标记）
-/artex.new
-/artex.new.sha256
-/artex.old
-/artex.failed
-/artex.upgrade.json
-/server/webui/dist/
-/dist/
-
-# JWT 签名密钥（运行时生成，存项目根，绝不提交）
-/jwt.key
-
-# Docker 部署生成的本地环境（含密码/密钥，不提交）
-.env
-
-# 调度器运行/模拟产生的事件日志（测试产物，不提交）
+# 测试产物
 *-events.csv
-
-# bench 基准测试相关（本地产物，不提交）
 /bench/
 /Dockerfile.bench
 /Dockerfile.bench.v2
+
+# Python 缓存
+__pycache__/
+*.pyc
+.build-tmp/

@@ -173,6 +173,10 @@ package_binary() {
   rm -rf "$package_root" "$archive"
   mkdir -p "$package_root"
   cp "$binary" "$package_root/"
+  # 安装助手跟着 Linux 包走(它是「一键安装」的执行体,由 install.sh 装成 root 常驻服务)
+  if [ -f "$(dirname "$binary")/artex-hostd" ]; then
+    cp "$(dirname "$binary")/artex-hostd" "$package_root/"
+  fi
   # 守护启动脚本是正式入口：页面上的一键更新要靠它在进程退出后重新拉起，
   # 直接跑 artex 本体的话更新完就再也起不来了。按目标系统只带对应的那一份。
   if [ "$goos" = "windows" ]; then
@@ -225,6 +229,23 @@ build_target() {
 
   compress_binary "$output" "$goos"
   if command -v file >/dev/null 2>&1; then file "$output"; fi
+  # 特权安装助手(仅 Linux:靠 Unix socket + apt/dnf,其它平台无意义)。
+  # 主服务被 NoNewPrivileges/ProtectSystem=strict 锁死无法提权,「一键安装」
+  # 由这个 root 常驻的助手执行,所以它必须随发行包一起发布。
+  if [ "$goos" = "linux" ]; then
+    hostd_output="$(dirname "$output")/artex-hostd"
+    info "编译 ${goos}/${goarch} 安装助手"
+    GOSUMDB="$ARTEX_GOSUMDB" \
+    CGO_ENABLED=0 \
+    GOOS="$goos" \
+    GOARCH="$goarch" \
+    go build \
+      -trimpath \
+      -ldflags "-s -w -buildid= -X main.version=${ARTEX_BUILD_VERSION}" \
+      -o "$hostd_output" \
+      ./cmd/artex-hostd
+    compress_binary "$hostd_output" "$goos"
+  fi
   if [ "$ARTEX_PACKAGE" = "1" ]; then package_binary "$output" "$goos" "$goarch"; fi
   ok "编译完成：$output"
 }

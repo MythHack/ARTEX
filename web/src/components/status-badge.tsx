@@ -12,17 +12,21 @@ export function StatusBadge({
   value,
   dot = false,
   className,
+  title,
 }: {
   domain: StatusDomain;
   value: string;
   dot?: boolean;
   className?: string;
+  /** 悬停提示。用于把「为什么是这个状态」摆在状态徽章上（如意图的中断原因）。 */
+  title?: string;
 }) {
   const meta = statusMeta(domain, value);
   return (
     <span
+      title={title}
       className={cn(
-        "inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-xs font-medium whitespace-nowrap",
+        "inline-flex items-center gap-1.5 whitespace-nowrap rounded-md border px-2 py-0.5 font-medium text-xs",
         toneClasses[meta.tone],
         className,
       )}

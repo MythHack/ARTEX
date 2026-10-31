@@ -58,16 +58,16 @@ function AgentGridCard({
       toast.success(`已删除 Agent「${agent.name}」`);
       onDeleted();
     } catch (e) {
-      toast.error("删除失败：" + (e as Error).message);
+      toast.error(`删除失败：${(e as Error).message}`);
     }
   }
   return (
-    <div className="hover:border-primary/50 group relative flex flex-col gap-2 rounded-lg border p-4 transition-colors">
+    <div className="group relative flex flex-col gap-2 rounded-lg border p-4 transition-colors hover:border-primary/50">
       <button type="button" onClick={onOpen} className="flex flex-col gap-2 text-left">
         <div className="flex flex-wrap items-center gap-2">
-          <Bot className="text-muted-foreground size-4" />
-          <span className="text-sm font-medium">{agent.name}</span>
-          <span className="text-muted-foreground font-mono text-xs">{agent.key}</span>
+          <Bot className="size-4 text-muted-foreground" />
+          <span className="font-medium text-sm">{agent.name}</span>
+          <span className="font-mono text-muted-foreground text-xs">{agent.key}</span>
           {agent.builtin ? (
             <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
               内置
@@ -78,15 +78,15 @@ function AgentGridCard({
             </Badge>
           )}
           {!agent.enabled && (
-            <Badge variant="outline" className="text-destructive px-1.5 py-0 text-[10px]">
+            <Badge variant="outline" className="px-1.5 py-0 text-[10px] text-destructive">
               已停用
             </Badge>
           )}
         </div>
-        <p className="text-muted-foreground line-clamp-2 min-h-8 text-xs">
+        <p className="line-clamp-2 min-h-8 text-muted-foreground text-xs">
           {agent.description || "（无描述）"}
         </p>
-        <div className="text-muted-foreground flex flex-wrap gap-1.5 text-[10px]">
+        <div className="flex flex-wrap gap-1.5 text-[10px] text-muted-foreground">
           <span className="rounded border px-1.5 py-0.5">MCP {agent.mcp_count ?? 0}</span>
           <span className="rounded border px-1.5 py-0.5">Skill {agent.skill_count ?? 0}</span>
           <span className="rounded border px-1.5 py-0.5">工具 {agent.tool_count ?? 0}</span>
@@ -98,7 +98,7 @@ function AgentGridCard({
             <Button
               variant="ghost"
               size="icon-sm"
-              className="text-muted-foreground hover:text-destructive absolute top-2 right-2 opacity-0 transition-opacity group-hover:opacity-100"
+              className="absolute top-2 right-2 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
             >
               <Trash2Icon className="size-3.5" />
             </Button>
@@ -139,7 +139,7 @@ function CreateAgentDialog({ onCreated }: { onCreated: (key: string) => void }) 
       setDescription("");
       onCreated(a.key);
     } catch (e) {
-      toast.error("创建失败：" + (e as Error).message);
+      toast.error(`创建失败：${(e as Error).message}`);
     } finally {
       setBusy(false);
     }
@@ -223,7 +223,7 @@ export default function AgentsPage() {
     <div className="flex flex-1 flex-col gap-4 md:gap-6">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">Agent</h1>
+          <h1 className="font-semibold text-xl tracking-tight">Agent</h1>
           <p className="text-muted-foreground text-sm">
             内置 Agent 的提示词/配置，以及自定义会话 Agent 的创建与管理
           </p>
@@ -243,7 +243,7 @@ export default function AgentsPage() {
         </CardHeader>
         <CardContent>
           {agents.length === 0 ? (
-            <p className="text-muted-foreground py-6 text-center text-sm">（暂无 Agent）</p>
+            <p className="py-6 text-center text-muted-foreground text-sm">（暂无 Agent）</p>
           ) : (
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {agents.map((a) => (
@@ -257,14 +257,14 @@ export default function AgentsPage() {
       <Sheet open={!!editing} onOpenChange={(o) => !o && setEditKey(null)}>
         <SheetContent
           side="right"
-          className="flex flex-col gap-0 p-0 data-[side=right]:w-[45vw] data-[side=right]:sm:max-w-[45vw]"
+          className="flex w-full! max-w-none! flex-col gap-0 p-0 sm:w-[45vw]! sm:max-w-[45vw]!"
         >
           {editing && (
             <>
               <SheetHeader className="px-4">
                 <SheetTitle className="flex items-center gap-2">
                   {editing.name}
-                  <span className="text-muted-foreground font-mono text-xs">{editing.key}</span>
+                  <span className="font-mono text-muted-foreground text-xs">{editing.key}</span>
                   {!editing.builtin && (
                     <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
                       自定义

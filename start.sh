@@ -25,6 +25,20 @@ BIN=./artex
 
 RESTART_CODE=75
 MAX_DELAY=60
+# 连续崩溃多少次后放弃自拉起。
+#
+# 为什么要有上限：崩溃在【配置坏了】时是永久的（数据库密码不对、schema 迁移
+# 失败、端口被占），此时无限重启有两个坏处——
+#   1) 日志被同一行错误刷爆，真正的首因被埋掉；
+#   2) **systemctl status 显示 active (running)**——因为活着的是 start.sh 这个
+#      包装脚本，artex 本体在反复崩溃重启。运维看状态以为服务正常，网页
+#      却打不开，排查方向完全跑偏（2026-10-22 在真机上就撞到过这个）。
+#
+# 放弃自拉起后脚本以非 0 退出，systemd 的 Restart=always 会接手并因
+# StartLimit 达到上限而把单元置为 failed —— 这时 status 才会如实显示故障。
+# 「程序请求重启」(75) 不计入崩溃次数：那是用户点「一键更新」，是正常流程。
+MAX_CRASHES=5
+crashes=0
 
 child=0
 stopping=0
@@ -71,9 +85,17 @@ while :; do
 			# 更新/回滚已就绪：重跑后 artex 会在启动时完成换装（见 selfupdate.Bootstrap）。
 			echo "[artex] 请求重启（应用新版本）…"
 			delay=1
+			crashes=0
 			;;
 		*)
-			echo "[artex] 异常退出 (code=$code)，${delay}s 后重启" >&2
+			crashes=$((crashes + 1))
+			if [ "$crashes" -ge "$MAX_CRASHES" ]; then
+				echo "[artex] 连续 ${crashes} 次异常退出，放弃自拉起（退出码 $code）。" >&2
+				echo "[artex] 这多半是配置或环境问题（如数据库密码不一致、端口被占、依赖缺失），" >&2
+				echo "[artex] 修好后请执行: sudo systemctl restart artex" >&2
+				exit "$code"
+			fi
+			echo "[artex] 异常退出 (code=$code)，${delay}s 后重启（第 ${crashes}/${MAX_CRASHES} 次）" >&2
 			sleep "$delay"
 			delay=$((delay * 2))
 			[ "$delay" -gt "$MAX_DELAY" ] && delay=$MAX_DELAY

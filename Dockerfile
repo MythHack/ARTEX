@@ -21,6 +21,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
+# nuclei(漏洞模板扫描引擎,配合 /app/nuclei-templates 情报模板库):
+# 官方 release 单二进制按架构下载,模板树由 artex 的 vulnintel 同步器维护
+# (git clone --depth 1 到 /app/nuclei-templates,每轮同步 git pull 更新)。
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) nuclei_arch="linux_amd64" ;; \
+      arm64) nuclei_arch="linux_arm64" ;; \
+      *) echo "unsupported arch: $arch"; exit 1 ;; \
+    esac; \
+    nuclei_ver="$(curl -fsSL https://api.github.com/repos/projectdiscovery/nuclei/releases/latest | jq -r .tag_name)"; \
+    curl -fsSL "https://github.com/projectdiscovery/nuclei/releases/download/${nuclei_ver}/nuclei_${nuclei_ver#v}_${nuclei_arch}.zip" -o /tmp/nuclei.zip; \
+    unzip -o /tmp/nuclei.zip -d /tmp/nuclei && install -m 0755 /tmp/nuclei/nuclei /usr/local/bin/nuclei \
+    && nuclei -version && rm -rf /tmp/nuclei /tmp/nuclei.zip
 # 预装 Playwright MCP 与 CLI（全局），运行时不再 npx 联网下载。
 # @playwright/mcp：browser MCP 直接 `npx @playwright/mcp`（已全局装好，无需 -y/@latest）。
 # @playwright/cli：提供 playwright-cli，装完顺带 --help 验证可执行。

@@ -32,6 +32,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useSideQuestions } from "@/hooks/use-side-questions";
 import { api } from "@/lib/api";
+import { listenMedia } from "@/lib/media-query";
 import type {
   InterceptApprovalFilter,
   InterceptApprovalRow,
@@ -658,13 +659,15 @@ export function ApprovalDetail({
 // expansion cannot create empty columns and leave a gap in the selected row.
 const approvalBreakpoints = ["(min-width: 40rem)", "(min-width: 48rem)", "(min-width: 64rem)", "(min-width: 80rem)"];
 function subscribeColumns(onChange: () => void) {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return () => undefined;
   const queries = approvalBreakpoints.map((query) => window.matchMedia(query));
-  for (const query of queries) query.addEventListener("change", onChange);
+  const offs = queries.map((query) => listenMedia(query, onChange));
   return () => {
-    for (const query of queries) query.removeEventListener("change", onChange);
+    for (const off of offs) off();
   };
 }
 function visibleColumnCount() {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return 3;
   const matches = approvalBreakpoints.map((query) => window.matchMedia(query).matches);
   return 3 + Number(matches[0]) + Number(matches[1]) + 2 * Number(matches[2]) + 2 * Number(matches[3]);
 }
@@ -946,7 +949,7 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
       ...historyById.get(row.id),
       ...row,
     }));
-  const title = taskId ? "拦截审批" : "审批记录";
+  const title = "拦截审批"; // 三处入口（侧栏/任务 tab/会话内嵌）统一一个名字，别让用户建两个心智
   return (
     <div className="flex min-w-0 flex-col gap-5">
       <div className="flex flex-wrap items-center justify-between gap-3">

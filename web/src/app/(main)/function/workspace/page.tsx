@@ -174,7 +174,7 @@ export default function WorkspacePage() {
       {/* 头部：面包屑 + 操作 */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-1 text-sm">
-          <HardDriveIcon className="text-muted-foreground mr-1 size-4 shrink-0" />
+          <HardDriveIcon className="mr-1 size-4 shrink-0 text-muted-foreground" />
           {crumbs.map((c, i) => (
             <React.Fragment key={c.path}>
               {i > 0 && <span className="text-muted-foreground">/</span>}
@@ -183,7 +183,7 @@ export default function WorkspacePage() {
                 onClick={() => load(c.path)}
                 className={cn(
                   "max-w-[160px] truncate rounded px-1.5 py-0.5 hover:bg-accent",
-                  i === crumbs.length - 1 ? "text-foreground font-medium" : "text-muted-foreground",
+                  i === crumbs.length - 1 ? "font-medium text-foreground" : "text-muted-foreground",
                 )}
               >
                 {c.name}
@@ -225,7 +225,7 @@ export default function WorkspacePage() {
             <TableBody>
               {entries.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={4} className="text-muted-foreground py-10 text-center text-sm">
+                  <TableCell colSpan={4} className="py-10 text-center text-muted-foreground text-sm">
                     {loading ? "加载中…" : "空目录"}
                   </TableCell>
                 </TableRow>
@@ -241,12 +241,12 @@ export default function WorkspacePage() {
                       {e.dir ? (
                         <FolderIcon className="size-4 shrink-0 text-blue-500" />
                       ) : (
-                        <FileIcon className="text-muted-foreground size-4 shrink-0" />
+                        <FileIcon className="size-4 shrink-0 text-muted-foreground" />
                       )}
                       <span className="truncate font-mono text-sm">{e.name}</span>
                     </button>
                   </TableCell>
-                  <TableCell className="text-muted-foreground text-right font-mono text-xs">
+                  <TableCell className="text-right font-mono text-muted-foreground text-xs">
                     {e.dir ? "—" : fmtSize(e.size)}
                   </TableCell>
                   <TableCell className="text-muted-foreground text-xs">{fmtTime(e.mtime)}</TableCell>
@@ -266,7 +266,7 @@ export default function WorkspacePage() {
                       <Button
                         variant="ghost"
                         size="icon"
-                        className="text-destructive size-7"
+                        className="size-7 text-destructive"
                         title="删除"
                         onClick={() => del(e)}
                       >

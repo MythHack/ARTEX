@@ -43,15 +43,15 @@ import type {
 
 // 紧凑格式化 token 数（12345 → 12.3k，2000000 → 2M）。
 function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + "M";
-  if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k`;
   return String(n);
 }
 
 // 缓存命中率 = 缓存读 / 输入（InputTokens 已含 cache_read 子集，故比值在 0–100%）。
 function cacheHitRate(cacheRead: number, input: number): string {
   if (input <= 0) return "—";
-  return Math.round((cacheRead / input) * 100) + "%";
+  return `${Math.round((cacheRead / input) * 100)}%`;
 }
 
 // 测试范围一条的显示值：域名 / 网段 / 公司。
@@ -98,7 +98,7 @@ function StatCard({
         </CardDescription>
         <CardTitle className="text-2xl tabular-nums">{value}</CardTitle>
       </CardHeader>
-      {sub && <CardContent className="text-xs text-muted-foreground">{sub}</CardContent>}
+      {sub && <CardContent className="text-muted-foreground text-xs">{sub}</CardContent>}
     </Card>
   );
 }
@@ -441,12 +441,12 @@ export function OverviewTab({ taskId }: { taskId: string }) {
         </CardHeader>
         <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div className="flex flex-col gap-1.5">
-            <div className="text-xs font-medium text-muted-foreground">描述</div>
-            <p className="text-sm whitespace-pre-wrap break-words">{task?.description?.trim() || "—"}</p>
+            <div className="font-medium text-muted-foreground text-xs">描述</div>
+            <p className="whitespace-pre-wrap break-words text-sm">{task?.description?.trim() || "—"}</p>
           </div>
           <div className="flex flex-col gap-1.5">
-            <div className="text-xs font-medium text-muted-foreground">目标</div>
-            <p className="text-sm whitespace-pre-wrap break-words">{task?.goal?.trim() || "—"}</p>
+            <div className="font-medium text-muted-foreground text-xs">目标</div>
+            <p className="whitespace-pre-wrap break-words text-sm">{task?.goal?.trim() || "—"}</p>
           </div>
         </CardContent>
       </Card>
@@ -456,7 +456,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
             <ListChecksIcon className="size-4 text-primary" /> 目标管理
-            <span className="text-muted-foreground text-xs font-normal">
+            <span className="font-normal text-muted-foreground text-xs">
               （最终可核验的目标，共 {goals.length} 条；新增/修改会通知规划者并复活任务）
             </span>
           </CardTitle>
@@ -487,7 +487,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
             <Button size="sm" variant="outline" disabled={goalBusy || !goalText.trim()} onClick={() => void addGoal()}>
               <PlusIcon className="size-3.5" /> 添加
             </Button>
-            {goalErr && <span className="text-xs text-red-500">{goalErr}</span>}
+            {goalErr && <span className="text-red-500 text-xs">{goalErr}</span>}
           </div>
           {/* 目标列表 */}
           {goals.length > 0 ? (
@@ -541,7 +541,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                     <StatusBadge domain="goal" value={g.state} />
                     <span className="min-w-0 flex-1 break-words">{g.text}</span>
                     {g.vulnclass && (
-                      <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-xs">
+                      <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-muted-foreground text-xs">
                         {g.vulnclass}
                       </span>
                     )}
@@ -579,7 +579,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
             <ShieldAlertIcon className="size-4 text-amber-500" /> 操作约束
-            <span className="text-muted-foreground text-xs font-normal">
+            <span className="font-normal text-muted-foreground text-xs">
               （框定 planner/worker 的探索边界，共 {constraints.length} 条；改动下一轮规划生效）
             </span>
           </CardTitle>
@@ -613,7 +613,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
             >
               <PlusIcon className="size-3.5" /> 添加
             </Button>
-            {conErr && <span className="text-xs text-red-500">{conErr}</span>}
+            {conErr && <span className="text-red-500 text-xs">{conErr}</span>}
           </div>
           {/* 约束列表 */}
           {constraints.length > 0 ? (
@@ -701,18 +701,18 @@ export function OverviewTab({ taskId }: { taskId: string }) {
         </CardContent>
       </Card>
       <TaskInterceptRulesCard taskId={taskId} />
-      {coverage && coverage.enabled && coverage.scope_rows > 0 && (
+      {coverage?.enabled && coverage.scope_rows > 0 && (
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <TargetIcon className="size-4 text-emerald-500" /> 资产测试覆盖度
-              <span className="text-muted-foreground text-xs font-normal">（粗估，仅供参考）</span>
+              <span className="font-normal text-muted-foreground text-xs">（粗估，仅供参考）</span>
             </CardTitle>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
             <div className="flex items-baseline gap-3">
-              <span className="text-2xl font-semibold tabular-nums">
-                {coverage.pct != null ? Math.round(coverage.pct * 100) + "%" : "—"}
+              <span className="font-semibold text-2xl tabular-nums">
+                {coverage.pct != null ? `${Math.round(coverage.pct * 100)}%` : "—"}
               </span>
               <span className="text-muted-foreground text-sm">
                 已测 {coverage.tested} / 范围内 {coverage.denominator}
@@ -722,9 +722,9 @@ export function OverviewTab({ taskId }: { taskId: string }) {
             {coverage.by_type.length > 0 && (
               <div className="flex flex-wrap gap-1.5 text-xs">
                 {coverage.by_type.map((b) => (
-                  <span key={b.type} className="bg-muted rounded px-1.5 py-0.5">
+                  <span key={b.type} className="rounded bg-muted px-1.5 py-0.5">
                     <span className="text-muted-foreground">{b.type}</span>{" "}
-                    <span className="tabular-nums font-medium">
+                    <span className="font-medium tabular-nums">
                       {b.tested}/{b.total}
                     </span>
                   </span>
@@ -739,7 +739,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
             <CoinsIcon className="size-4 text-amber-500" /> LLM Token 用量
-            <span className="text-muted-foreground text-xs font-normal">
+            <span className="font-normal text-muted-foreground text-xs">
               （按模型统计{tokenTotals.calls > 0 ? `，共 ${tokenTotals.calls} 次调用` : ""}）
             </span>
           </CardTitle>
@@ -772,7 +772,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
-                    <tr className="text-muted-foreground border-b text-left text-xs">
+                    <tr className="border-b text-left text-muted-foreground text-xs">
                       <th className="py-1.5 pr-3 font-medium">模型</th>
                       <th className="py-1.5 pr-3 text-right font-medium">调用</th>
                       <th className="py-1.5 pr-3 text-right font-medium">输入</th>
@@ -791,7 +791,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                         <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.input_tokens)}</td>
                         <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.output_tokens)}</td>
                         <td className="py-1.5 pr-3 text-right tabular-nums">{fmtTokens(m.cache_read_tokens)}</td>
-                        <td className="py-1.5 text-right tabular-nums text-emerald-500">
+                        <td className="py-1.5 text-right text-emerald-500 tabular-nums">
                           {cacheHitRate(m.cache_read_tokens, m.input_tokens)}
                         </td>
                       </tr>
@@ -810,7 +810,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
             <ShieldCheckIcon className="size-4 text-emerald-500" /> 测试范围
-            <span className="text-muted-foreground text-xs font-normal">
+            <span className="font-normal text-muted-foreground text-xs">
               （覆盖度分母 + 授权边界，共 {scope.length} 条）
             </span>
           </CardTitle>
@@ -859,18 +859,18 @@ export function OverviewTab({ taskId }: { taskId: string }) {
             >
               <PlusIcon className="size-3.5" /> 添加
             </Button>
-            {scopeErr && <span className="text-xs text-red-500">{scopeErr}</span>}
+            {scopeErr && <span className="text-red-500 text-xs">{scopeErr}</span>}
           </div>
           {/* 范围列表 */}
           {scope.length > 0 ? (
             <div className="flex flex-col gap-1.5">
               {scope.map((row) => (
                 <div key={row.id} className="flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-sm">
-                  <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-xs">
+                  <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-muted-foreground text-xs">
                     {SCOPE_KIND_LABELS[row.kind]}
                   </span>
                   <span className="min-w-0 flex-1 truncate font-mono text-xs">{scopeValue(row)}</span>
-                  <span className="text-muted-foreground shrink-0 text-xs">{SCOPE_SOURCE_LABELS[row.source]}</span>
+                  <span className="shrink-0 text-muted-foreground text-xs">{SCOPE_SOURCE_LABELS[row.source]}</span>
                   {row.task_id.toString() === taskId ? (
                     <Button
                       size="sm"
@@ -881,7 +881,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                       <Trash2Icon className="size-3.5 text-red-500" />
                     </Button>
                   ) : (
-                    <span className="text-muted-foreground shrink-0 text-xs">继承</span>
+                    <span className="shrink-0 text-muted-foreground text-xs">继承</span>
                   )}
                 </div>
               ))}
@@ -900,7 +900,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
         </CardHeader>
         <CardContent className="grid grid-cols-2 gap-4 sm:grid-cols-4">
           <div>
-            <div className="text-xs text-muted-foreground">引擎态</div>
+            <div className="text-muted-foreground text-xs">引擎态</div>
             <StatusBadge
               domain="engine"
               value={stats?.engine_mode ?? task?.engine_mode ?? "idle"}
@@ -909,25 +909,25 @@ export function OverviewTab({ taskId }: { taskId: string }) {
             />
           </div>
           <div>
-            <div className="text-xs text-muted-foreground">运行中 Worker</div>
-            <div className="mt-1 text-lg font-semibold tabular-nums">{running.length}</div>
+            <div className="text-muted-foreground text-xs">运行中 Worker</div>
+            <div className="mt-1 font-semibold text-lg tabular-nums">{running.length}</div>
           </div>
           <div>
-            <div className="text-xs text-muted-foreground">最近活动</div>
+            <div className="text-muted-foreground text-xs">最近活动</div>
             <div className="mt-1 inline-flex items-center gap-1 text-sm">
               <ClockIcon className="size-3.5" />
               {task?.last_activity ? new Date(task.last_activity).toLocaleTimeString("zh-CN") : "—"}
             </div>
           </div>
           <div>
-            <div className="text-xs text-muted-foreground">
+            <div className="text-muted-foreground text-xs">
               目标 {task?.goals_met ?? 0}/{task?.goals_total ?? 0}
             </div>
             <Progress value={goalsPct} className="mt-2" />
           </div>
           {task?.completed_unix && task.completed_unix > 0 ? (
             <div>
-              <div className="text-xs text-muted-foreground">完成时间</div>
+              <div className="text-muted-foreground text-xs">完成时间</div>
               <div className="mt-1 inline-flex items-center gap-1 text-sm">
                 <ClockIcon className="size-3.5" />
                 {new Date(task.completed_unix * 1000).toLocaleString("zh-CN")}
@@ -952,7 +952,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                 <span className="min-w-0 flex-1 truncate">{i.payload}</span>
               </div>
             ))}
-            {running.length === 0 && <p className="text-sm text-muted-foreground">暂无进行中意图</p>}
+            {running.length === 0 && <p className="text-muted-foreground text-sm">暂无进行中意图</p>}
           </CardContent>
         </Card>
 
@@ -964,20 +964,20 @@ export function OverviewTab({ taskId }: { taskId: string }) {
           </CardHeader>
           <CardContent className="grid grid-cols-2 gap-3 text-sm">
             <div>
-              <div className="text-2xl font-semibold tabular-nums text-red-600">{taskFindings.length}</div>
-              <div className="text-xs text-muted-foreground">确认漏洞</div>
+              <div className="font-semibold text-2xl text-red-600 tabular-nums">{taskFindings.length}</div>
+              <div className="text-muted-foreground text-xs">确认漏洞</div>
             </div>
             <div>
-              <div className="text-2xl font-semibold tabular-nums text-blue-600">{running.length}</div>
-              <div className="text-xs text-muted-foreground">执行中</div>
+              <div className="font-semibold text-2xl text-blue-600 tabular-nums">{running.length}</div>
+              <div className="text-muted-foreground text-xs">执行中</div>
             </div>
             <div>
-              <div className="text-2xl font-semibold tabular-nums">{open.length}</div>
-              <div className="text-xs text-muted-foreground">frontier 待领</div>
+              <div className="font-semibold text-2xl tabular-nums">{open.length}</div>
+              <div className="text-muted-foreground text-xs">frontier 待领</div>
             </div>
             <div>
-              <div className="text-2xl font-semibold tabular-nums text-red-600">{blocked.length}</div>
-              <div className="text-xs text-muted-foreground">被拦意图</div>
+              <div className="font-semibold text-2xl text-red-600 tabular-nums">{blocked.length}</div>
+              <div className="text-muted-foreground text-xs">被拦意图</div>
             </div>
           </CardContent>
         </Card>
@@ -995,7 +995,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                 <span className="min-w-0 flex-1 truncate">{f.summary}</span>
               </div>
             ))}
-            {taskFindings.length === 0 && <p className="text-sm text-muted-foreground">暂无发现</p>}
+            {taskFindings.length === 0 && <p className="text-muted-foreground text-sm">暂无发现</p>}
           </CardContent>
         </Card>
       </div>
@@ -1007,7 +1007,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
           <CardHeader className="flex-row items-center justify-between gap-2 space-y-0">
             <CardTitle className="flex items-center gap-2 text-sm">
               <AlertTriangleIcon className="size-4 text-red-500" /> 被拦/出错意图
-              <span className="text-xs font-normal text-muted-foreground">（共 {blocked.length} 条，可重跑）</span>
+              <span className="font-normal text-muted-foreground text-xs">（共 {blocked.length} 条，可重跑）</span>
             </CardTitle>
             <Button size="sm" variant="outline" disabled={rerunning.has("__all__")} onClick={() => void rerunAll()}>
               <RefreshCwIcon className={`size-3.5 ${rerunning.has("__all__") ? "animate-spin" : ""}`} />
@@ -1032,7 +1032,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
               </div>
             ))}
             {blocked.length > 20 && (
-              <p className="text-xs text-muted-foreground">
+              <p className="text-muted-foreground text-xs">
                 仅显示前 20 条，点「全部重跑」处理剩余 {blocked.length - 20} 条。
               </p>
             )}
@@ -1169,7 +1169,7 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
       <CardHeader>
         <CardTitle className="flex items-center gap-2 text-base">
           <ShieldCheckIcon className="size-4 text-sky-500" /> 任务级资产拦截 / 允许
-          <span className="text-muted-foreground text-xs font-normal">
+          <span className="font-normal text-muted-foreground text-xs">
             （仅本任务生效，不进全局；先拦截后允许，共 {rules.length} 条）
           </span>
         </CardTitle>
@@ -1208,7 +1208,7 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
           <Button size="sm" variant="outline" disabled={busy || !newPattern.trim()} onClick={() => void add()}>
             <PlusIcon className="size-3.5" /> 添加
           </Button>
-          {err && <span className="text-xs text-red-500">{err}</span>}
+          {err && <span className="text-red-500 text-xs">{err}</span>}
         </div>
         {/* 规则列表 */}
         {rules.length > 0 ? (
@@ -1283,10 +1283,10 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
                   >
                     {r.action === "allow" ? "允许" : "拦截"}
                   </span>
-                  <span className="text-muted-foreground shrink-0 text-xs">{TASK_RULE_KIND_LABEL[r.kind]}</span>
-                  <code className="bg-muted min-w-0 flex-1 truncate rounded px-1.5 py-0.5 text-xs">{r.pattern}</code>
+                  <span className="shrink-0 text-muted-foreground text-xs">{TASK_RULE_KIND_LABEL[r.kind]}</span>
+                  <code className="min-w-0 flex-1 truncate rounded bg-muted px-1.5 py-0.5 text-xs">{r.pattern}</code>
                   {r.note && (
-                    <span className="text-muted-foreground max-w-[120px] shrink-0 truncate text-xs">{r.note}</span>
+                    <span className="max-w-[120px] shrink-0 truncate text-muted-foreground text-xs">{r.note}</span>
                   )}
                   <Switch checked={r.enabled} onCheckedChange={() => void toggle(r)} />
                   <Button

@@ -141,14 +141,62 @@ function emptyState(): SessionState {
   };
 }
 
+// taskScopedKey 给会话 key 加任务前缀。
+//
+// ## 为什么必须加
+//
+// 会话 key 原本是 `main:<seg>` / `plan` / `system` / `intent:<id>`——**前三个
+// 不含任务维度**。于是任务 3 的主会话和任务 4 的主会话 key 字面上都是
+// "main:0"。
+//
+// 而 store / reqTokenRef / loadingKeysRef / activeKeyRef **全部按这个 key
+// 索引**。切任务时：
+//
+//	1. reset effect 把 loadingKeysRef 置成 new Set(["main:0"])（预留）
+//	2. boot 时若新任务的当前段恰好是 0，`delete("main:0")` 不执行 → 预留项留着
+//	3. 用户点开主会话 → loadSession("main:0") → loadingKeysRef.has("main:0")
+//	   → **直接 return，不发请求**
+//	4. 界面显示的是 reset 前的残留 —— **就是上一个任务的会话**
+//
+// intent:<id> 不会串（节点 id 全局唯一），但主会话/规划/系统三类都会串，
+// 而这三类恰好是任务级的（worker 会话反而安全）。
+//
+// ## 为什么不改成"清空守卫"而是"加前缀"
+//
+// 清空守卫只能修好「预留项没删」这一处，跨任务的同 key 仍可能撞（比如
+// 切任务时旧请求在飞、token 序号与新任务混用）。加前缀是**结构性**的修复：
+// 不同任务的 key 永不相同，守卫/令牌/缓存自然隔离，不需要在每个使用点记得
+// "切任务时记得清干净"。
+function taskScopedKey(taskId: string, key: string): string {
+  return `t${taskId}:${key}`;
+}
+
+// wireSessionKey 把 store key 还原成后端认识的 session 格式。
+//
+// store key 带任务前缀（`t3:main:0`），但后端 parseActivitySession 只认
+// `main:N` / `plan` / `intent:ID` —— 直接把 store key 发过去会解析失败。
+// 所以发请求前剥掉前缀。
+//
+// 剥法：找最后一个 "t<taskId>:" 前缀。taskId 是数字串（任务的 id），
+// 而 key 的后半段是 `main:N`/`plan`/`system`/`intent:ID`，后者不会以 "t数字:"
+// 开头，所以按第一个 ":" 之后找 "t<数字>:" 前缀是安全的。
+function wireSessionKey(taskId: string, key: string): string {
+  const prefix = `t${taskId}:`;
+  return key.startsWith(prefix) ? key.slice(prefix.length) : key;
+}
+
 // sessionKeyOf routes an activity to its stable session key. worker="planner" covers
 // BOTH the Goal Agent's round-0 decomposition and the Planner (single Plan session).
-function sessionKeyOf(a: Activity): string {
-  if (a.worker === "system" || a.kind === "llm_switch" || a.kind === "llm_failover") return "system";
-  if (a.worker === "mainagent") return `main:${a.main_seg ?? 0}`; // one key per conversation segment
-  if (a.worker === "planner") return "plan";
-  if (a.intent_id) return `intent:${a.intent_id}`;
-  return "unknown";
+//
+// **key 必须带 taskId**（见 taskScopedKey 的说明）——两个任务的 "main:0"/
+// "plan"/"system" 在字面上完全相同，共用一套 store/守卫就会把上一个任务的
+// 会话显示到当前任务里。
+function sessionKeyOf(a: Activity, taskId: string): string {
+  if (a.worker === "system" || a.kind === "llm_switch" || a.kind === "llm_failover") return taskScopedKey(taskId, "system");
+  if (a.worker === "mainagent") return taskScopedKey(taskId, `main:${a.main_seg ?? 0}`); // one key per conversation segment
+  if (a.worker === "planner") return taskScopedKey(taskId, "plan");
+  if (a.intent_id) return taskScopedKey(taskId, `intent:${a.intent_id}`);
+  return taskScopedKey(taskId, "unknown");
 }
 
 // mergeBySeq unions two activity lists by seq (dedup) in ascending seq order. Every
@@ -248,7 +296,9 @@ const roleMeta = {
 // starts on a clean transcript while the task's graph/assets/goal stay shared. Each
 // segment is a switchable UI session; only the current (highest) one is writable.
 const mainSessionId = (seg: number) => `s-main-${seg}`;
-const mainSessionKey = (seg: number) => `main:${seg}`;
+// mainSessionKey 的 key 带任务前缀（见 taskScopedKey）——任务 3 与任务 4 的
+// "main:0" 在字面上相同，不加前缀会互相串。
+const mainSessionKey = (taskId: string, seg: number) => taskScopedKey(taskId, `main:${seg}`);
 const mainSessionTitle = (seg: number) => `主 Agent · 会话 #${seg + 1}`;
 const MAIN_ID = mainSessionId(0);
 const MAIN_SESSION: Session = {
@@ -289,11 +339,12 @@ const SYSTEM_SESSION: Session = {
 };
 
 // keyForSession maps a UI Session → its stable store key (main:<seg> | plan | intent:<id>).
-function keyForSession(s: Session): string {
-  if (s.role === "mainagent") return `main:${s.seg ?? 0}`;
-  if (s.role === "planner") return "plan";
-  if (s.role === "system") return "system";
-  return `intent:${s.intent_id}`;
+// key 带任务前缀（见 taskScopedKey）。
+function keyForSession(s: Session, taskId: string): string {
+  if (s.role === "mainagent") return taskScopedKey(taskId, `main:${s.seg ?? 0}`);
+  if (s.role === "planner") return taskScopedKey(taskId, "plan");
+  if (s.role === "system") return taskScopedKey(taskId, "system");
+  return taskScopedKey(taskId, `intent:${s.intent_id}`);
 }
 
 // Map an exploration intent (TaskNode) state → a session status the UI renders.
@@ -385,7 +436,7 @@ function SessionItem({
       >
         {icon ?? <span className="size-3.5 shrink-0" />}
         {s.intent_id && (
-          <span className="shrink-0 rounded bg-muted px-1 py-0.5 font-mono text-[10px] tabular-nums text-muted-foreground">
+          <span className="shrink-0 rounded bg-muted px-1 py-0.5 font-mono text-[10px] text-muted-foreground tabular-nums">
             #{s.intent_id}
           </span>
         )}
@@ -395,7 +446,7 @@ function SessionItem({
           </Badge>
         )}
         <span
-          className={cn("min-w-0 flex-1 truncate text-sm font-medium", deleted && "text-muted-foreground line-through")}
+          className={cn("min-w-0 flex-1 truncate font-medium text-sm", deleted && "text-muted-foreground line-through")}
         >
           {displayTitle}
         </span>
@@ -406,12 +457,12 @@ function SessionItem({
         )}
         {hasPending && <ShieldAlertIcon className="size-3.5 shrink-0 text-amber-500" />}
         {!active && unread ? (
-          <span className="inline-flex min-w-4 items-center justify-center rounded-full bg-blue-500/15 px-1 text-[10px] font-medium tabular-nums text-blue-600 dark:text-blue-400">
+          <span className="inline-flex min-w-4 items-center justify-center rounded-full bg-blue-500/15 px-1 font-medium text-[10px] text-blue-600 tabular-nums dark:text-blue-400">
             {unread > 99 ? "99+" : unread}
           </span>
         ) : null}
         {s.live && (
-          <span className="inline-flex items-center gap-1 rounded bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-medium text-blue-600 dark:text-blue-400">
+          <span className="inline-flex items-center gap-1 rounded bg-blue-500/15 px-1.5 py-0.5 font-medium text-[10px] text-blue-600 dark:text-blue-400">
             <span className="size-1 animate-pulse rounded-full bg-blue-500" />
             实时
           </span>
@@ -465,11 +516,11 @@ function WorkerAssetBadge({ assets }: { assets: IntentAsset[] }) {
           {displayAssets.map((asset) => (
             <div key={`${asset.intent_id}-${asset.asset_id}`} className="min-w-0">
               <div className="break-all font-mono text-xs">{asset.label.trim() || `#${asset.asset_id}`}</div>
-              <div className="mt-0.5 text-xs text-muted-foreground">
+              <div className="mt-0.5 text-muted-foreground text-xs">
                 {taskAssetTypeLabel(asset.type)} · {taskAssetSourceLabel(asset.source)}
                 {asset.inherited ? ` · 来源任务 #${asset.source_task_id}` : ""}
               </div>
-              <div className="mt-0.5 [overflow-wrap:anywhere] text-xs">{asset.source_summary}</div>
+              <div className="mt-0.5 text-xs [overflow-wrap:anywhere]">{asset.source_summary}</div>
             </div>
           ))}
         </div>
@@ -542,6 +593,9 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
   // 下方的会话记录会被挤到只剩标题与输入框。折叠后记录区拿到几乎全部高度，
   // 点标题栏可展开选会话，选完自动收起。桌面端不受影响（lg 起始终展开）。
   const [listOpen, setListOpen] = React.useState(false);
+  // 继承来的 worker 会话分组默认**收起**——它们来自别的任务，混在自家列表里
+  // 会让人分不清哪个 Agent 在哪边跑。要看历史时再展开。
+  const [expandedInherited, setExpandedInherited] = React.useState<Record<number, boolean>>({});
   // Per-session lazily-loaded caches, keyed by session_key (main | plan | intent:<id>).
   const [store, setStore] = React.useState<SessionStore>({});
   // Worker sessions derived from exploration intents (paged past the old 300 cap).
@@ -594,7 +648,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
       setMainSegs((prev) => [{ seq: r.seq, created_at: r.created_at }, ...prev.filter((m) => m.seq !== r.seq)]);
       setCurrentSeg(r.current ?? r.seq);
       // Seed an empty, loaded state so the new (empty) session renders immediately.
-      setStore((prev) => ({ ...prev, [mainSessionKey(r.seq)]: { ...emptyState(), loaded: true } }));
+      setStore((prev) => ({ ...prev, [mainSessionKey(taskId, r.seq)]: { ...emptyState(), loaded: true } }));
       setActiveId(mainSessionId(r.seq));
       setListOpen(false);
       setInput("");
@@ -667,7 +721,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
   // Refs backing SSE/loading without re-render churn.
   const snapshotRef = React.useRef(0); // task-level snapshot cursor → SSE since=
   const esRef = React.useRef<EventSource | null>(null);
-  const activeKeyRef = React.useRef(mainSessionKey(0)); // current session key (for SSE dispatch/unread)
+  const activeKeyRef = React.useRef(mainSessionKey(taskId, 0)); // current session key (for SSE dispatch/unread)
   const atBottomRef = React.useRef(true); // transcript pinned to bottom?
   const llmToastSeqRef = React.useRef<Set<number>>(new Set());
   const chatStatusRequestRef = React.useRef(0);
@@ -697,7 +751,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
       reqTokenRef.current[key] = token;
       patchStore(key, (s) => ({ ...s, loading: true, error: undefined }));
 
-      if (key === "system") {
+      if (key === taskScopedKey(taskId, "system")) {
         void (async () => {
           let since = 0;
           let systemItems: Activity[] = [];
@@ -741,7 +795,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
       }
 
       api
-        .activityHistory(taskId, key, 0, PAGE)
+        .activityHistory(taskId, wireSessionKey(taskId, key), 0, PAGE)
         .then((r) => {
           if (reqTokenRef.current[key] !== token) return; // superseded
           if (r.snapshotCursor > snapshotRef.current) snapshotRef.current = r.snapshotCursor;
@@ -778,7 +832,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
       const prevTop = vp?.scrollTop ?? 0;
       patchStore(key, (s) => ({ ...s, loadingMore: true }));
       api
-        .activityHistory(taskId, key, st.earliestSeq, PAGE)
+        .activityHistory(taskId, wireSessionKey(taskId, key), st.earliestSeq, PAGE)
         .then((r) => {
           patchStore(key, (s) => {
             const items = mergeBySeq(r.items, s.items);
@@ -918,7 +972,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
     reqTokenRef.current = {};
     // Reserve the initial main key so the active-session effect (which fires for main on
     // mount) won't double-load it and pre-empt the SSE opened here.
-    loadingKeysRef.current = new Set([mainSessionKey(0)]);
+    loadingKeysRef.current = new Set([mainSessionKey(taskId, 0)]);
     let alive = true;
 
     // MOCK demo: no SSE backend — pull one activity snapshot and bucket by session.
@@ -929,7 +983,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
           if (!alive) return;
           const buckets: SessionStore = {};
           for (const a of r.items) {
-            const k = sessionKeyOf(a);
+            const k = sessionKeyOf(a, taskId);
             if (!buckets[k]) buckets[k] = emptyState();
             buckets[k].items.push(a);
           }
@@ -941,13 +995,13 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
             st.earliestSeq = st.items.length ? st.items[0].seq : 0;
             st.lastTs = st.items.length ? st.items[st.items.length - 1].ts : "";
           }
-          buckets[mainSessionKey(0)] ??= { ...emptyState(), loaded: true };
+          buckets[mainSessionKey(taskId, 0)] ??= { ...emptyState(), loaded: true };
           buckets.system ??= { ...emptyState(), loaded: true };
           setStore(buckets);
         })
         .catch(() =>
           setStore({
-            [mainSessionKey(0)]: { ...emptyState(), loaded: true },
+            [mainSessionKey(taskId, 0)]: { ...emptyState(), loaded: true },
             system: { ...emptyState(), loaded: true },
           }),
         );
@@ -958,7 +1012,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
 
     const token = (reqTokenRef.current.mainboot ?? 0) + 1;
     reqTokenRef.current.mainboot = token;
-    let bootKey = mainSessionKey(0);
+    let bootKey = mainSessionKey(taskId, 0);
     // Resolve the main-agent segments first, then load the CURRENT segment's history and
     // open the SSE from its snapshot cursor. The SSE tails all segments and routes each
     // frame by session_key (main:<seg>), so switching segments needs no new stream.
@@ -969,12 +1023,12 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
         const segs = ms.sessions.length ? ms.sessions : [{ seq: 0, created_at: "" }];
         setMainSegs(segs);
         setCurrentSeg(ms.current);
-        bootKey = mainSessionKey(ms.current);
-        if (bootKey !== mainSessionKey(0)) loadingKeysRef.current.delete(mainSessionKey(0));
+        bootKey = mainSessionKey(taskId, ms.current);
+        if (bootKey !== mainSessionKey(taskId, 0)) loadingKeysRef.current.delete(mainSessionKey(taskId, 0));
         loadingKeysRef.current.add(bootKey);
         if (!hasRequestedSession.current) setActiveId(mainSessionId(ms.current));
         patchStore(bootKey, (s) => ({ ...s, loading: true }));
-        return api.activityHistory(taskId, bootKey, 0, PAGE);
+        return api.activityHistory(taskId, wireSessionKey(taskId, bootKey), 0, PAGE);
       })
       .then((r) => {
         if (!alive || reqTokenRef.current.mainboot !== token) return;
@@ -1024,7 +1078,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                 // The periodic resolver poll will retry if this event-triggered refresh fails.
               });
           }
-          const k = sessionKeyOf(a);
+          const k = sessionKeyOf(a, taskId);
           setStore((prev) => {
             const cur = prev[k] ?? emptyState();
             const activeK = activeKeyRef.current;
@@ -1169,7 +1223,35 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
     return grouped;
   }, [intentAssets]);
 
+  // worker 会话分成【本任务的】与【继承来的】两组。
+  //
+  // 为什么必须分开：派生任务（如任务 4 从任务 3 派生）会继承源任务**全部已结束的
+  // 意图**——实测任务 4 的接口返回 224 条，其中 206 条 inherited（来自任务 3），
+  // 只有 18 条是任务 4 自己的。这些继承条目以前和自家条目**混在同一列表**里
+  // 平铺，只靠一个「来源 #3」小徽标区分——两个任务各有几百条时根本分不清哪个
+  // 是哪个任务在跑、哪个 Agent 在哪边。
+  //
+  // 后台的继承本身是有用的（少干重复活、结论可复用），不需要改；这里只解决
+  // **前端视图按任务分开**的问题：继承的折叠进一个可展开分组，默认收起。
   const workerSessions = React.useMemo(() => allIntents.map(intentToSession), [allIntents]);
+  const ownWorkerSessions = React.useMemo(
+    () => workerSessions.filter((s) => !s.inherited),
+    [workerSessions],
+  );
+  // 继承的按来源任务分组（一个任务可以继承多个来源）。
+  const inheritedWorkerGroups = React.useMemo(() => {
+    const bySource = new Map<number, Session[]>();
+    for (const s of workerSessions) {
+      if (!s.inherited) continue;
+      const src = Number(s.source_task_id ?? 0);
+      const list = bySource.get(src);
+      if (list) list.push(s);
+      else bySource.set(src, [s]);
+    }
+    return [...bySource.entries()]
+      .map(([sourceTaskId, items]) => ({ sourceTaskId, items }))
+      .sort((a, b) => a.sourceTaskId - b.sourceTaskId);
+  }, [workerSessions]);
   const intentsHasMore = hasLoadedOlderIntentsPage ? olderIntentsHasMore : firstIntentsHasMore;
 
   // For each worker session (intent), derive the display title from the intent
@@ -1224,8 +1306,8 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
     },
     [store],
   );
-  const currentMainKey = mainSessionKey(currentSeg);
-  const plannerLive = recentLive("plan");
+  const currentMainKey = mainSessionKey(taskId, currentSeg);
+  const plannerLive = recentLive(taskScopedKey(taskId, "plan"));
 
   // Which main segment is streaming RIGHT NOW. A main turn is serialized per task, so at
   // most one segment is live. Gate on the real running flag (sending / mainChatRunning)
@@ -1238,14 +1320,14 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
     let seg = currentSeg;
     let bestTs = -1;
     for (const m of mainSegs) {
-      const raw = store[mainSessionKey(m.seq)]?.lastTs;
+      const raw = store[mainSessionKey(taskId, m.seq)]?.lastTs;
       const ts = raw ? Date.parse(raw) : -1;
       if (ts > bestTs) {
         bestTs = ts;
         seg = m.seq;
       }
     }
-    const items = store[mainSessionKey(seg)]?.items ?? [];
+    const items = store[mainSessionKey(taskId, seg)]?.items ?? [];
     const last = items[items.length - 1];
     if (last && (last.kind === "result" || (last.kind === "text" && last.is_error))) return null;
     return seg;
@@ -1277,7 +1359,9 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
   const grouped = {
     mainagent: sessions.filter((s) => s.role === "mainagent"),
     planner: sessions.filter((s) => s.role === "planner"),
-    worker: sessions.filter((s) => s.role === "worker"),
+    // worker 只放**本任务自己的**会话；继承来的单独按来源任务折叠展示
+    // （见 inheritedWorkerGroups）。
+    worker: ownWorkerSessions,
     system: sessions.filter((s) => s.role === "system"),
   };
 
@@ -1292,7 +1376,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
   const isMain = active.role === "mainagent";
   const isPlanner = active.role === "planner";
   const isSystem = active.role === "system";
-  const activeKey = keyForSession(active);
+  const activeKey = keyForSession(active, taskId);
   const activeState = store[activeKey];
   // A main turn is serialized per task (chat lock), so "busy" is task-wide: while any
   // main segment is mid-turn the active composer is disabled. Clear it the moment the
@@ -1324,10 +1408,14 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
     }
   }, [activeKey]);
 
-  const focusKey = approvalFocus.state?.source?.session;
+  // focusKey 来自后端（source.session），格式是 `main:N` / `plan` / `intent:ID`
+  // ——**没有任务前缀**。它要作为 store key 用，所以必须转成 task-scoped；
+  // 发给后端时用原始的 focusWireKey（后端只认无前缀格式）。
+  const focusWireKey = approvalFocus.state?.source?.session;
+  const focusKey = focusWireKey ? taskScopedKey(taskId, focusWireKey) : undefined;
   const loadFocusPage = React.useCallback(
-    (before: number) => api.activityHistory(taskId, focusKey ?? "main", before, PAGE),
-    [taskId, focusKey],
+    (before: number) => api.activityHistory(taskId, focusWireKey ?? "main", before, PAGE),
+    [taskId, focusWireKey],
   );
   const mergeFocusPage = React.useCallback(
     (page: { items: Activity[]; hasMore: boolean }) => {
@@ -1605,7 +1693,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                 onClick={() => setListOpen((open) => !open)}
                 aria-expanded={listOpen}
                 aria-controls="session-list-panel"
-                className="flex min-w-0 flex-1 items-center gap-1 text-left text-xs font-medium text-muted-foreground lg:pointer-events-none"
+                className="flex min-w-0 flex-1 items-center gap-1 text-left font-medium text-muted-foreground text-xs lg:pointer-events-none"
               >
                 <ChevronDownIcon
                   className={cn("size-3.5 shrink-0 transition-transform lg:hidden", !listOpen && "-rotate-90")}
@@ -1617,7 +1705,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                       · {activeDisplayTitle}
                     </span>
                     {hiddenUnread > 0 && (
-                      <span className="inline-flex min-w-4 shrink-0 items-center justify-center rounded-full bg-blue-500/15 px-1 text-[10px] font-medium tabular-nums text-blue-600 lg:hidden dark:text-blue-400">
+                      <span className="inline-flex min-w-4 shrink-0 items-center justify-center rounded-full bg-blue-500/15 px-1 font-medium text-[10px] text-blue-600 tabular-nums lg:hidden dark:text-blue-400">
                         {hiddenUnread > 99 ? "99+" : hiddenUnread}
                       </span>
                     )}
@@ -1649,7 +1737,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
             {taskTokens && (
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1 text-xs text-muted-foreground">
+                  <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1 text-muted-foreground text-xs">
                     <span>任务总计</span>
                     <span>·</span>
                     <TokenMetrics
@@ -1671,7 +1759,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
             id="session-list-panel"
             type="auto"
             className={cn(
-              "min-h-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:block!",
+              "[&_[data-slot=scroll-area-viewport]>div]:block! min-h-0 flex-1",
               !listOpen && "max-lg:hidden",
             )}
           >
@@ -1682,7 +1770,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                 const Meta = roleMeta[role];
                 return (
                   <div key={role} className="flex flex-col gap-0.5">
-                    <div className="flex items-center gap-1.5 px-2 py-1 text-xs font-medium text-muted-foreground">
+                    <div className="flex items-center gap-1.5 px-2 py-1 font-medium text-muted-foreground text-xs">
                       <Meta.icon className="size-3.5" />
                       {Meta.label}
                       {role === "mainagent" && (
@@ -1712,7 +1800,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                           active={s.id === activeId}
                           displayTitle={meta?.title ?? s.title}
                           hasPending={hasPendingForSession(s)}
-                          unread={store[keyForSession(s)]?.unread}
+                          unread={store[keyForSession(s, taskId)]?.unread}
                           onClick={() => {
                             approvalFocus.close();
                             setActiveId(s.id);
@@ -1733,7 +1821,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                         type="button"
                         onClick={loadOlderIntents}
                         disabled={loadingOlderIntents}
-                        className="mt-0.5 flex items-center justify-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-accent/50"
+                        className="mt-0.5 flex items-center justify-center gap-1 rounded-md px-2 py-1 text-muted-foreground text-xs hover:bg-accent/50"
                       >
                         {loadingOlderIntents ? (
                           <Loader2Icon className="size-3.5 animate-spin" />
@@ -1743,11 +1831,66 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                         加载更早的 Worker
                       </button>
                     )}
+                    {/* 继承来的 worker 会话（来自别的任务）折叠成独立分组，默认收起。
+                        后台的继承是有用的（少干重复活），但前端必须按任务分开看——
+                        否则两个任务各有几百条时根本分不清哪个 Agent 在哪边跑。 */}
+                    {role === "worker" &&
+                      inheritedWorkerGroups.map((group) => {
+                        const expanded = expandedInherited[group.sourceTaskId] ?? false;
+                        return (
+                          <div className="mt-1 flex flex-col gap-0.5" key={`inh-${group.sourceTaskId}`}>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setExpandedInherited((prev) => ({
+                                  ...prev,
+                                  [group.sourceTaskId]: !expanded,
+                                }))
+                              }
+                              className="flex items-center gap-1.5 rounded px-2 py-1 text-left text-[11px] text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+                              aria-expanded={expanded}
+                            >
+                              <ChevronDownIcon
+                                className={cn("size-3.5 shrink-0 transition-transform", !expanded && "-rotate-90")}
+                              />
+                              <span className="min-w-0 flex-1 truncate">
+                                来自任务 #{group.sourceTaskId} 的历史（{group.items.length} 条）
+                              </span>
+                            </button>
+                            {expanded &&
+                              group.items.map((s) => {
+                                const meta = sessionMeta.get(s.id);
+                                return (
+                                  <SessionItem
+                                    key={s.id}
+                                    s={s}
+                                    active={s.id === activeId}
+                                    displayTitle={meta?.title ?? s.title}
+                                    hasPending={hasPendingForSession(s)}
+                                    unread={store[keyForSession(s, taskId)]?.unread}
+                                    onClick={() => {
+                                      approvalFocus.close();
+                                      setActiveId(s.id);
+                                      setListOpen(false);
+                                      setWorkerMessage("");
+                                      setWorkerMessageRequestId("");
+                                    }}
+                                    controlling={controllingIntent === s.intent_id}
+                                    deleted={meta?.deleted}
+                                    onCancel={() => {
+                                      setCancelIntent(s);
+                                    }}
+                                  />
+                                );
+                              })}
+                          </div>
+                        );
+                      })}
                   </div>
                 );
               })}
-              {mainLoaded && !workerSessions.length && (
-                <div className="px-2 py-1 text-xs text-muted-foreground">暂无运行中的 Worker 会话。</div>
+              {mainLoaded && !ownWorkerSessions.length && (
+                <div className="px-2 py-1 text-muted-foreground text-xs">暂无运行中的 Worker 会话。</div>
               )}
             </div>
           </ScrollArea>
@@ -1758,7 +1901,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
           side={side}
           label={active.role === "worker" ? `Worker #${active.intent_id} · ${activeDisplayTitle}` : activeDisplayTitle}
         >
-          <div className="flex min-h-0 flex-1 min-w-0 flex-col overflow-hidden rounded-lg border bg-card">
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg border bg-card">
             <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 border-b px-3 py-2 sm:px-4 sm:py-2.5">
               {(() => {
                 const isWorker = active.role === "worker";
@@ -1766,7 +1909,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                 // Worker: the intent moved into the transcript as a message, so the
                 // header shows a stable generic label (intent JSON stays on hover).
                 const title = isWorker ? "Worker 执行会话" : active.title;
-                const titleEl = <span className="min-w-0 truncate text-sm font-medium">{title}</span>;
+                const titleEl = <span className="min-w-0 truncate font-medium text-sm">{title}</span>;
                 return meta?.json ? (
                   <Tooltip>
                     <TooltipTrigger asChild>{titleEl}</TooltipTrigger>
@@ -1806,7 +1949,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                 <Badge variant="outline">来源任务 #{active.source_task_id} · 只读历史</Badge>
               )}
               {active.live && (
-                <span className="inline-flex items-center gap-1 rounded bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-medium text-blue-600 dark:text-blue-400">
+                <span className="inline-flex items-center gap-1 rounded bg-blue-500/15 px-1.5 py-0.5 font-medium text-[10px] text-blue-600 dark:text-blue-400">
                   <span className="size-1 animate-pulse rounded-full bg-blue-500" />
                   实时
                 </span>
@@ -1816,7 +1959,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                   ↑ 更早历史
                 </span>
               )}
-              <div className="ml-auto flex min-w-0 max-w-full items-center justify-end gap-x-3 gap-y-1 text-xs text-muted-foreground max-sm:w-full max-sm:flex-wrap">
+              <div className="ml-auto flex min-w-0 max-w-full items-center justify-end gap-x-3 gap-y-1 text-muted-foreground text-xs max-sm:w-full max-sm:flex-wrap">
                 {tokenTotal.any && (
                   <Tooltip>
                     {/* 手机端用短标签（入/缓/出）：长标签会把这一行撑成两行，进一步压缩记录区。 */}
@@ -1859,7 +2002,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
               const dm = active.role === "worker" ? sessionMeta.get(active.id) : undefined;
               if (!dm?.deleted) return null;
               return (
-                <div className="flex items-start gap-2 border-b border-destructive/30 bg-destructive/5 px-4 py-2.5 text-xs">
+                <div className="flex items-start gap-2 border-destructive/30 border-b bg-destructive/5 px-4 py-2.5 text-xs">
                   <Trash2Icon className="mt-0.5 size-3.5 shrink-0 text-destructive" />
                   <div className="min-w-0">
                     <span className="font-medium text-destructive">此意图已被用户删除</span>
@@ -1890,21 +2033,21 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
             to block so wide/unbreakable steps (long commands, code, URLs) can't blow
             out the width and defeat the truncation below — the transcript wraps to
             the panel instead of overflowing horizontally. */}
-            <ScrollArea type="auto" className="min-h-0 min-w-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:block!">
+            <ScrollArea type="auto" className="[&_[data-slot=scroll-area-viewport]>div]:block! min-h-0 min-w-0 flex-1">
               <div className="min-w-0 max-w-full p-4" ref={contentRef}>
                 {activeState?.loadingMore && (
-                  <div className="flex items-center justify-center gap-2 pb-2 text-xs text-muted-foreground">
+                  <div className="flex items-center justify-center gap-2 pb-2 text-muted-foreground text-xs">
                     <Loader2Icon className="size-3.5 animate-spin" />
                     加载更早历史…
                   </div>
                 )}
                 {showLoader ? (
-                  <div className="flex items-center gap-2 pl-9 text-xs text-muted-foreground">
+                  <div className="flex items-center gap-2 pl-9 text-muted-foreground text-xs">
                     <Loader2Icon className="size-3.5 animate-spin" />
                     加载活动流…
                   </div>
                 ) : activeState?.error ? (
-                  <div className="flex items-center gap-2 pl-9 text-xs text-red-500">
+                  <div className="flex items-center gap-2 pl-9 text-red-500 text-xs">
                     <CircleXIcon className="size-3.5" />
                     加载失败：{activeState.error}
                     <Button
@@ -1925,7 +2068,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                     focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined}
                   />
                 ) : (
-                  <div className="pl-9 text-xs text-muted-foreground">
+                  <div className="pl-9 text-muted-foreground text-xs">
                     {isMain ? "还没有对话。在下方给主 Agent 发消息，引导探索方向或介入流程。" : "暂无活动记录。"}
                   </div>
                 )}
@@ -2052,7 +2195,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                   <InputGroupAddon align="block-end">
                     <span
                       className={cn(
-                        "px-1 text-[10px] tabular-nums text-muted-foreground",
+                        "px-1 text-[10px] text-muted-foreground tabular-nums",
                         workerMessageCharCount(workerMessage) > MAX_WORKER_MESSAGE_CHARS && "text-destructive",
                       )}
                     >
@@ -2138,7 +2281,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
           <AlertDialogContent className="max-w-[min(32rem,calc(100vw-2rem))]">
             <AlertDialogHeader>
               <AlertDialogTitle>删除 Worker #{cancelIntent?.intent_id}？</AlertDialogTitle>
-              <AlertDialogDescription className="break-words whitespace-normal">
+              <AlertDialogDescription className="whitespace-normal break-words">
                 {deleteMode === "hard" ? (
                   <>
                     <strong>真删除</strong>会物理移除该意图，以及<strong>仅由它支撑</strong>
@@ -2164,7 +2307,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                   )}
                 >
                   <div className="font-medium">假删除</div>
-                  <div className="text-xs text-muted-foreground">保留数据，可追溯</div>
+                  <div className="text-muted-foreground text-xs">保留数据，可追溯</div>
                 </button>
                 <button
                   type="button"
@@ -2175,11 +2318,11 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
                   )}
                 >
                   <div className="font-medium">真删除</div>
-                  <div className="text-xs text-muted-foreground">级联移除，不可恢复</div>
+                  <div className="text-muted-foreground text-xs">级联移除，不可恢复</div>
                 </button>
               </div>
               <div className="grid gap-2">
-                <label htmlFor="cancel-reason" className="text-sm font-medium">
+                <label htmlFor="cancel-reason" className="font-medium text-sm">
                   删除原因（必填）
                 </label>
                 <Textarea
@@ -2210,7 +2353,7 @@ export function SessionsTab({ taskId, requestedSession = "" }: { taskId: string;
           <AlertDialogContent className="max-w-[min(32rem,calc(100vw-2rem))]">
             <AlertDialogHeader>
               <AlertDialogTitle>开启新会话？</AlertDialogTitle>
-              <AlertDialogDescription className="break-words whitespace-normal">
+              <AlertDialogDescription className="whitespace-normal break-words">
                 当前会话会被归档（可随时切回），主 Agent 将以干净的上下文继续。任务的图谱、资产、目标不受影响。
               </AlertDialogDescription>
             </AlertDialogHeader>

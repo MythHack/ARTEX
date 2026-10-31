@@ -1,3 +1,5 @@
+import { listenMedia } from "@/lib/media-query";
+
 import type { ResolvedThemeMode, ThemeMode } from "./theme";
 
 export function resolveThemeMode(mode: ThemeMode): ResolvedThemeMode {
@@ -30,13 +32,7 @@ export function subscribeToSystemTheme(onChange: (mode: ResolvedThemeMode) => vo
   const media = window.matchMedia?.("(prefers-color-scheme: dark)");
   if (!media) return () => undefined;
 
-  const listener = (event: MediaQueryListEvent) => {
-    onChange(event.matches ? "dark" : "light");
-  };
-
-  media.addEventListener("change", listener);
-
-  return () => {
-    media.removeEventListener("change", listener);
-  };
+  return listenMedia(media, () => {
+    onChange(media.matches ? "dark" : "light");
+  });
 }

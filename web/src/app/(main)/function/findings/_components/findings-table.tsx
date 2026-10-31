@@ -316,6 +316,11 @@ export function FindingsTable({
                       className="inline-flex max-w-full items-center gap-1 text-primary hover:underline"
                       title={f.task_description}
                     >
+                      {/* 任务 id 必须显示且不能被截断掉——两个任务的名字可能
+                          前缀完全相同（实测两条都以「安康职业技术学院」开头），
+                          列宽又只有 w-32，只显示描述的话两行看起来一模一样，
+                          根本分不清这条发现属于哪个任务。 */}
+                      <span className="shrink-0 font-mono text-xs">#{f.task_id}</span>
                       <span className="truncate">{f.task_description}</span>
                       <ArrowUpRightIcon className="size-3 shrink-0" />
                     </Link>
@@ -323,7 +328,7 @@ export function FindingsTable({
                     <span className="text-muted-foreground">—</span>
                   )}
                 </TableCell>
-                <TableCell className="text-xs text-muted-foreground tabular-nums">{fmtTime(f.ts)}</TableCell>
+                <TableCell className="text-muted-foreground text-xs tabular-nums">{fmtTime(f.ts)}</TableCell>
                 <TableCell onClick={(e) => e.stopPropagation()}>
                   <div className="flex items-center gap-1">
                     {retest ? (
@@ -383,13 +388,13 @@ export function FindingsTable({
                 <TableRow className="hover:bg-transparent">
                   {/* whitespace-normal 覆盖 TableCell 默认的 nowrap,否则展开区文字
                       被强制单行、直接溢出单元格。 */}
-                  <TableCell colSpan={COLUMN_COUNT} className="bg-muted/30 whitespace-normal">
+                  <TableCell colSpan={COLUMN_COUNT} className="whitespace-normal bg-muted/30">
                     <div className="flex flex-col gap-2 px-2 py-1">
                       {/* 行内编辑:名称/类别/严重等级,可改并保存(仅独立 finding 行)。 */}
                       {f.finding_id && edit && (
                         <div className="flex flex-wrap items-end gap-3 rounded-md border bg-background px-3 py-2.5">
                           <div className="flex min-w-[12rem] flex-1 flex-col gap-1">
-                            <Label className="text-xs text-muted-foreground">漏洞名称</Label>
+                            <Label className="text-muted-foreground text-xs">漏洞名称</Label>
                             <Input
                               value={edit.name}
                               onChange={(e) => onEditChange((s) => (s ? { ...s, name: e.target.value } : s))}
@@ -397,7 +402,7 @@ export function FindingsTable({
                             />
                           </div>
                           <div className="flex min-w-[10rem] flex-col gap-1">
-                            <Label className="text-xs text-muted-foreground">类别</Label>
+                            <Label className="text-muted-foreground text-xs">类别</Label>
                             <Input
                               value={edit.vulnclass}
                               onChange={(e) => onEditChange((s) => (s ? { ...s, vulnclass: e.target.value } : s))}
@@ -405,7 +410,7 @@ export function FindingsTable({
                             />
                           </div>
                           <div className="flex flex-col gap-1">
-                            <Label className="text-xs text-muted-foreground">严重等级</Label>
+                            <Label className="text-muted-foreground text-xs">严重等级</Label>
                             <Select
                               value={edit.severity}
                               onValueChange={(v) => onEditChange((s) => (s ? { ...s, severity: v as Severity } : s))}
@@ -427,7 +432,7 @@ export function FindingsTable({
                           </Button>
                         </div>
                       )}
-                      <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                      <div className="flex flex-wrap items-center gap-2 text-muted-foreground text-xs">
                         <ShieldAlertIcon className="size-3.5" />
                         证据
                         {f.vulnclass && (
@@ -448,14 +453,14 @@ export function FindingsTable({
                           </span>
                         )}
                       </div>
-                      <pre className="overflow-x-auto rounded-md bg-muted px-3 py-2 font-mono text-xs whitespace-pre-wrap">
+                      <pre className="overflow-x-auto whitespace-pre-wrap rounded-md bg-muted px-3 py-2 font-mono text-xs">
                         {f.evidence}
                       </pre>
 
                       {/* 旧版详细报告保留；新版合并报告在详情页按概览/步骤/根因/修复展示。 */}
                       {f.finding_id && !isStructuredReproductionReport(reports[rowKey]?.text ?? "") && (
                         <div className="flex flex-col gap-1.5">
-                          <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                          <div className="flex items-center justify-between gap-2 text-muted-foreground text-xs">
                             <span className="flex items-center gap-2">
                               <FileTextIcon className="size-3.5" />
                               详细报告
@@ -472,11 +477,11 @@ export function FindingsTable({
                           {(() => {
                             const rep = reports[rowKey];
                             if (!rep || rep.status === "loading")
-                              return <p className="text-xs text-muted-foreground">加载中…</p>;
+                              return <p className="text-muted-foreground text-xs">加载中…</p>;
                             if (rep.status === "error")
-                              return <p className="text-xs text-muted-foreground">报告加载失败。</p>;
+                              return <p className="text-muted-foreground text-xs">报告加载失败。</p>;
                             if (!rep.text.trim())
-                              return <p className="text-xs text-muted-foreground">暂无详细报告。</p>;
+                              return <p className="text-muted-foreground text-xs">暂无详细报告。</p>;
                             return (
                               // break-words 会继承到段落/列表,pre 另加
                               // whitespace-pre-wrap 让代码块也换行——否则长代码行/长 URL
@@ -497,7 +502,7 @@ export function FindingsTable({
         })}
         {(caseRows ? caseRows.length : items.length) === 0 && (
           <TableRow>
-            <TableCell colSpan={COLUMN_COUNT} className="py-12 text-center text-sm text-muted-foreground">
+            <TableCell colSpan={COLUMN_COUNT} className="py-12 text-center text-muted-foreground text-sm">
               没有匹配的发现。
             </TableCell>
           </TableRow>

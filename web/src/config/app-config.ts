@@ -2,12 +2,14 @@ import packageJson from "../../package.json";
 
 const currentYear = new Date().getFullYear();
 
+// 文档标题与描述是公网未鉴权即可抓到的指纹面（根路径 / 404 页都会带）。
+// 保持中性，产品名只出现在登录后界面（可见即已通过鉴权）。
 export const APP_CONFIG = {
   name: "ARTEX",
   version: packageJson.version,
   copyright: `© ${currentYear}, ARTEX.`,
   meta: {
-    title: "ARTEX — 自主渗透测试控制台",
-    description: "LLM 驱动的自主渗透测试系统控制台",
+    title: "Console",
+    description: "Authorized operations console",
   },
 };

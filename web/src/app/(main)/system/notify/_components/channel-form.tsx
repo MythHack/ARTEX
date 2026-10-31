@@ -118,7 +118,7 @@ export function ConfigField({
   }
 
   const hint = masked ? (
-    <p className="text-muted-foreground flex items-center gap-1 text-xs">
+    <p className="flex items-center gap-1 text-muted-foreground text-xs">
       <CheckIcon className="size-3" />
       已保存{maskedTail ? `（尾号 ${maskedTail}）` : ""} · 填入新值即覆盖，清空则删除该项
     </p>
