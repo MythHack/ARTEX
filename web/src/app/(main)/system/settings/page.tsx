@@ -984,7 +984,9 @@ export default function SystemSettingsPage() {
               </CardContent>
             </Card>
 
-            <Card className="mb-4 break-inside-avoid md:mb-6">
+            <Card
+              className={`${isSettingVisible("agent", "CVSS CWE 定级校准 漏洞评级") ? "" : "hidden"} mb-4 break-inside-avoid md:mb-6`}
+            >
               <CardHeader>
                 <CardTitle className="flex items-center gap-2 text-base">
                   <ShieldCheckIcon className="size-4" />

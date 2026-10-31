@@ -10,7 +10,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
-import { api } from "@/lib/api";
+import { api, http } from "@/lib/api";
 
 interface Identity {
   id: number;
@@ -34,8 +34,7 @@ export function IdentitiesTab({ taskId }: { taskId: string }) {
   const [loading, setLoading] = React.useState(true);
 
   const load = React.useCallback(() => {
-    api
-      .get<Identity[]>(`/api/tasks/${taskId}/identities`)
+    http<Identity[]>(`/tasks/${taskId}/identities`)
       .then((data) => {
         setItems(data || []);
         setLoading(false);
@@ -55,8 +54,7 @@ export function IdentitiesTab({ taskId }: { taskId: string }) {
       toast.error("身份名称不能为空");
       return;
     }
-    api
-      .post<Identity>(`/api/tasks/${taskId}/identities`, { ...draft, name: draft.name!.trim() })
+    http<Identity>(`/tasks/${taskId}/identities`, { method: "POST", body: JSON.stringify({ ...draft, name: draft.name!.trim() }) })
       .then((it) => {
         setItems((prev) => [...prev, it]);
         setDraft({ ...empty });
@@ -66,8 +64,7 @@ export function IdentitiesTab({ taskId }: { taskId: string }) {
   };
 
   const toggle = (it: Identity, on: boolean) => {
-    api
-      .put<Identity>(`/api/tasks/${taskId}/identities/${it.id}`, { ...it, enabled: on })
+    http<Identity>(`/tasks/${taskId}/identities/${it.id}`, { method: "PUT", body: JSON.stringify({ ...it, enabled: on }) })
       .then((updated) => {
         setItems((prev) => prev.map((x) => (x.id === it.id ? updated : x)));
       })
@@ -75,8 +72,7 @@ export function IdentitiesTab({ taskId }: { taskId: string }) {
   };
 
   const remove = (it: Identity) => {
-    api
-      .delete(`/api/tasks/${taskId}/identities/${it.id}`)
+    http(`/tasks/${taskId}/identities/${it.id}`, { method: "DELETE" })
       .then(() => setItems((prev) => prev.filter((x) => x.id !== it.id)))
       .catch((e) => toast.error(`删除失败：${(e as Error).message}`));
   };
