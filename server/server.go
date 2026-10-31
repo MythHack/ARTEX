@@ -2398,7 +2398,10 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 	stamp := now.Format("20060102-150405")
 	setDownload := func(contentType, filename string) {
 		w.Header().Set("Content-Type", contentType)
-		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+		// Keep an ASCII fallback for older clients and provide the real UTF-8
+		// name through RFC 5987. Browsers otherwise commonly decode Chinese
+		// names using the platform legacy code page.
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`, sanitizeFilename(filename), url.PathEscape(filename)))
 	}
 
 	switch format {
