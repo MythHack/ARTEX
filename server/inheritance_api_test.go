@@ -12,7 +12,7 @@ import (
 )
 
 func TestInheritedActivityDetailAndRelationDeletion(t *testing.T) {
-	m, err := NewManager(t.TempDir(), "")
+	m, err := NewManager(testDir(t), "")
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
@@ -52,8 +52,8 @@ func TestInheritedActivityDetailAndRelationDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
-	token, err := signJWT(s.jwtKey)
+	s := New(context.Background(), m, testDir(t), testDir(t), testDir(t))
+	token, err := signJWT(s.currentJWTKey())
 	if err != nil {
 		t.Fatal(err)
 	}

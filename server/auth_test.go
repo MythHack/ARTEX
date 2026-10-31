@@ -2,9 +2,12 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // GetSetting 对"键不存在"和"读取出错"的返回值只差一个 error：两种情况 value 都是
@@ -80,5 +83,103 @@ func TestValidatePassword(t *testing.T) {
 				t.Fatalf("validatePassword(%q)=%q, wantErr=%v", tc.pw, got, tc.wantErr)
 			}
 		})
+	}
+}
+
+// testKey 构造一个装好签名 key 的 Server（atomic.Value 字段无法在字面量里
+// 直接初始化，测试统一走这里）。
+func testKey(k []byte) *Server {
+	s := &Server{}
+	s.jwtKey.Store(k)
+	return s
+}
+
+// 登录防爆破：每 IP 10 分钟窗口内失败 5 次 → 锁 15 分钟；成功清零；
+// 其他 IP 不受牵连；全局阈值兜底 XFF 伪造。
+func TestLoginLimiterPerIPLockout(t *testing.T) {
+	l := &loginLimiter{fails: map[string][]time.Time{}, lockedUntil: map[string]time.Time{}}
+	for i := 0; i < loginMaxFailsPerIP; i++ {
+		l.recordFail("1.2.3.4")
+	}
+	ok, wait := l.allow("1.2.3.4")
+	if ok {
+		t.Fatal("连续失败后应锁定")
+	}
+	if wait <= 0 || wait > loginLockoutPerIP {
+		t.Fatalf("锁定剩余时长=%v，应在 (0,%v] 内", wait, loginLockoutPerIP)
+	}
+	if ok, _ := l.allow("5.6.7.8"); !ok {
+		t.Fatal("其他 IP 不应被牵连锁定")
+	}
+	l.recordSuccess("1.2.3.4")
+	if ok, _ := l.allow("1.2.3.4"); !ok {
+		t.Fatal("成功登录后应清零解锁")
+	}
+}
+
+// 成功后失败计数从零开始：不清零的话正常用户偶尔输错一次也会慢慢累积成锁。
+func TestLoginLimiterSuccessResetsWindow(t *testing.T) {
+	l := &loginLimiter{fails: map[string][]time.Time{}, lockedUntil: map[string]time.Time{}}
+	for i := 0; i < loginMaxFailsPerIP-1; i++ {
+		l.recordFail("9.9.9.9")
+	}
+	l.recordSuccess("9.9.9.9")
+	for i := 0; i < loginMaxFailsPerIP-1; i++ {
+		l.recordFail("9.9.9.9")
+	}
+	if ok, _ := l.allow("9.9.9.9"); !ok {
+		t.Fatal("成功清零后未达阈值不应锁定")
+	}
+	l.recordFail("9.9.9.9")
+	if ok, _ := l.allow("9.9.9.9"); ok {
+		t.Fatal("清零后再次连续失败达阈值应锁定")
+	}
+}
+
+// 全局兜底：每 IP 各失败 1 次、凑满全局阈值 → 全局锁定（含全新 IP）。
+func TestLoginLimiterGlobalBackstop(t *testing.T) {
+	l := &loginLimiter{fails: map[string][]time.Time{}, lockedUntil: map[string]time.Time{}}
+	for i := 0; i < loginGlobalMaxFails; i++ {
+		l.recordFail(fmt.Sprintf("10.0.0.%d", i))
+	}
+	if ok, _ := l.allow("10.9.9.9"); ok {
+		t.Fatal("达到全局失败阈值后，全新 IP 也应被全局锁定兜住")
+	}
+}
+
+// /api/health 是唯一的未鉴权探活端点：响应体里绝不能出现 service 名与
+// 版本号——那是公网测绘引擎最省事的 body 指纹。版本查询走鉴权的 /api/version。
+func TestHealthResponseHasNoIdentity(t *testing.T) {
+	s := &Server{}
+	w := httptest.NewRecorder()
+	s.health(w, httptest.NewRequest("GET", "/api/health", nil))
+	body := w.Body.String()
+	for _, banned := range []string{"artex", "ARTEX", "version", "0.3"} {
+		if strings.Contains(strings.ToLower(body), strings.ToLower(banned)) {
+			t.Fatalf("health 响应包含指纹信息 %q: %s", banned, body)
+		}
+	}
+	if !strings.Contains(body, "\"ok\":true") {
+		t.Fatalf("health 应保留 ok 探活字段: %s", body)
+	}
+}
+
+// 安全头中间件：nosniff / DENY / no-referrer 必在；/api/* 必带 no-store。
+func TestSecurityHeadersApplied(t *testing.T) {
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	h := securityHeaders(next)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/tasks", nil))
+	if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatal("缺少 X-Content-Type-Options: nosniff")
+	}
+	if rec.Header().Get("X-Frame-Options") != "DENY" {
+		t.Fatal("缺少 X-Frame-Options: DENY")
+	}
+	if rec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatal("/api/* 缺少 Cache-Control: no-store")
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatal("不应再放行任意跨域读取（ACAO 已移除）")
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
@@ -148,7 +149,7 @@ func (s *Server) agentFindingTrafficAccess(ctx context.Context, id int64, write 
 }
 
 func (s *Server) toolBindFindingTraffic() actool.CoreTool {
-	return wrTool("bind_finding_traffic", "为已登记漏洞补绑经核实的真实 HTTP 流量。finding_id 使用独立漏洞记录 ID；不要传探索节点 ID。同批引用全部成功或全部失败，重复引用不覆盖已有说明。补绑会使已有报告标记待更新；不要为补包重新探测或重复创建漏洞。",
+	return wrTool("bind_finding_traffic", "为已登记漏洞补绑经核实的真实 HTTP 流量。finding_id 使用独立漏洞记录 ID；不要传探索节点 ID。绑定是尽力而为：有效的引用正常挂上，ID 不存在或正文不可读的引用会在返回的 skipped_traffic_refs 里列出，不影响其余绑定、也不影响已有绑定；重复引用不覆盖已有说明。补绑会使已有报告标记待更新；不要为补包重新探测或重复创建漏洞。",
 		objSchema(map[string]any{"finding_id": strParam("独立漏洞记录 ID，从 list_task_findings / get_task_node_detail 的 finding_id 字段读取"), "traffic_refs": agent.HintTrafficSchema()}, "finding_id", "traffic_refs"),
 		func(ctx context.Context, raw json.RawMessage) (actool.Result, error) {
 			if !s.m.pg.GetBool(settingAgentTrafficBinding, false) {
@@ -172,6 +173,18 @@ func (s *Server) toolBindFindingTraffic() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			return jsonResult(trafficSummary(list))
+			out := trafficSummary(list)
+			if len(out.SkippedRefs) > 0 {
+				ids := make([]string, 0, len(out.SkippedRefs))
+				for _, r := range out.SkippedRefs {
+					ids = append(ids, r.TrafficID)
+				}
+				return jsonResult(map[string]any{
+					"finding_id": out.FindingID, "version": out.Version, "report_version": out.ReportVersion,
+					"bindings": out.Bindings, "skipped_traffic_refs": out.SkippedRefs,
+					"note": "以下引用未生效（ID 不存在或正文不可读）：" + strings.Join(ids, ", ") + "。其余引用已绑定；请用 traffic_get 核实真实 ID 后重试。",
+				})
+			}
+			return jsonResult(out)
 		})
 }

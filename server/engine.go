@@ -494,6 +494,18 @@ func (e *Engine) releaseWorkControl(intentID int64, run *workExecution, action s
 	e.workMu.Unlock()
 }
 
+// truncateStopReason keeps the stored reason short and single-line so the UI can
+// show it in a tooltip without a wall of text.
+func truncateStopReason(s string) string {
+	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
+	const max = 300
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
+}
+
+// transitionIntentState atomically moves an intent from expected to state.
 func transitionIntentState(store *db.ExplorationStore, intentID int64, expected, state string) error {
 	changed, err := store.CompareAndSetIntentState(intentID, expected, state)
 	if err != nil {
@@ -845,14 +857,48 @@ func workerSlotsForTask(t *Task, pools []WorkerPool, global int) ([]WorkerSlot, 
 
 func workerCountForTask(t *Task, global int) int {
 	if t != nil && t.WorkerCount > 0 {
-		// Direct database edits can bypass validation; cap those values so the
-		// engine never starts more than the supported per-task worker count.
 		if t.WorkerCount > db.MaxTaskWorkerCount {
 			return db.MaxTaskWorkerCount
 		}
 		return t.WorkerCount
 	}
 	return global
+}
+
+const plannerRoundTimeout = 15 * time.Minute
+
+var plannerRoundTimeoutOverride time.Duration
+
+func plannerRoundLimit() time.Duration {
+	if plannerRoundTimeoutOverride > 0 {
+		return plannerRoundTimeoutOverride
+	}
+	return plannerRoundTimeout
+}
+
+type plannerRoundOutcome struct {
+	met    bool
+	reason string
+	err    error
+}
+
+func runPlannerRound(ctx context.Context, plan func(context.Context) (bool, string, error)) plannerRoundOutcome {
+	type result struct {
+		met    bool
+		reason string
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		met, reason, err := plan(ctx)
+		done <- result{met: met, reason: reason, err: err}
+	}()
+	select {
+	case r := <-done:
+		return plannerRoundOutcome{met: r.met, reason: r.reason, err: r.err}
+	case <-ctx.Done():
+		return plannerRoundOutcome{err: ctx.Err()}
+	}
 }
 
 // plannerHeartbeatInterval 解析任务的 planner 心跳间隔。db.CreateTask 已归一
@@ -976,6 +1022,25 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		if ectx.Err() != nil || e.IsDeleting(t.ID) {
 			return
 		}
+		// 规划轮自身的墙钟上限（与任务 deadline 无关）。
+		//
+		// 为什么必须有：planner 的 MaxDuration 来自 clampMaxDuration(deadline, 0)，
+		// 任务没有 deadline 时它就是 0 = **不限时**；而 SDK 的 MaxDuration 只在
+		// **轮边界**检查、且只约束**工具执行**——LLM 调用用的是无 deadline 的
+		// l.ctx。一次上游半开连接（连接建立但永不返回）就会让 Plan() 永不返回，
+		// runRound 永不结束，而 runRound 是**串行**的：后续所有唤醒（边沿 + 心跳）
+		// 都堵在同一个 runRound 里出不来。
+		//
+		// 实测后果（线上 2026-10-20）：14:30 启动后 planner 跑到 14:42/15:45 就
+		// 不再出规划轮，worker 自己把剩余意图跑完（最后一个 exhausted 在 16:53），
+		// 此后 6 小时零规划轮、零新意图——「运行中 Worker」恒为 0，任务看着还在
+		// running 却什么都不干。重启服务即恢复。
+		//
+		// 15 分钟的由来：实测一轮规划（1M 上下文 + 几十次工具调用）3–5 分钟；
+		// 15 分钟给它三倍冗余，同时保证「上游卡死」最多浪费 15 分钟就能自愈，
+		// 不会像之前那样无限期哑火。
+		roundCtx, roundCancel := context.WithTimeout(ectx, plannerRoundLimit())
+		defer roundCancel()
 		log.Printf("[planner] task %s 规划中…(%s 触发)", t.ID, src)
 		// round marker: each Plan() is one planner round; emit a boundary so the
 		// UI can separate rounds in the transcript (kind='round').
@@ -986,17 +1051,38 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		triggers := t.drainTriggers()
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
 		e.BeginLLMCall(t.ID)
-		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
+		// Plan runs on its own goroutine so that NOTHING it can get stuck on can
+		// stop the planner loop.
+		//
+		// Why this matters (2026-10-21 real incident): the planner went silent
+		// for over an hour while the service kept running. The goroutine dump
+		// showed it blocked on a self-deadlock inside the compactor
+		// (agent/compaction.go: tryStart held c.mu and called a lock-taking
+		// cooldownFor). A deadlocked goroutine never returns, so **ctx
+		// cancellation cannot break it** — the wall-clock deadline below was
+		// powerless against it, and the planner's serial runRound kept every
+		// later wake-up (edge + heartbeat) stuck behind it.
+		//
+		// Selecting on the result channel means the loop gives up on a stuck
+		// round after plannerRoundTimeout and keeps serving wake-ups. The stuck
+		// goroutine leaks (Go cannot kill one), which is the lesser evil: one
+		// leaked goroutine per stuck round versus a permanently mute planner.
+		res := runPlannerRound(roundCtx, func(ctx context.Context) (bool, string, error) {
+			return planner.Plan(ctx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
+		})
 		e.EndLLMCall(t.ID)
 		switch {
-		case err != nil && ectx.Err() == nil:
-			log.Printf("[planner] task %s 规划出错: %v", t.ID, err)
-		case met:
-			log.Printf("[planner] task %s 判定目标达成: %s", t.ID, reason)
-			// 所有目标达成 → 持久化任务状态为 done（前端 DTO 会优先展示该终态）。
-			if err := e.m.SetTaskStatus(t.ID, "done"); err != nil {
-				log.Printf("[planner] task %s 标记完成落库失败: %v", t.ID, err)
-			}
+		case res.err != nil && roundCtx.Err() != nil && ectx.Err() == nil:
+			// 规划轮超时（本轮自身的墙钟上限到了，不是任务 deadline）。
+			//
+			// 这一支必须能走到：超时时本轮作废，runRound 正常结束，
+			// planner 恢复响应——下次唤醒再规划一轮。**不能**让它走进下面的
+			// "规划出错"分支后被静默吞掉，否则会退回「永久哑火」的旧症状。
+			log.Printf("[planner] task %s 规划轮超时(%s)，本轮作废，等下次唤醒重试", t.ID, plannerRoundLimit())
+		case res.err != nil && ectx.Err() == nil:
+			log.Printf("[planner] task %s 规划出错: %v", t.ID, res.err)
+		case res.met:
+			log.Printf("[planner] task %s 判定目标达成: %s", t.ID, res.reason)
 			// 任务已判完成 → 立刻取消在跑的 worker：它们手头的意图跑出来也没意义了。
 			// 下一轮 worker 循环撞终态门就不再领新意图;被取消的这批走下方"任务已完成"分支
 			// 归为 stopped(而非 blocked)。
@@ -1232,6 +1318,8 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	if ectx.Err() != nil && e.isSettling(t.ID) {
 		if err := transitionIntentState(t.Store, intent.ID, "running", "exhausted"); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 超时收尾状态落库失败: %v", name, t.ID, intent.ID, err)
+		} else {
+			_ = t.Store.SetIntentStopReason(intent.ID, db.IntentStopTaskTimeout)
 		}
 		log.Printf("[worker %s] task %s 意图 #%d 因任务超时收尾结束(exhausted)，写回 %s", name, t.ID, intent.ID, wrote)
 		e.touch(t.ID)
@@ -1242,6 +1330,8 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	if ectx.Err() != nil && isTerminalStatus(e.m.TaskStatus(t.ID)) {
 		if err := transitionIntentState(t.Store, intent.ID, "running", "stopped"); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 终态停止落库失败: %v", name, t.ID, intent.ID, err)
+		} else {
+			_ = t.Store.SetIntentStopReason(intent.ID, db.IntentStopTaskDone)
 		}
 		log.Printf("[worker %s] task %s 意图 #%d 因任务已完成而取消(stopped)", name, t.ID, intent.ID)
 		e.touch(t.ID)
@@ -1251,6 +1341,8 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	if killed {
 		if err := transitionIntentState(t.Store, intent.ID, "running", "stopped"); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d planner 停止落库失败: %v", name, t.ID, intent.ID, err)
+		} else {
+			_ = t.Store.SetIntentStopReason(intent.ID, db.IntentStopKilled)
 		}
 		log.Printf("[worker %s] task %s 意图 #%d 被终止(stopped)", name, t.ID, intent.ID)
 		e.touch(t.ID)
@@ -1262,15 +1354,27 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	// terminal分流：撞步数上限 ≠ 完成。max_turns→exhausted（规划者据此知道这个方向
 	// 试过但没真正做完、需换角度，而非当成已覆盖永久跳过）；出错→blocked；正常→done。
+	//
+	// 每条路径都落一个原因码到 blocked_reason：之前 exhausted/blocked/stopped 的
+	// 原因**完全没落库**，界面上只看到一个空状态——用户看到「一堆子任务异常中断」
+	// 却不知道为什么是中断的。规划者也能据此判断该不该重试。
 	state := "done"
+	stopReason := ""
 	switch {
 	case err != nil:
 		state = "blocked"
+		stopReason = db.IntentStopError
+		if isTaskLLMChainExhausted(err) {
+			stopReason = db.IntentBlockedLLMQuota
+		}
+		stopReason = stopReason + ": " + truncateStopReason(err.Error())
 	case reason == harness.ReasonMaxTurns:
 		state = "exhausted"
+		stopReason = db.IntentStopMaxTurns
 		log.Printf("[worker %s] intent %d 撞步数上限(exhausted)，本次写回 %s", name, intent.ID, wrote)
 	case reason == harness.ReasonTimeout:
 		state = "exhausted"
+		stopReason = db.IntentStopTimeout
 		log.Printf("[worker %s] intent %d 运行超时(exhausted)，收尾后写回 %s", name, intent.ID, wrote)
 	}
 	if state == "blocked" && isTaskLLMChainExhausted(err) {
@@ -1278,6 +1382,10 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	} else {
 		if stateErr := transitionIntentState(t.Store, intent.ID, "running", state); stateErr != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 终态 %s 落库失败: %v", name, t.ID, intent.ID, state, stateErr)
+		} else if stopReason != "" {
+			if err := t.Store.SetIntentStopReason(intent.ID, stopReason); err != nil {
+				log.Printf("[worker %s] task %s 意图 #%d 终态原因落库失败: %v", name, t.ID, intent.ID, err)
+			}
 		}
 	}
 	log.Printf("[worker %s] task %s 意图 #%d 结束: %s (写回 %s)", name, t.ID, intent.ID, state, wrote)

@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/Autumn-27/artex/agent"
@@ -16,6 +18,14 @@ func names(tools []actool.CoreTool) map[string]actool.CoreTool {
 		m[t.Name()] = t
 	}
 	return m
+}
+
+// truncate shortens a string for error messages.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // TestWireTools verifies end-to-end against the live dev PG: wireTools seeds the
@@ -59,10 +69,23 @@ func TestWireTools(t *testing.T) {
 	// SDK generic tools aren't seeded → ToolResolve passes them through unchanged
 	// (same object, original description — not decorated). No startup prune touches
 	// non-catalog rows, so future user-defined custom tools survive too.
+	//
+	// Bash is the exception: on Linux the resolver APPENDS an environment
+	// capability block (agent.EnvCapabilityNote reads /proc/self/status, so it
+	// is never empty there). Assert the addendum shape — the original
+	// description is preserved as a prefix — rather than exact equality, which
+	// could only hold on a non-Linux host.
 	if bash, ok := worker["Bash"]; !ok {
 		t.Error("worker lost Bash (should pass through)")
-	} else if bash.Description() != actool.NewBash().Description() {
-		t.Error("Bash should pass through undecorated, but description changed")
+	} else {
+		orig := actool.NewBash().Description()
+		got := bash.Description()
+		if !strings.HasPrefix(got, orig) {
+			t.Errorf("Bash description should keep the original as prefix, got %q", truncate(got, 120))
+		}
+		if runtime.GOOS == "linux" && got == orig {
+			t.Error("Bash description should carry the Linux environment capability note")
+		}
 	}
 	// planner is not bound to record_fact → resolving a base that contains it drops it.
 	planner := names(agent.ToolResolve(ctx, "planner", base))

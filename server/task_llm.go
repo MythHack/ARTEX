@@ -101,6 +101,15 @@ type taskLLMStreamHooks struct {
 	current    func() (taskLLMSelection, error)
 	exhaust    func(taskLLMSelection, error) (db.TaskLLMTransition, error)
 	transition func(taskLLMSelection, db.TaskLLMTransition, error)
+	// withoutThinking 解析一个**不发 thinking.type 字段**的等价 provider，
+	// 供「模型拒收 thinking 参数」时降级重试（见 thinking_fallback.go）。
+	//
+	// 为什么需要它：thinking 参数是在 **provider 配置层**注入的（llm.Config
+	// .ThinkingType），不在 llm.CompletionRequest 里——所以降级不能靠改请求，
+	// 只能换一个 provider。
+	//
+	// nil = 不支持降级（此时 2013 会照常冒泡）。
+	withoutThinking func() (llm.Provider, error)
 }
 
 // current resolves the provider this role runs on. Pinned workers use only their
@@ -233,7 +242,65 @@ func (r *taskLLMRuntime) streamHooks() taskLLMStreamHooks {
 		transition: func(selection taskLLMSelection, transition db.TaskLLMTransition, cause error) {
 			r.s.emitTaskLLMTransition(selection.task, transition, cause)
 		},
+		withoutThinking: r.withoutThinking,
 	}
+}
+
+// configForSelection 解析 selection 对应的 LLM 配置（与 current() 的优先级一致）。
+//
+// current() 只把 provider 交出来；降级重试需要**配置本身**才能重建一个不带
+// thinking 的 provider，所以这里按同样的顺序再解析一次。
+//
+// agentKey 传空 = 不走 agent 绑定这一级（调用方已经知道绑定的结果）。
+func (s *Server) configForSelection(agentKey string, sel taskLLMSelection) (agent.Config, bool) {
+	// 1) agent 绑定
+	if agentKey != "" {
+		if prov, cfg, ok := s.agentBindingProvider(agentKey); ok && prov != nil {
+			return cfg, true
+		}
+	}
+	// 2) 任务链的当前 profile
+	if sel.profileID > 0 {
+		if _, cfg, ok := s.providerForProfile(sel.profileID); ok {
+			return cfg, true
+		}
+	}
+	// 3) 全局
+	if _, cfg, ok := s.globalProvider(); ok {
+		return cfg, true
+	}
+	return agent.Config{}, false
+}
+
+// withoutThinking 解析一个不发 thinking.type 字段的等价 provider。
+//
+// 复用 current() 的解析路径（绑定 → 任务链 → 全局），只是把解析出的配置里的
+// ThinkingType 清掉再重建 provider。重建出来的 provider **不进 provider 缓存**
+// ——它只服务于这一次降级重试，缓存进去会让后续所有调用都丢掉 thinking 参数，
+// 那等于悄悄改掉了用户的配置。
+//
+// 拿不到等价配置时（没有可解析的 profile）返回错误，调用方按原错误冒泡。
+func (r *taskLLMRuntime) withoutThinking() (llm.Provider, error) {
+	sel, err := r.current()
+	if err != nil {
+		return nil, err
+	}
+	// current() 已经把配置解析好了，但只把 provider 交出来；这里需要 cfg 本身
+	// 才能重建。故按同样的优先级再解析一次配置。
+	cfg, ok := r.s.configForSelection(r.agentKey, sel)
+	if !ok {
+		return nil, fmt.Errorf("无法解析 LLM 配置以降级重试（profile %d）", sel.profileID)
+	}
+	if cfg.ThinkingType == "" {
+		// 本来就没发 thinking.type ——降级没有意义，让调用方按原错误冒泡。
+		return nil, fmt.Errorf("当前配置未发送 thinking 参数，无法降级")
+	}
+	cfg.SuppressThinking = true
+	prov, err := cfg.NewProvider()
+	if err != nil {
+		return nil, err
+	}
+	return prov, nil
 }
 
 func (r *taskLLMRuntime) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
@@ -252,6 +319,9 @@ func (r *taskLLMRuntime) Complete(ctx context.Context, req llm.CompletionRequest
 }
 
 func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest, hooks taskLLMStreamHooks) (llm.Message, string, llm.Usage, error) {
+	// thinking 降级只做一次（与 streamTaskLLM 同理，见 thinking_fallback.go）。
+	// 降级是【换 provider】而不是改请求——thinking 参数在 provider 配置层。
+	downgradedProv, thinkingDowngraded := llm.Provider(nil), false
 	for {
 		selection, err := hooks.current()
 		if err != nil {
@@ -267,7 +337,23 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 		// 中途已交付输出的问题,所以任何瞬时失败都可原样重试。
 		retries, backoffOf := sameProviderRetryPolicy(selection.retry)
 		for attempt := 0; ; attempt++ {
-			msg, sr, usage, callErr = selection.provider.Complete(ctx, req)
+			prov := selection.provider
+			if downgradedProv != nil {
+				prov = downgradedProv
+			}
+			msg, sr, usage, callErr = prov.Complete(ctx, req)
+			// 模型拒收 thinking 参数 → 换一个不发 thinking 的 provider 重试一次。
+			if callErr != nil && !thinkingDowngraded && ctx.Err() == nil &&
+				hooks.withoutThinking != nil && isThinkingRejected(callErr) {
+				alt, altErr := hooks.withoutThinking()
+				if altErr == nil {
+					thinkingDowngraded = true
+					downgradedProv = alt
+					log.Printf("[task-llm] task %s 模型拒收 thinking 参数,改用不带 thinking 的 provider 重试: %v", taskID, callErr)
+					continue
+				}
+				log.Printf("[task-llm] task %s 模型拒收 thinking 参数,但无法降级(%v),按原错误处理", taskID, altErr)
+			}
 			if callErr != nil && ctx.Err() == nil &&
 				attempt < retries && isRetryableStreamError(callErr) {
 				backoff := backoffOf(attempt)
@@ -303,6 +389,11 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 
 func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest, hooks taskLLMStreamHooks) iter.Seq2[llm.StreamEvent, error] {
 	return func(yield func(llm.StreamEvent, error) bool) {
+		// thinking 降级只做一次：模型拒收 thinking 参数时换 provider 重试。
+		// 变量在闭包外声明，因为降级后的 provider 要贯穿整个 for 循环
+		// （换 profile 之后用的也是这一份）。
+		cur := req
+		downgradedProv, thinkingDowngraded := llm.Provider(nil), false
 		for {
 			selection, err := hooks.current()
 			if err != nil {
@@ -320,7 +411,11 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 				committed = false
 				pending = nil
 				streamErr = nil
-				for event, err := range selection.provider.Stream(ctx, req) {
+				prov := selection.provider
+				if downgradedProv != nil {
+					prov = downgradedProv
+				}
+				for event, err := range prov.Stream(ctx, cur) {
 					if err != nil {
 						streamErr = err
 						break
@@ -341,6 +436,31 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 					if !yield(event, nil) {
 						return
 					}
+				}
+				// 模型拒收 thinking 参数（adaptive thinking 模型不接受
+				// thinking.type=disabled）→ 换一个不发 thinking 的 provider 重试一次。
+				//
+				// 为什么在这里兜底而不是让每个调用方自己小心：这个 400 在
+				// ARTEX 里已经踩了三次（裁决/压缩/旁路摘要），每次都是某个
+				// 新的调用方硬编码了 thinking。放在统一入口，一处修好全局生效。
+				//
+				// 降级必须【换 provider】而不是改请求：thinking 参数在 provider
+				// 配置层（llm.Config.ThinkingType），不在 llm.CompletionRequest 里
+				// ——第一版实现改请求，条件恒为假、从不触发（实测 2013 出现 23 次
+				// 而降级 0 次）。
+				//
+				// 只降级一次：换 provider 后再报同样的错，说明不是这个原因，
+				// 继续重试只是浪费。
+				if streamErr != nil && !committed && !thinkingDowngraded &&
+					ctx.Err() == nil && hooks.withoutThinking != nil && isThinkingRejected(streamErr) {
+					alt, altErr := hooks.withoutThinking()
+					if altErr == nil {
+						thinkingDowngraded = true
+						downgradedProv = alt
+						log.Printf("[task-llm] task %s 模型拒收 thinking 参数,改用不带 thinking 的 provider 重试: %v", taskID, streamErr)
+						continue
+					}
+					log.Printf("[task-llm] task %s 模型拒收 thinking 参数,但无法降级(%v),按原错误处理", taskID, altErr)
 				}
 				if streamErr != nil && !committed && ctx.Err() == nil &&
 					attempt < retries && isRetryableStreamError(streamErr) {
@@ -602,16 +722,22 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	pl.SetKillWork(s.engine.KillWork)
 	pl.SetSteerWork(s.engine.SteerWork)
+	// Guard 归因 → graph_overview 的 guard_attributions 块（planner 看到 blocked/error
+	// 计数后可换打法，v0.3.88 体检 N5）。t.Guard 在 manager.go 建任务时必然创建。
+	pl.SetAttributions(t.Guard.Attributions)
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	pl.SetWebSearch(s.webSearchFor("planner"))
 	pl.SetConstraintInject(s.constraintInjectPlanner) // 操作约束注入 planner(可配置,默认开)
 	// cold-digest §7: 冷节点后台压缩。引擎经权威解析器实际驱动的就是这套 per-task planner
 	// (agentsForTask),Compactor 必须接在这里。走任务路由的 planner provider(§4:与 agent
-	// 同模型,随任务 LLM 链解析),压缩用 Complete 一次性生成 body。body 预算(输出上限/
-	// 思考模式)来自平台设置,每次 compress 重读,改配置无需重建。
-	comp := agent.NewCompactor(plannerRuntime, "task-router")
-	comp.SetBodyBudget(s.m.CompactionMaxTokens, s.m.CompactionThinking)
-	pl.SetCompactor(comp)
+	compactor := agent.NewCompactor(plannerRuntime, "task-router")
+	compactor.SetBodyBudget(s.m.CompactionMaxTokens, s.m.CompactionThinking)
+	compactor.SetOutputTokens(s.m.CompactionTokens())
+	if secs := s.m.CompactionTimeout(); secs > 0 {
+		compactor.SetMaxDuration(time.Duration(secs) * time.Second)
+	}
+	compactor.SetMaxBlockMembers(s.m.CompactionMaxMembers())
+	pl.SetCompactor(compactor)
 	main := agent.NewMainAgent(mainRuntime, "task-router", s.m.dir, tx, mainRuntime.CompactionWindow(), s.agentMaxTurns("mainagent"))
 	main.SetFindingRecorder(s.evidenceStore())
 	main.SetCompactionWindowResolver(mainRuntime.CompactionWindow)
@@ -621,6 +747,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	main.SetWebSearch(s.webSearchFor("mainagent"))
 	main.SetSteerWork(s.engine.SteerWork) // steer_work：人对运行中 work 实时纠偏
+	main.SetAttributions(t.Guard.Attributions) // Guard 归因 → 概览（人在环路同享打回计数）
 	bundle := &taskAgentBundle{
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
 		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main, pinnedWorkers: map[int64]*agent.Worker{},

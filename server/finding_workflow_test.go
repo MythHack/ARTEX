@@ -141,13 +141,25 @@ func TestFindingWorkflowAutoHintToPlannerAndSetting(t *testing.T) {
 	if err != nil || len(after.Bindings) != 3 || after.Version != recorded.Traffic.Version || after.Bindings[0].Note != refs[0].Note {
 		t.Fatal("duplicate changed evidence", after, err)
 	}
-	// A malformed handoff must not create a partial finding or notify Planner.
+	// A handoff whose traffic id does not exist must NOT discard the confirmed
+	// finding: the reference is reported back as skipped so the model can
+	// re-check the real id, and the vulnerability still lands.
 	badHint := workflowCall(t, ctx, s.toolAddHint(), map[string]any{"task_id": task.ID, "text": "missing packet", "traffic_refs": []db.TrafficRef{{TrafficID: "missing"}}}, false)
 	var badID int64
 	fmt.Sscanf(badHint, "hint added: %d", &badID)
-	workflowCall(t, ctx, report, map[string]any{"vulnclass": "TEST", "severity": "low", "summary": "must fail", "evidence_hint_id": badID}, true)
-	if notices != 1 {
-		t.Fatal("failed handoff notified before commit")
+	badResult := workflowCall(t, ctx, report, map[string]any{"vulnclass": "TEST", "severity": "low", "summary": "must survive a bad reference", "evidence_hint_id": badID}, false)
+	if !strings.Contains(badResult, "partially_bound") || !strings.Contains(badResult, "missing") {
+		t.Fatal("bad reference was not reported as skipped:", badResult)
+	}
+	var badRecorded db.RecordedFinding
+	if err := json.Unmarshal([]byte(strings.SplitN(badResult, "\n", 2)[1]), &badRecorded); err != nil {
+		t.Fatal(err)
+	}
+	if badRecorded.FindingID == 0 || len(badRecorded.SkippedRefs) != 1 || badRecorded.SkippedRefs[0].TrafficID != "missing" {
+		t.Fatalf("bad reference lost the finding or the skip report: %+v", badRecorded)
+	}
+	if notices != 2 {
+		t.Fatal("notified count wrong after a skipped reference", notices)
 	}
 	child, err := s.m.CreateTaskWithOptions("inherited handoff", "fixture", db.TaskCreateOptions{SourceTaskIDs: []int64{*f.TaskID}})
 	if err != nil {
@@ -179,7 +191,7 @@ func TestFindingWorkflowAutoHintToPlannerAndSetting(t *testing.T) {
 		t.Fatal("disabled binding discarded finding or bound evidence", offResult)
 	}
 	workflowCall(t, ctx, report, map[string]any{"vulnclass": "TCP", "severity": "low", "summary": "no packet needed"}, false)
-	if notices != 3 {
+	if notices != 4 {
 		t.Fatal("optional no-packet report failed")
 	}
 	workflowCall(t, ctx, s.toolGetFindingTraffic(), map[string]any{"finding_id": recorded.FindingID}, false)

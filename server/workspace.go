@@ -24,6 +24,40 @@ const (
 	maxWorkspaceUpload = 512 << 20 // 512 MiB per upload request
 )
 
+// workspaceProtectedDirs 是工作空间里**不可删除**的系统内部目录。
+//
+// 工作空间根目录就是 s.m.dir（data 目录），系统把运行时数据直接放在它下面。
+// 文件管理器的路径约束只保证「不越出根目录」，但根目录里的这些子目录是
+// 系统自己在用的：删掉之后要么不可再生，要么要花很久重建。
+//
+//   traffic          —— 流量采集库（实测 3.3G / 34 万条）。删了历史请求
+//                       响应全丢，漏洞报告里的 HTTP 证据链随之断掉。
+//   evidence         —— 漏洞绑定的流量正文（按 sha256 存 blob）。删了
+//                       findings 里的绑定全部变成空指针。
+//   nuclei-templates —— 漏洞模板库（实测 934M / 14077 个模板）。删了要
+//                       重新 git clone 一遍。
+//
+// 任务数据（tasks / sessions / transcripts）**不在**这份名单里：它们属于
+// 某个任务，要清就通过 DELETE /api/tasks/{id} 走正规路径，而不是在工作
+// 空间里顺手删一棵目录树。
+//
+// 只拦删除，不禁读写——agent 仍要能往这些目录里写东西。
+var workspaceProtectedDirs = []string{"traffic", "evidence", "nuclei-templates"}
+
+// wsProtected reports whether an absolute path is one of the protected system
+// directories (the directory itself, or anything under it).
+func (s *Server) wsProtected(abs string) bool {
+	root := filepath.Clean(s.m.dir)
+	target := filepath.Clean(abs)
+	for _, name := range workspaceProtectedDirs {
+		p := filepath.Join(root, name)
+		if target == p || strings.HasPrefix(target, p+string(os.PathSeparator)) {
+			return true
+		}
+	}
+	return false
+}
+
 // wsResolve maps a user-supplied relative path to an absolute path INSIDE the work
 // dir. It returns ok=false if the path would escape the root. filepath.Clean on a
 // rooted copy collapses any ".." so nothing can climb above the root.
@@ -149,6 +183,11 @@ func (s *Server) wsWrite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
+	// 覆盖系统数据目录里的文件同样会破坏数据（traffic 索引、证据 blob）。
+	if s.wsProtected(abs) {
+		writeErr(w, 403, "系统数据目录不可写入（"+strings.Join(workspaceProtectedDirs, " / ")+"）")
+		return
+	}
 	if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
 		writeErr(w, 400, "目标是目录")
 		return
@@ -178,6 +217,10 @@ func (s *Server) wsMkdir(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "非法路径")
 		return
 	}
+	if s.wsProtected(abs) {
+		writeErr(w, 403, "系统数据目录不可写入（"+strings.Join(workspaceProtectedDirs, " / ")+"）")
+		return
+	}
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -195,6 +238,10 @@ func (s *Server) wsDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	if abs == filepath.Clean(s.m.dir) {
 		writeErr(w, 400, "不能删除工作区根目录")
+		return
+	}
+	if s.wsProtected(abs) {
+		writeErr(w, 403, "系统数据目录不可删除（"+strings.Join(workspaceProtectedDirs, " / ")+"）")
 		return
 	}
 	if _, err := os.Stat(abs); err != nil {
@@ -314,6 +361,10 @@ func (s *Server) wsUpload(w http.ResponseWriter, r *http.Request) {
 	dirAbs, ok := s.wsResolve(r.URL.Query().Get("path"))
 	if !ok {
 		writeErr(w, 400, "非法路径")
+		return
+	}
+	if s.wsProtected(dirAbs) {
+		writeErr(w, 403, "系统数据目录不可写入（"+strings.Join(workspaceProtectedDirs, " / ")+"）")
 		return
 	}
 	if fi, err := os.Stat(dirAbs); err != nil || !fi.IsDir() {

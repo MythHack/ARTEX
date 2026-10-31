@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
@@ -21,6 +22,7 @@ import (
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/artex/vulnintel"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -236,6 +238,22 @@ type Manager struct {
 	traffic     *traffic.Traffic       // process-wide recording proxy (may be nil)
 	enrich      *enrich.Engine         // engine-side asset auto-completion (DNS/HTTP)
 	interceptor *intercept.Interceptor // user-configured tool-call interception rules
+	vulnintel   *vulnintel.Store       // public CVE/KEV intel store (agent search_vulns reads it)
+	nucleiDir   string                 // local nuclei-templates checkout (synced by vulnintel goroutine)
+	// 漏洞情报同步的互斥与状态：定时循环与页面「立即同步」共用一把锁，保证同一时刻
+	// 只有一轮，避免并发写 vuln_sync_state、抢 NVD 限速。
+	vulnSyncMu        sync.Mutex
+	vulnSyncRunning   atomic.Bool
+	vulnSyncStartedAt atomic.Int64
+	// 近期高危快通道的互斥：与主同步【不共用锁】——主同步一轮最长 30 分钟，
+	// 快通道必须能在那期间照常把新披露的高危送进库（共用锁会被拖到 30 分钟
+	// 一次，等于没有快通道）。快通道自己内部也互斥，避免重复拉同一窗口。
+	vulnFastLaneMu sync.Mutex
+	// 代理池主动健康检查的开关与节流状态（proxypool_health_* settings）。
+	proxyCheckInFlight atomic.Bool
+	// proxyCheckMu 保护代理池「最近一次验证」的快照(页面回显用)。
+	proxyCheckMu   sync.Mutex
+	proxyCheckLast map[string]any
 
 	companyMu sync.Mutex // serializes task/company-scope commits with live handle registration
 	// taskStateMu preserves commit order between PostgreSQL lifecycle writes and
@@ -276,11 +294,17 @@ const (
 	// settingGlobalProxy is the global egress proxy for all target traffic
 	// (http/https/socks5). Empty = direct. Distinct from web_search_proxy (which
 	// only routes the search backend) and the per-profile LLM proxy.
-	settingGlobalProxy  = "global_proxy"
-	settingShowEgressIP = "show_egress_ip"
-	settingWorkers      = "workers"
-	settingWorkerPools  = "worker_pools"
-	settingLLMRecord    = "llm_record"
+	settingGlobalProxy          = "global_proxy"
+	settingShowEgressIP         = "show_egress_ip"
+	settingInstallProxy         = "install_proxy"
+	settingVulnIntelOn          = "vulnintel_enabled"
+	settingNvdApiKey            = "nvd_api_key"
+	settingWorkers              = "workers"
+	settingWorkerPools          = "worker_pools"
+	settingLLMRecord            = "llm_record"
+	settingCompactionTokens     = "compaction_max_tokens"
+	settingCompactionTimeout    = "compaction_timeout_seconds"
+	settingCompactionMaxMembers = "compaction_max_members"
 	// LLM 轮询(故障转移)。默认关闭——开启后走「全局激活配置」的 agent 在当前配置
 	// 不可用(余额不足/key 失效/限流/服务异常)时自动切到下一个配置。
 	// settingLLMPoolBindFallback 仅在轮询开启时有意义:默认关闭,即 agent/任务显式
@@ -516,6 +540,87 @@ func (m *Manager) SetWorkers(n int) error {
 	return m.pg.SetSetting(settingWorkers, strconv.Itoa(n))
 }
 
+// CompactionTokens 返回冷节点压缩的输出预算。0/未配 = 用 agent 包的默认值。
+func (m *Manager) CompactionTokens() int {
+	if m == nil || m.pg == nil {
+		return 0
+	}
+	v, ok, err := m.pg.GetSetting(settingCompactionTokens)
+	if err != nil || !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// SetCompactionTokens 持久化压缩的输出预算。n<=0 表示恢复默认(清空设置)。
+func (m *Manager) SetCompactionTokens(n int) error {
+	if m == nil || m.pg == nil {
+		return fmt.Errorf("数据库未就绪")
+	}
+	if n <= 0 {
+		return m.pg.SetSetting(settingCompactionTokens, "")
+	}
+	return m.pg.SetSetting(settingCompactionTokens, strconv.Itoa(n))
+}
+
+// CompactionTimeout 返回单次后台压缩的墙钟上限(秒)。0/未配 = 用 agent 包的默认值。
+func (m *Manager) CompactionTimeout() int {
+	if m == nil || m.pg == nil {
+		return 0
+	}
+	v, ok, err := m.pg.GetSetting(settingCompactionTimeout)
+	if err != nil || !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// SetCompactionTimeout 持久化压缩的墙钟上限(秒)。n<=0 表示恢复默认(清空设置)。
+func (m *Manager) SetCompactionTimeout(secs int) error {
+	if m == nil || m.pg == nil {
+		return fmt.Errorf("数据库未就绪")
+	}
+	if secs <= 0 {
+		return m.pg.SetSetting(settingCompactionTimeout, "")
+	}
+	return m.pg.SetSetting(settingCompactionTimeout, strconv.Itoa(secs))
+}
+
+// CompactionMaxMembers 返回单次压缩请求的成员节点数上限。0/未配 = 用默认值。
+func (m *Manager) CompactionMaxMembers() int {
+	if m == nil || m.pg == nil {
+		return 0
+	}
+	v, ok, err := m.pg.GetSetting(settingCompactionMaxMembers)
+	if err != nil || !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// SetCompactionMaxMembers 持久化单次压缩请求的成员节点数上限。n<=0 = 恢复默认。
+func (m *Manager) SetCompactionMaxMembers(n int) error {
+	if m == nil || m.pg == nil {
+		return fmt.Errorf("数据库未就绪")
+	}
+	if n <= 0 {
+		return m.pg.SetSetting(settingCompactionMaxMembers, "")
+	}
+	return m.pg.SetSetting(settingCompactionMaxMembers, strconv.Itoa(n))
+}
+
 // Enrich returns the asset auto-completion engine (may be nil if init failed).
 func (m *Manager) Enrich() *enrich.Engine { return m.enrich }
 
@@ -625,11 +730,37 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		if err := m.traffic.SetUpstreamProxy(m.globalProxy); err != nil {
 			log.Printf("[proxy] 全局代理 %q 无效，已忽略: %v", m.globalProxy, err)
 		}
+		// 代理池恢复(upstream 钩子是"池优先",池非空时覆盖上面的单代理)。
+		// 放 manager 的字段恢复段之后,与 capture 状态无关(池只影响出口选择)。
+		if pool := loadProxyPoolState(pg); pool != nil {
+			if err := m.traffic.SetProxyPool(pool.Entries, pool.Strategy); err != nil {
+				log.Printf("[proxypool] 池恢复失败: %v", err)
+			} else if len(pool.Entries) > 0 {
+				log.Printf("[proxypool] 已恢复 %d 个上游代理(策略 %s,池优先于全局代理)", len(pool.Entries), pool.Strategy)
+			}
+		}
 	}
 	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
 	// Reconcile the seeded browser MCP with the persisted capture state, so a
 	// restart with capture already on keeps Playwright routed through the proxy.
 	m.syncBrowserMCPProxy()
+	// 漏洞情报库：store 全局共享（agent 的 search_vulns/get_vuln 经包级注入读取）。
+	// 同步走独立 goroutine：延迟 90s 起跑避开启动风暴，默认每 6h 一轮；关闭开关只
+	// 停同步，已入库数据仍可查。
+	m.vulnintel = vulnintel.New(m.pg)
+	m.nucleiDir = vulnintel.TemplatesDir(m.dir)
+	agent.SetVulnIntelStore(m.vulnintel)
+	agent.SetNucleiTemplatesDir(m.nucleiDir)
+	if pg.GetBool(settingVulnIntelOn, true) {
+		go m.runVulnIntelSync()
+		// 近期高危快通道：独立 goroutine + 独立锁，不被主同步的 30 分钟一轮拖住。
+		go m.runVulnIntelFastLane()
+	} else {
+		log.Printf("[vulnintel] 同步已关闭（settings.%s=false），agent 工具将返回未启用", settingVulnIntelOn)
+	}
+	// 代理池主动健康检查：定时探测已启用上游，不通的立刻熔断。
+	// 间隔为 0 时关闭（设置项 proxypool_health_minutes）。
+	m.StartProxyPoolHealthCheck()
 	return m, nil
 }
 
@@ -833,6 +964,36 @@ func (m *Manager) deepSeekSearchCreds() (baseURL, apiKey, model string) {
 		return "", "", ""
 	}
 	return p.BaseURL, p.APIKey, p.Model
+}
+
+
+// WebSearchEnabled reports whether web search is enabled.
+func (m *Manager) WebSearchEnabled() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.webSearchOn
+}
+
+// VulnintelEnabled reports whether the vulnerability intelligence sync is enabled.
+func (m *Manager) VulnintelEnabled() bool {
+	if m.pg == nil {
+		return false
+	}
+	return m.pg.GetBool(settingVulnIntelOn, true)
+}
+
+// SetVulnintelEnabled persists and applies the vulnintel toggle. Sync goroutine
+// checks this flag on each cycle, so the toggle takes effect on the next cycle.
+func (m *Manager) SetVulnintelEnabled(on bool) error {
+	return m.pg.SetBool(settingVulnIntelOn, on)
+}
+
+// ProxyPoolEnabled reports whether the proxy pool is configured and running.
+func (m *Manager) ProxyPoolEnabled() bool {
+	if m.traffic == nil {
+		return false
+	}
+	return m.traffic.ProxyPoolEnabled()
 }
 
 // SetWebSearch persists and applies the web-search settings. braveKey, tavilyKey, and
@@ -1078,11 +1239,66 @@ func (m *Manager) ProxyCACert() string {
 	return m.traffic.CACertPath()
 }
 
+// runVulnIntelSync drives the periodic CVE/KEV sync. One pass per cycle; the
+// per-run ceiling (vulnintel.Config.MaxRuntime) bounds each pass, the cursor
+// resumes where the previous one stopped, so a slow first backfill simply
+// finishes over several cycles. The toggle is re-read each cycle so turning it
+// off in the UI takes effect without a restart. No shutdown channel: the
+// process exit reaps it, same as the traffic proxy goroutine.
+func (m *Manager) runVulnIntelSync() {
+	time.Sleep(90 * time.Second) // 避开启动风暴（LLM 链接、traffic proxy 起动期）
+	for {
+		if !m.pg.GetBool(settingVulnIntelOn, true) {
+			log.Printf("[vulnintel] 同步已关闭，进入待机（仍刷新 nuclei 模板树）")
+			// 模板树与情报同步解耦：scan_with_nuclei 是独立功能，开关关掉也不该让它烂在原地。
+			// 仍拿同一把锁，避免与页面「立即同步」并发跑 git。
+			if m.vulnSyncMu.TryLock() {
+				m.refreshNucleiTemplates(m.vulnIntelProxy())
+				m.vulnSyncMu.Unlock()
+			}
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+			// TryLock 保证与页面「立即同步」不并发：同一时刻只允许一轮。
+			if err := m.runVulnIntelPass(ctx); err != nil {
+				log.Printf("[vulnintel] 本轮跳过: %v", err)
+			}
+			cancel()
+		}
+		time.Sleep(defaultVulnIntelInterval)
+	}
+}
+
 // GlobalProxy returns the configured global egress proxy URL (empty = direct).
 func (m *Manager) GlobalProxy() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.globalProxy
+}
+
+// maintenanceProxy resolves the egress proxy for MAINTENANCE traffic (CVE/KEV 同步、
+// nuclei 模板树、拉更新、装宿主工具): 装机代理 → 全局代理 → 搜索代理 → 直连。
+// 语义上装机代理最贴切(它本来就是为连 GitHub 拉东西配的),老部署没配过它时按原样
+// 回落到全局代理,行为不变。与 Server.maintenanceProxy 是同一套回退链——那里住的是
+// HTTP 侧的调用方,这里住的是后台同步协程。
+func (m *Manager) maintenanceProxy() string {
+	if m == nil || m.pg == nil {
+		return ""
+	}
+	if v, _, _ := m.pg.GetSetting(settingInstallProxy); strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+	// 环境变量兜底：Docker 形态没有 config.json，install.sh 只能通过 compose
+	// 传进来；这里让它与数据库 setting 同等生效（数据库优先，可被页面改写）。
+	if v := strings.TrimSpace(os.Getenv("ARTEX_INSTALL_PROXY")); v != "" {
+		return v
+	}
+	if p := m.GlobalProxy(); p != "" {
+		return p
+	}
+	if v, ok, _ := m.pg.GetSetting(settingWebSearchProxy); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
 }
 
 // SetGlobalProxy validates, persists and applies the global egress proxy

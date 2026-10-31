@@ -23,10 +23,10 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/skill"
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
 )
 
 // validSkillName checks the agentskills.io name constraints, widened so a skill can
@@ -361,6 +361,7 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 		RunSeconds       *int  `json:"run_seconds"`
 		WebSearch        *bool `json:"web_search"`
 		InteractiveShell *bool `json:"interactive_shell"`
+		LocalExec        *bool `json:"local_exec"`
 		// llm_profile_id 三态:字段缺省=不动;显式 null=解绑(跟随任务/全局);数字=绑定该 profile。
 		LLMProfileID json.RawMessage `json:"llm_profile_id"`
 		// P3 触发后处理策略(三者一起可选,提供任一即整体写入;未提供则不动)。
@@ -419,6 +420,12 @@ func (s *Server) pgSaveAgentConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.InteractiveShell != nil {
 		if err := pg.SetAgentInteractiveShell(a.Key, *req.InteractiveShell); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.LocalExec != nil {
+		if err := pg.SetAgentLocalExec(a.Key, *req.LocalExec); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -870,6 +877,12 @@ func (s *Server) pgSaveMCP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	// transport 受 DB CHECK 约束（stdio/http/sse）。前置校验，非法值返回 400
+	// 而不是让 DB 约束以 500 的形式冒出来。
+	if msg := checkEnum("transport", m.Transport, validMCPTransports); msg != "" {
+		writeErr(w, 400, msg)
+		return
+	}
 	isNew := m.ID == 0
 	id, err := pg.SaveMCP(&m)
 	if err != nil {
@@ -958,12 +971,13 @@ func (s *Server) pgMCPTools(w http.ResponseWriter, r *http.Request) {
 // ---------- skills (文件系统) ----------
 
 type skillFileNode struct {
-	Name          string   `json:"name"`
-	Description   string   `json:"description,omitempty"`
-	License       string   `json:"license,omitempty"`
-	Compatibility string   `json:"compatibility,omitempty"`
-	MCPs          []string `json:"mcps,omitempty"`
-	Files         []string `json:"files"`
+	Name          string    `json:"name"`
+	Description   string    `json:"description,omitempty"`
+	License       string    `json:"license,omitempty"`
+	Compatibility string    `json:"compatibility,omitempty"`
+	MCPs          []string  `json:"mcps,omitempty"`
+	Tags          SkillTags `json:"tags,omitempty"`
+	Files         []string  `json:"files"`
 	// Usage ledger (db/skill_usage.go). Calls is 0 and LastUsed nil for a skill that
 	// was never invoked — the ledger only has rows for skills agents actually loaded.
 	Calls    int        `json:"calls"`
@@ -988,6 +1002,8 @@ func (s *Server) fsListSkills(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	// 标准化标签（CWE/ATT&CK/class）：可选元数据，解析失败只是没有标签。
+	tagsByDir := LoadSkillTags(s.skillDir)
 	// Usage is best-effort decoration: a ledger read failure leaves the counts at
 	// zero rather than failing the skill list itself.
 	statBySkill := map[string]db.SkillStat{}
@@ -1015,6 +1031,9 @@ func (s *Server) fsListSkills(w http.ResponseWriter, r *http.Request) {
 			node.License = meta.License
 			node.Compatibility = meta.Compatibility
 			node.MCPs = meta.MCPs
+		}
+		if tags, ok := tagsByDir[dirName]; ok {
+			node.Tags = tags
 		}
 		node.Files, _ = walkSkillFiles(filepath.Join(s.skillDir, dirName))
 		if node.Files == nil {
@@ -1814,6 +1833,13 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	p := body.LLMProfile
 	p.APIKey = body.APIKey
 	p.Streaming = body.Streaming == nil || *body.Streaming
+	// format 受 DB CHECK 约束（openai/anthropic/openai-responses）。非法值在
+	// 这里就挡掉，否则会以 500 + SQLSTATE 23514 的形式甩给用户，前端只能显示
+	// 「服务器内部错误」，看不出是自己填错了。
+	if msg := checkEnum("format", p.Format, validLLMProfileFormats); msg != "" {
+		writeErr(w, 400, msg)
+		return
+	}
 	// 输出上限:负数无意义,归零(= 不发送该字段)。字段名开关只有 Chat Completions
 	// 用得上——anthropic 与 openai-responses 各自定死了字段名,存下来只会误导后续读者,
 	// 故非 openai 格式一律清空。未知取值同样清空,避免把 DB CHECK 的报错甩给用户。
@@ -1935,6 +1961,11 @@ func (s *Server) pgActivateProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := pg.SetActiveProfile(body.ID); err != nil {
+		// 找不到 profile 是调用方的错（4xx），不是服务端故障。
+		if errors.Is(err, db.ErrLLMProfileNotFound) {
+			writeErr(w, 404, "LLM 配置不存在")
+			return
+		}
 		writeErr(w, 500, err.Error())
 		return
 	}
