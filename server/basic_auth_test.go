@@ -37,7 +37,8 @@ func (m *basicAuthMemoryStore) SetSettingContext(ctx context.Context, _ string, 
 func basicAuthTestServer(t *testing.T) (*Server, *basicAuthMemoryStore) {
 	t.Helper()
 	store := &basicAuthMemoryStore{}
-	s := &Server{jwtKey: []byte("test-only-signing-key-32-characters")}
+	s := &Server{}
+	s.jwtKey.Store([]byte("test-only-signing-key-32-characters"))
 	if err := s.basicAuth.load(store); err != nil {
 		t.Fatal(err)
 	}
@@ -233,10 +234,10 @@ func TestBasicAuthGate(t *testing.T) {
 	if !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode || cookie.Path != "/" {
 		t.Fatalf("unsafe cookie: %+v", cookie)
 	}
-	if verifyJWT(cookie.Value, s.jwtKey) {
+	if verifyJWT(cookie.Value, s.currentJWTKey()) {
 		t.Fatal("gate cookie accepted as admin JWT")
 	}
-	adminJWT, _ := signJWT(s.jwtKey)
+	adminJWT, _ := signJWT(s.currentJWTKey())
 	for _, tc := range []struct {
 		name, path, user, pass, bearer string
 		cookie                         *http.Cookie
@@ -408,7 +409,7 @@ func TestBasicAuthCORS(t *testing.T) {
 		r := httptest.NewRequest("OPTIONS", "http://127.0.0.1:8787/api/settings/basic-auth", nil)
 		r.Header.Set("Origin", tc.origin)
 		w := httptest.NewRecorder()
-		cors(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("preflight reached handler") })).ServeHTTP(w, r)
+		securityHeaders(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("preflight reached handler") })).ServeHTTP(w, r)
 		if w.Code != 204 || (w.Header().Get("Access-Control-Allow-Credentials") == "true") != tc.credentials {
 			t.Fatalf("unexpected CORS for %s: %v", tc.origin, w.Header())
 		}
@@ -444,11 +445,12 @@ func TestBasicAuthPostgresLoginFlow(t *testing.T) {
 	if err := m.pg.SetSetting(authPassKey, string(hash)); err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{m: m, jwtKey: []byte("test-only-signing-key-32-characters")}
+	s := &Server{m: m}
+	s.jwtKey.Store([]byte("test-only-signing-key-32-characters"))
 	if err := s.basicAuth.load(m.pg); err != nil {
 		t.Fatal(err)
 	}
-	adminJWT, err := signJWT(s.jwtKey)
+	adminJWT, err := signJWT(s.currentJWTKey())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +469,8 @@ func TestBasicAuthPostgresLoginFlow(t *testing.T) {
 		t.Fatalf("save: %d %s", w.Code, w.Body.String())
 	}
 
-	restarted := &Server{m: m, jwtKey: s.jwtKey}
+	restarted := &Server{m: m}
+	restarted.jwtKey.Store(s.currentJWTKey())
 	if err := restarted.basicAuth.load(m.pg); err != nil {
 		t.Fatal(err)
 	}
@@ -485,7 +488,7 @@ func TestBasicAuthPostgresLoginFlow(t *testing.T) {
 	var login struct {
 		Token string `json:"token"`
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &login); err != nil || w.Code != 200 || !verifyJWT(login.Token, s.jwtKey) {
+	if err := json.Unmarshal(w.Body.Bytes(), &login); err != nil || w.Code != 200 || !verifyJWT(login.Token, s.currentJWTKey()) {
 		t.Fatalf("Basic Auth + existing login failed: %d %s", w.Code, w.Body.String())
 	}
 	cookie := w.Result().Cookies()[0]

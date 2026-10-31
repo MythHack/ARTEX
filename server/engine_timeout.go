@@ -18,9 +18,19 @@ import (
 //   ④ 等在跑 worker drain(受 grace) → ⑤ 终局一轮 planner 判定 → ⑥ 定终态(带守卫)
 
 const (
-	settleDrainGrace     = 90 * time.Second // 等在跑 worker 优雅收尾的上限;超过则硬 cancel
-	deadlinePollInterval = 2 * time.Second  // deadline 未盖章/LLM 未就绪时的轮询间隔
-	deadlineMaxSleep     = 30 * time.Second // 单次最长睡眠(便于周期复查终态)
+	// settleDrainGrace 是等在跑 worker 优雅收尾的上限;超过则硬 cancel。
+	//
+	// 为什么从 90s 提到 300s(2026-10-21 实测修正)：任务到点时可能同时有
+	// **12 个 worker** 在跑(worker 数就是并发上限),每个都要走一遍 SDK 的
+	// settlement(注入收尾词 + 禁 Bash + 写回成果 + 收尾总结)——那至少是
+	// 1 轮 LLM 调用,而思考型模型(minimax-m3.1)一轮就要 30~60 秒。
+	//
+	// 实测线上任务 3：13:42:23 到点，13:43:53 就 drain 超时硬砍——90 秒里
+	// 12 个 worker 只来得及各写回 1~3 条事实，正在写的成果直接丢了。
+	// 收尾窗口必须按「并发 worker 数 × 单轮 LLM 耗时」来给，不能按单 worker 给。
+	settleDrainGrace     = 300 * time.Second // 等在跑 worker 优雅收尾的上限;超过则硬 cancel
+	deadlinePollInterval = 2 * time.Second   // deadline 未盖章/LLM 未就绪时的轮询间隔
+	deadlineMaxSleep     = 30 * time.Second  // 单次最长睡眠(便于周期复查终态)
 )
 
 // ---------- settling 状态 ----------
@@ -257,12 +267,24 @@ func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task) (met bool) {
 		Summary: fmt.Sprintf("任务超时收尾·终局判定(第 %d 轮)", e.nextPlannerRound(t.ID))})
 	tTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
-	met, reason, err := planner.Plan(fctx, tTaskID, e.m.assets, t.Store, t.Goal, t.drainTriggers(), emit)
+	// 终局轮与普通规划轮同款墙钟护栏：fctx 是无 deadline 的 server 根 ctx，而
+	// settleTask 在等这一步落终态——Plan 若卡死（上游半开连接/compactor 自死锁，
+	// 两类都是线上发生过的事故），任务会永远停在 settling。超时=按「未达成」
+	// 返回，走正常的超时收尾流程；卡死的 goroutine 泄漏是两害取其轻。
+	roundCtx, roundCancel := context.WithTimeout(fctx, plannerRoundLimit())
+	defer roundCancel()
+	res := runPlannerRound(roundCtx, func(pctx context.Context) (bool, string, error) {
+		return planner.Plan(pctx, tTaskID, e.m.assets, t.Store, t.Goal, t.drainTriggers(), emit)
+	})
 	e.EndLLMCall(t.ID)
-	if err != nil {
-		log.Printf("[deadline] task %s 终局规划出错: %v", t.ID, err)
-	} else if met {
-		log.Printf("[deadline] task %s 终局判定目标达成: %s", t.ID, reason)
+	if res.err != nil && roundCtx.Err() != nil {
+		log.Printf("[deadline] task %s 终局规划超时(%s)，按未达成继续收尾", t.ID, plannerRoundLimit())
+		return false
 	}
-	return met
+	if res.err != nil {
+		log.Printf("[deadline] task %s 终局规划出错: %v", t.ID, res.err)
+	} else if res.met {
+		log.Printf("[deadline] task %s 终局判定目标达成: %s", t.ID, res.reason)
+	}
+	return res.met
 }

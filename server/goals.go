@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -40,6 +41,11 @@ func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
 	}
 }
 
+// goalsDecomposeTimeout 是第 0 轮目标拆解（单条 LLM 调用）的墙钟上限。
+// 实测正常拆解 30 秒～2 分钟（思考型模型偏慢），5 分钟给足冗余；上游挂起时
+// 最多损失这 5 分钟就走回退路径，任务不再可能永久卡在 created。
+const goalsDecomposeTimeout = 5 * time.Minute
+
 func (s *Server) startTaskEngine(t *Task) {
 	ctx := s.engine.execContextFor(s.ctx, t.ID)
 	if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
@@ -47,9 +53,20 @@ func (s *Server) startTaskEngine(t *Task) {
 	}
 	s.engine.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
 		Summary: "第 0 轮目标拆解"})
-	goals := s.createGoals(ctx, t, func(r db.Activity) {
+	// 拆解是一次单条 LLM 调用，必须自带墙钟：任务没配 timeout_seconds 时
+	// execContextFor 无 deadline，上游连接挂起（连上但永不返回）会让拆解
+	// 永不返回——任务永久卡在 created，且无任何日志（2026-10-30 实测：
+	// llmpool 故障转移后的大模型连接挂起，卡 15 分钟以上无重试无报错）。
+	// 与 plannerRoundTimeout 同思路：超时放弃本轮，走「拆解无产出 → 原始
+	// 目标作为单目标」的既有回退路径，任务照常起跑。
+	decomposeCtx, cancel := context.WithTimeout(ctx, goalsDecomposeTimeout)
+	defer cancel()
+	goals := s.createGoals(decomposeCtx, t, func(r db.Activity) {
 		s.engine.emitActivity(t, r)
 	})
+	if errors.Is(decomposeCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+		log.Printf("[goals] task %s 目标拆解超时（%s），回退为原始目标", t.ID, goalsDecomposeTimeout)
+	}
 	if ctx.Err() != nil || s.engine.IsDeleting(t.ID) {
 		return
 	}

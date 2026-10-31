@@ -200,6 +200,11 @@ type TaskNodeDTO struct {
 	SourceTaskID string `json:"source_task_id,omitempty"`
 	Inherited    bool   `json:"inherited,omitempty"`
 	DeleteReason string `json:"delete_reason,omitempty"` // 意图假删除(state='deleted')时的删除原因
+	// BlockedReason 是意图**为什么停**的说明（exhausted/blocked/stopped 都可能有）：
+	// 撞步数上限、运行超时、任务级超时收尾、被规划者终止、执行出错……
+	// 之前这些原因完全不落库，界面上只看到一个空状态——用户看到「一堆子任务异常
+	// 中断」却不知道为什么中断。
+	BlockedReason string `json:"blocked_reason,omitempty"`
 }
 
 func taskNodeDTO(n *db.Node) TaskNodeDTO {
@@ -208,6 +213,7 @@ func taskNodeDTO(n *db.Node) TaskNodeDTO {
 		Type:         n.Kind,
 		Payload:      rawString(n.Payload),
 		DeleteReason: n.DeleteReason,
+		BlockedReason: n.BlockedReason,
 		Priority:     n.Priority,
 		State:        n.State,
 		Origin:       n.Origin,
@@ -229,19 +235,27 @@ type GoalDTO struct {
 	State     string `json:"state"`
 	Origin    string `json:"origin,omitempty"`
 	TS        string `json:"ts"`
+	// Unverified 表示这个目标是在「整体收官(goal_met)」时被顺带声明的，没有走
+	// prove_goal 的逐条证据链。报告与界面据此区分「被证明」和「被声称」。
+	Unverified       bool   `json:"unverified,omitempty"`
+	UnverifiedReason string `json:"unverified_reason,omitempty"`
 }
 
 func goalDTO(n *db.Node) GoalDTO {
 	var p struct {
-		Text      string `json:"text"`
-		VulnClass string `json:"vulnclass"`
+		Text             string `json:"text"`
+		VulnClass        string `json:"vulnclass"`
+		Unverified       bool   `json:"unverified"`
+		UnverifiedReason string `json:"unverified_reason"`
 	}
 	_ = json.Unmarshal(n.Payload, &p)
 	return GoalDTO{
-		ID:        i64s(n.ID),
-		Text:      p.Text,
-		VulnClass: p.VulnClass,
-		State:     n.State,
+		ID:               i64s(n.ID),
+		Text:             p.Text,
+		VulnClass:        p.VulnClass,
+		Unverified:       p.Unverified,
+		UnverifiedReason: p.UnverifiedReason,
+		State:            n.State,
 		Origin:    n.Origin,
 		TS:        rfc3339(n.CreatedAt),
 	}

@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
 )
 
 // jsonResult marshals v to a JSON tool result.
@@ -38,9 +38,11 @@ func jsonResult(v any) (actool.Result, error) {
 //
 //nolint:unused // used as the hostTools provider in wireAgentAugment
 func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
-	tools := append(s.m.HostTools(), s.orchestrationTools()...)
+	tools := append([]actool.CoreTool{}, s.m.HostTools()...)
+	tools = append(tools, s.orchestrationTools()...)
 	tools = append(tools, s.findingRetestTools()...)
 	tools = append(tools, s.platformTools()...) // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
+	tools = append(tools, s.proxyTools()...)     // 代理池：状态查询 + 坏出口上报
 	custom, err := s.customTools()
 	if err != nil {
 		log.Printf("[custom-tool] 加载失败: %v", err)
@@ -231,7 +233,9 @@ func (s *Server) toolListLLMProfiles() actool.CoreTool {
 
 func (s *Server) toolSpawnTask() actool.CoreTool {
 	return wrTool("spawn_task",
-		"新建一个子任务并启动探索引擎，返回 task_id。用于把一件事(如一道题/一个目标)派成独立任务。parent_ref 可选：填当前编排关联的父任务 id 做父子关联。",
+		"新建一个子任务并启动探索引擎，返回 task_id。用于把一件事(如一道题/一个目标)派成独立任务。parent_ref 可选：填当前编排关联的父任务 id 做父子关联。"+
+			"**一个任务 = 一个目标 + 它的完整渗透链**(资产发现→服务识别→漏洞探测→验证→报告)：同一目标的多个阶段必须写进同一个任务的 goal，"+
+			"不要按阶段拆成多个任务并行——那会重复扫描同一批资产，且后一个任务开局没有任何前置资产。只有多个互不依赖的目标才建多个任务。",
 		objSchema(map[string]any{
 			"description":            strParam("任务描述(简短标题)"),
 			"goal":                   strParam("任务目标(要达成什么)"),
@@ -519,6 +523,13 @@ func (s *Server) seedOrchestrationTools() {
 		schema, _ := json.Marshal(t.InputSchema())
 		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, autoAgents)
 	}
+	// 代理池工具默认绑 worker + planner：执行者遇到「目标连不通」时需要能查池状态
+	// 并上报坏出口；规划者读态势时也用得上。
+	proxyAgents, _ := json.Marshal([]string{"worker", "planner"})
+	for _, t := range s.proxyTools() {
+		schema, _ := json.Marshal(t.InputSchema())
+		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, proxyAgents)
+	}
 	s.refreshBuiltinToolSchemas()
 	s.seedAutoDefaultBindings()
 	s.seedPlannerDefaultBindings()
@@ -527,7 +538,6 @@ func (s *Server) seedOrchestrationTools() {
 	s.seedWorkerReadToolsUnbind() // list_facts/list_companies/list_worker_traces 从 worker 默认解绑(一次性)
 	s.seedWorkerReadbackRebind()  // 修复旧迁移误删：把 search_all_worker_traces/get_worker_trace/node_detail 补绑回 worker(一次性)
 	s.seedAutoReportFindingBinding()
-	s.unbindGoalMetDefault()
 	s.reseedGoalsPrompt()             // goals 提示词加入「抽操作约束」步 → 旧库追加一版新默认(一次性)
 	s.reseedMainAgentPrompt()         // mainagent 提示词加入「目标达成后 add_intent 反问是否建目标」(一次性)
 	s.reseedPlannerPrompt()           // planner 提示词:重写「0 意图」正当理由 + 加量化验收核对 + CVSS 原语深挖导向(一次性)
@@ -612,7 +622,7 @@ func (s *Server) migrateReporterWorkflow() {
 // reaches an old DB otherwise. Preserves each tool's agent binding + enabled flag.
 // Bump the flag whenever these tools' schemas/descriptions change in code.
 func (s *Server) refreshBuiltinToolSchemas() {
-	const flag = "tool_schema_refresh_v9_cvss_cwe_finding"
+	const flag = "tool_schema_refresh_v10_merged_chu_cvss"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -642,23 +652,6 @@ func (s *Server) refreshBuiltinToolSchemas() {
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
 	log.Printf("[tools] 已刷新 orchestration/platform 工具 schema 到代码默认(一次性)")
-}
-
-// unbindGoalMetDefault removes goal_met's default "planner" binding ONCE (guarded by
-// a settings flag), so existing DBs match the new default of NO agent. goal_met bypasses
-// per-goal prove_goal to declare the whole task done — powerful/risky and redundant with
-// the prove_goal→auto-complete path — so it ships unbound; users can re-bind it per agent
-// in the UI. A user's own binding to another agent is untouched (we only strip planner).
-func (s *Server) unbindGoalMetDefault() {
-	const flag = "goal_met_unbind_default_v1"
-	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
-		return
-	}
-	if err := s.m.pg.RemoveAgentFromTool("planner", "goal_met"); err != nil {
-		log.Printf("[tools] goal_met 解绑 planner 失败: %v", err)
-		return
-	}
-	_ = s.m.pg.SetSetting(flag, "true")
 }
 
 // reseedGoalsPrompt 把 goals 目标拆解器的提示词刷成【当前代码默认】——因为默认正文新增了
@@ -853,14 +846,25 @@ func (s *Server) upgradeReporterTriggerMessage() {
 // 绑定 update_finding_report + 任务查询工具，并挂一个「report_finding 被调用即触发」的
 // 触发器 —— 每登记一个漏洞就唤起它写详细报告。一次性(settings flag 守卫)：用户删掉后不再重建。
 // 依赖：orchestration 工具已在本函数上方 SeedTool 入库，故绑定得上。
+//
+// flag 守卫不是「跑过就永远不管」：agent 存在但触发器/工具绑定缺失时（误删、
+// DB 迁移、清库后恢复），必须**补齐缺的那部分**——否则漏洞上报后不会自动
+// 触发报告 Agent，流量证据也就没人去核对了。已经存在的部分**不覆盖**，
+// 用户改过的内容保持原样。
 func (s *Server) seedReporterAgent() {
 	const flag = "reporter_agent_seed_v1"
+	seeded := false
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
-		return
+		seeded = true
 	}
-	defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // 无论成功与否只尝试一次
+	if !seeded {
+		defer func() { _ = s.m.pg.SetSetting(flag, "true") }() // 无论成功与否只尝试一次
+	}
 
-	if exist, _ := s.m.pg.GetAgentByKey("reporter"); exist != nil {
+	exist, _ := s.m.pg.GetAgentByKey("reporter")
+	if exist != nil {
+		// agent 已在（builtin 或用户手建）——只补缺失的触发器与绑定，不覆盖。
+		s.repairReporterAgent(exist)
 		return // key 已被占用(用户手建过)——不覆盖
 	}
 	a, err := s.m.pg.CreateAgent("reporter", "报告撰写",
@@ -898,6 +902,57 @@ func (s *Server) seedReporterAgent() {
 		log.Printf("[reporter] 创建触发器失败: %v", err)
 	}
 	log.Printf("[reporter] 已预置「报告撰写」agent + finding 触发器")
+}
+
+// repairReporterAgent 补齐 reporter 缺失的 report_finding 触发器与工具绑定。
+// 已存在的部分不动——用户可能改过工具列表或触发消息。
+func (s *Server) repairReporterAgent(a *db.Agent) {
+	triggers, err := s.m.pg.ListTriggersFor("reporter")
+	if err != nil {
+		log.Printf("[reporter] 读取触发器失败: %v", err)
+		return
+	}
+	hasFindingTrigger := false
+	for _, t := range triggers {
+		if t.OnToolCall && containsString(t.ToolNames, "report_finding") {
+			hasFindingTrigger = true
+			break
+		}
+	}
+	if !hasFindingTrigger {
+		if _, err := s.m.pg.CreateTrigger(&db.AgentTrigger{
+			AgentKey:        "reporter",
+			Enabled:         true,
+			OnToolCall:      true,
+			ToolNames:       []string{"report_finding"},
+			ToolCallMessage: reporterToolCallMessage,
+		}); err != nil {
+			log.Printf("[reporter] 补建 report_finding 触发器失败: %v", err)
+		} else {
+			log.Printf("[reporter] 已补建缺失的 report_finding 触发器")
+		}
+	}
+	// 工具绑定同理：缺哪个补哪个，已绑的不动。
+	for _, key := range []string{
+		"update_finding_report", "get_task_node_detail", "list_task_findings",
+		"get_task_worker_trace", "list_task_worker_traces", "search_task_worker_traces",
+		"get_task_graph",
+	} {
+		if err := s.m.pg.AddAgentToToolBinding("reporter", []string{key}); err != nil {
+			log.Printf("[reporter] 补绑工具 %s 失败: %v", key, err)
+		}
+	}
+	_ = a
+}
+
+// containsString reports whether list contains s.
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // seedAutoReportFindingBinding adds "auto" to report_finding's binding ONCE so
@@ -1038,4 +1093,15 @@ func (s *Server) seedAutoDefaultBindings() {
 		return
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
+	// goal_met 默认绑 planner(收官门槛落地;起点未绑过的实例补上,已手动.unbind 的
+	// 会被此把加回——可接受:该设置名为 v4 的变更点,与 auto 的 v3 同语义)。
+	const goalFlag = "goal_met_planner_binding_v1"
+	if v, _, _ := s.m.pg.GetSetting(goalFlag); v != "true" {
+		if err := s.m.pg.AddAgentToToolBinding("planner", []string{"goal_met"}); err != nil {
+			log.Printf("[toolcatalog] goal_met 绑 planner 失败: %v", err)
+		} else {
+			_ = s.m.pg.SetSetting(goalFlag, "true")
+			log.Printf("[toolcatalog] goal_met 已默认绑定 planner(收官门槛)")
+		}
+	}
 }

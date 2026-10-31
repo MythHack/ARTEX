@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -83,6 +85,154 @@ func loadOrCreateJWTKey(keyDir, dataDir string) ([]byte, error) {
 	return buf, nil
 }
 
+// currentJWTKey 原子读取当前签名 key（改密码轮换后立即变化）。
+func (s *Server) currentJWTKey() []byte {
+	if v, ok := s.jwtKey.Load().([]byte); ok {
+		return v
+	}
+	return nil
+}
+
+// rotateJWTKey 生成新 key 原子替换并落盘：**所有已签发 token 立即失效**。
+// 改密码必须轮换——否则公网上泄露的旧 token 能一直用到 7 天自然过期，
+// 「改密码踢掉攻击者」就成了一句空话。
+func (s *Server) rotateJWTKey() error {
+	buf := make([]byte, 32)
+	for i := range buf {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(keyChars))))
+		if err != nil {
+			return fmt.Errorf("generate jwt key: %w", err)
+		}
+		buf[i] = keyChars[n.Int64()]
+	}
+	if err := os.WriteFile(filepath.Join(s.keyDir, jwtKeyFilename), buf, 0o600); err != nil {
+		return fmt.Errorf("write jwt key: %w", err)
+	}
+	s.jwtKey.Store(buf)
+	log.Printf("[auth] JWT key 已轮换（改密码），全部旧会话失效")
+	return nil
+}
+
+// clientIP 提取客户端 IP：反代部署下取 X-Forwarded-For 首段（部署手册要求
+// 反代覆写该头），直连时取 RemoteAddr。XFF 可伪造，所以限流器另有全局限
+// 作为兜底——伪造无限个 IP 也撞不穿全局阈值。
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.Index(xff, ","); i > 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	if xr := r.Header.Get("X-Real-IP"); xr != "" {
+		return strings.TrimSpace(xr)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// loginLimiter 是登录/初始化接口的进程级防爆破闸门：
+//   - 每 IP：10 分钟窗口内失败 5 次 → 锁 15 分钟；
+//   - 全局：1 分钟窗口内失败 30 次 → 全局锁 5 分钟（兜 XFF 伪造与分布式低速）。
+//
+// 内存态即可：重启清零只影响攻击者的等待时间，不影响正确性。
+// 返回 (允许, 剩余锁定时长)。
+type loginLimiter struct {
+	mu          sync.Mutex
+	fails       map[string][]time.Time // ip → 失败时间序列（滑动窗口）
+	lockedUntil map[string]time.Time   // ip → 锁定截止
+	globalFails []time.Time
+	globalUntil time.Time
+}
+
+var loginLimit = &loginLimiter{fails: map[string][]time.Time{}, lockedUntil: map[string]time.Time{}}
+
+const (
+	loginMaxFailsPerIP   = 5
+	loginFailWindow      = 10 * time.Minute
+	loginLockoutPerIP    = 15 * time.Minute
+	loginGlobalMaxFails  = 30
+	loginGlobalWindow    = time.Minute
+	loginGlobalLockout   = 5 * time.Minute
+	loginFailureMinDelay = 300 * time.Millisecond // 失败响应的人为下限，抹平时序差
+)
+
+func (l *loginLimiter) allow(ip string) (bool, time.Duration) {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if until, ok := l.lockedUntil[ip]; ok && now.Before(until) {
+		return false, until.Sub(now)
+	}
+	if now.Before(l.globalUntil) {
+		return false, l.globalUntil.Sub(now)
+	}
+	// 惰性清理过期窗口，防 map 随扫描流量无限增长。
+	for k, until := range l.lockedUntil {
+		if now.After(until) && len(l.fails[k]) == 0 {
+			delete(l.lockedUntil, k)
+		}
+	}
+	return true, 0
+}
+
+func (l *loginLimiter) recordFail(ip string) {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// per-IP 滑动窗口。
+	f := append(l.fails[ip], now)
+	cut := now.Add(-loginFailWindow)
+	i := 0
+	for i < len(f) && f[i].Before(cut) {
+		i++
+	}
+	f = f[i:]
+	l.fails[ip] = f
+	if len(f) >= loginMaxFailsPerIP {
+		l.lockedUntil[ip] = now.Add(loginLockoutPerIP)
+		l.fails[ip] = nil
+	}
+	// 全局滑动窗口。
+	l.globalFails = append(l.globalFails, now)
+	gcut := now.Add(-loginGlobalWindow)
+	j := 0
+	for j < len(l.globalFails) && l.globalFails[j].Before(gcut) {
+		j++
+	}
+	l.globalFails = l.globalFails[j:]
+	if len(l.globalFails) >= loginGlobalMaxFails {
+		l.globalUntil = now.Add(loginGlobalLockout)
+		l.globalFails = nil
+	}
+}
+
+func (l *loginLimiter) recordSuccess(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.fails, ip)
+	delete(l.lockedUntil, ip)
+}
+
+// loginGuard 统一包住 login/init 的防爆破语义：超限直接 429，失败记一笔并
+// 人为拖慢响应。返回 false 表示已写响应、调用方直接 return。
+func loginGuard(w http.ResponseWriter, r *http.Request, action string) bool {
+	ip := clientIP(r)
+	if ok, wait := loginLimit.allow(ip); !ok {
+		log.Printf("[auth] %s 限流触发 ip=%s 剩余=%s", action, ip, wait.Truncate(time.Second))
+		writeErr(w, http.StatusTooManyRequests, "尝试过于频繁，请稍后再试")
+		return false
+	}
+	if action == "login-fail" {
+		loginLimit.recordFail(ip)
+		log.Printf("[auth] 登录失败 ip=%s", ip)
+		time.Sleep(loginFailureMinDelay)
+	}
+	return true
+}
+
 // signJWT issues a 7-day HS256 token for user ARTEX.
 func signJWT(key []byte) (string, error) {
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
@@ -129,7 +279,7 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			writeErr(w, 401, "未授权")
 			return
 		}
-		if !verifyJWT(tok, s.jwtKey) {
+		if !verifyJWT(tok, s.currentJWTKey()) {
 			writeErr(w, 401, "token 无效或已过期")
 			return
 		}
@@ -156,6 +306,9 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/auth/init — sets the password for the first time; rejected if already set.
 func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
+	if !loginGuard(w, r, "init") {
+		return
+	}
 	pg := s.pg(w)
 	if pg == nil {
 		return
@@ -197,7 +350,7 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "密码已设置")
 		return
 	}
-	tok, err := signJWT(s.jwtKey)
+	tok, err := signJWT(s.currentJWTKey())
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
 		return
@@ -213,7 +366,7 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	if !verifyJWT(extractToken(r), s.currentJWTKey()) {
 		writeErr(w, 401, "未授权")
 		return
 	}
@@ -255,11 +408,20 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "保存失败: "+err.Error())
 		return
 	}
+	// 轮换签名 key：旧密码可能已经泄露（改密码本身往往就是怀疑泄露的动作），
+	// 不轮换的话用旧 token 的会话全部存活到自然过期。
+	if err := s.rotateJWTKey(); err != nil {
+		// 密码已改成功、轮换失败：不回滚（密码改了比没改安全），但要显式告警。
+		log.Printf("[auth] 改密码后 JWT key 轮换失败: %v（旧 token 仍然有效，请重启服务强制轮换）", err)
+	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 // POST /api/auth/login — validates username/password and returns a JWT.
 func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
+	if !loginGuard(w, r, "login") {
+		return
+	}
 	pg := s.pg(w)
 	if pg == nil {
 		return
@@ -286,10 +448,12 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
+		loginGuard(w, r, "login-fail")
 		writeErr(w, 401, "用户名或密码错误")
 		return
 	}
-	tok, err := signJWT(s.jwtKey)
+	loginLimit.recordSuccess(clientIP(r))
+	tok, err := signJWT(s.currentJWTKey())
 	if err != nil {
 		writeErr(w, 500, "token 生成失败")
 		return

@@ -69,12 +69,12 @@ func TestChatUnavailableReasonDistinguishesStates(t *testing.T) {
 // agent even when NO global profile is active, so the send precheck stops
 // rejecting it with "LLM 未配置".
 func TestResolveChatAgentHonoursConversationProfile(t *testing.T) {
-	m, err := NewManager(t.TempDir(), "")
+	m, err := NewManager(testDir(t), "")
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) — skipping", err)
 	}
 	defer m.Close()
-	td := t.TempDir()
+	td := testDir(t)
 	s := New(context.Background(), m, td, td, td)
 
 	// Force the global fallback to nil so a non-nil result can ONLY come from the

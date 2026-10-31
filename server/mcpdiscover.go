@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os/exec"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
@@ -26,6 +27,10 @@ func connectMCP(ctx context.Context, m *db.MCPServer) (mcpClient, error) {
 	case "stdio":
 		if m.Command == "" {
 			return nil, fmt.Errorf("stdio 传输缺少命令")
+		}
+		// 命令不存在是最常见的失败原因，给出可执行的提示而不是裸 exec error。
+		if _, err := exec.LookPath(m.Command); err != nil {
+			return nil, fmt.Errorf("命令 %q 不在 PATH 里（%v）：装上它，或在「MCP」页把该服务器停用", m.Command, err)
 		}
 		return mcp.NewStdioClient(ctx, m.Name, m.Command, jsonStrMap(m.Env), jsonStrSlice(m.Args)...)
 	case "http":

@@ -17,18 +17,21 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/Autumn-27/norma/llm"
+	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Autumn-27/norma/transcript"
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/listener"
+	"github.com/Autumn-27/artex/hostd"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/artex/report"
 	"github.com/Autumn-27/artex/traffic"
-	"github.com/Autumn-27/norma/llm"
-	actool "github.com/Autumn-27/norma/tool"
-	"github.com/Autumn-27/norma/transcript"
 )
 
 // BuildVersion is the backend application version, injected from cmd/artex at
@@ -48,9 +51,12 @@ type Server struct {
 	lastCPUUse uint64
 	lastCPUAt  time.Time
 
-	skillDir  string // root directory for skill subdirectories
-	jwtKey    []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
-	basicAuth basicAuthGate
+	skillDir   string // root directory for skill subdirectories
+	keyDir     string // directory holding jwt.key (next to the executable)
+	jwtKey     atomic.Value // HS256 signing key ([]byte); replaceable to revoke sessions
+	basicAuth  basicAuthGate
+	listenOnce sync.Once
+	listeners  *listener.Manager
 
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
@@ -157,12 +163,19 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
-	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, dataDir: dataDir, jwtKey: key, chatBusy: map[string]bool{},
+	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, keyDir: keyDir, dataDir: dataDir, chatBusy: map[string]bool{},
 		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{},
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1), credentialWake: make(chan struct{}, 1)}
+	s.jwtKey.Store(key)
+	s.listeners = listener.NewManager()
+	agent.SetListenerManager(s.listeners)
+	agent.SetConnectBackResolver(func(port int) agent.ConnectBack {
+		cb := s.ResolveConnectBack(port)
+		return agent.ConnectBack{Mode: cb.Mode, LHOST: cb.LHOST, LPORT: cb.LPORT, Via: cb.Via}
+	})
 	s.initSideQuestions()
 	if m.pg != nil {
 		if err := s.basicAuth.load(m.pg); err != nil {
@@ -246,6 +259,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			return a.TaskTimeoutWrapupMaxTurns, true
 		}
 		wireAgentAugment(m.pg, s.skillDir, s.hostTools) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
+		agent.SetCweSkillIndex(BuildCweSkillIndex(s.skillDir)) // CWE→方法论 skill 联动（漏洞情报工具输出 related_skills）
 		domainReg := buildDomainReg(m.Assets())
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
@@ -293,8 +307,17 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		s.seedCredentialProcessor()
 		go s.runCredentialProcessor()
 	}
+	s.StartHostdReconcile()
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
 	return s
+}
+
+// Close releases process-scoped resources owned by Server. It is safe to call
+// repeatedly; listener.Manager.Stop is idempotent.
+func (s *Server) Close() {
+	if s == nil {
+		return
+	}
 }
 
 // Restored deadline and worker loops must inherit the same context as new tasks,
@@ -335,7 +358,7 @@ func (s *Server) restoreTaskRuntimes() {
 // agentMaxTurns returns the configured max_turns for an agent key (0 = unlimited,
 // also the fallback when no DB or no row).
 func (s *Server) agentMaxTurns(key string) int {
-	if s.m.pg == nil {
+	if s == nil || s.m == nil || s.m.pg == nil {
 		return 0
 	}
 	a, err := s.m.pg.GetAgentByKey(key)
@@ -346,9 +369,14 @@ func (s *Server) agentMaxTurns(key string) int {
 }
 
 // agentRunSeconds returns the configured wall-clock run budget (seconds) for an
-// agent key (0 = unlimited; 1200 fallback when no DB or no row, matching schema).
+// agent key (0 = unlimited; 1200 fallback when no DB or no row, matching the
+// seed default and upstream ARTEX-upstream).
+//
+// 兜底值跟着种子默认走（1200），不是 3600：DB 读不出来时回落到一个**长** run
+// 会让所有意图一起变慢（2026-10-21 实测 3600s 时 4 个意图跑满一小时、
+// 4.1 小时机时零产出）。宁可短。
 func (s *Server) agentRunSeconds(key string) int {
-	if s.m.pg == nil {
+	if s == nil || s.m == nil || s.m.pg == nil {
 		return 1200
 	}
 	a, err := s.m.pg.GetAgentByKey(key)
@@ -825,6 +853,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/tasks/{id}/intents/rerun-blocked", s.rerunBlocked) // 批量重跑本任务全部 blocked 意图
 	mux.HandleFunc("POST /api/active", s.setActive)
 
+	mux.HandleFunc("GET /api/version", s.version)
 	mux.HandleFunc("GET /api/llm", s.getLLM)
 	mux.HandleFunc("POST /api/llm", s.setLLM)
 	mux.HandleFunc("POST /api/llm/test", s.testLLM)
@@ -929,10 +958,34 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/notify/channels/{id}/test", s.notifyTestChannel)
 	mux.HandleFunc("GET /api/notify/deliveries", s.notifyListDeliveries)
 	mux.HandleFunc("POST /api/notify/deliveries/{id}/retry", s.notifyRetryDelivery)
+	mux.HandleFunc("GET /api/vulnintel/status", s.vulnintelStatus)
+	mux.HandleFunc("PUT /api/vulnintel/config", s.vulnintelSaveConfig)
+	mux.HandleFunc("POST /api/vulnintel/sync", s.vulnintelSyncNow)
+	mux.HandleFunc("POST /api/vulnintel/probe", s.vulnintelProbe)
+	mux.HandleFunc("GET /api/proxypool", s.proxyPoolGet)
+	mux.HandleFunc("PUT /api/proxypool", s.proxyPoolPut)
+	mux.HandleFunc("POST /api/proxypool/bulk", s.proxyPoolBulk)
+	mux.HandleFunc("POST /api/proxypool/check", s.proxyPoolCheck)
 	mux.HandleFunc("POST /api/settings/web-search/test", s.testWebSearch)
 	// 出口代理连通性测试：发真实请求验证 global_proxy 是否可用，并回显出口 IP。
 	mux.HandleFunc("POST /api/settings/proxy/test", s.testEgressProxy)
 	mux.HandleFunc("GET /api/report", s.getReport)
+	mux.HandleFunc("GET /api/report/export", s.exportTaskDocx)
+	mux.HandleFunc("GET /api/findings/{id}/export", s.exportFindingDocx)
+	mux.HandleFunc("GET /api/tools/inventory", s.toolsInventory)
+	// 宿主环境:体检(含一键安装可用性)+ 一键安装(经特权助手 artex-hostd)
+	mux.HandleFunc("GET /api/hostenv/status", s.hostenvStatus)
+	mux.HandleFunc("GET /api/c2/config", s.c2ConfigGet)
+	mux.HandleFunc("PUT /api/c2/config", s.c2ConfigPut)
+	mux.HandleFunc("GET /api/listeners", s.listenerList)
+	mux.HandleFunc("POST /api/listeners", s.listenerStart)
+	mux.HandleFunc("GET /api/listeners/{name}", s.listenerSessions)
+	mux.HandleFunc("POST /api/listeners/{name}/stop", s.listenerStop)
+	mux.HandleFunc("POST /api/hostenv/install", s.hostenvInstall)
+	mux.HandleFunc("POST /api/hostenv/install-batch", s.hostenvInstallBatch)
+	mux.HandleFunc("GET /api/hostenv/jobs/{id}", s.hostenvJob)
+	mux.HandleFunc("POST /api/hostenv/jobs/{id}/cancel", s.hostenvCancel)
+	mux.HandleFunc("POST /api/hostenv/proxy-check", s.hostenvProxyCheck)
 	mux.HandleFunc("GET /api/chat/mentions", s.searchChatMentions)
 	mux.HandleFunc("POST /api/chat", s.chat)
 	mux.HandleFunc("POST /api/chat/upload", s.chatUpload) // 方式1 文件上传:落到会话/任务工作目录 uploads/
@@ -1057,7 +1110,7 @@ func (s *Server) Handler() http.Handler {
 	// /api/* goes through CORS + JWT; everything else is served by the embedded
 	// frontend (no JWT required; the optional Basic Auth gate wraps both). With the
 	// no-embed build the webui handler just 404s (run `next dev` separately).
-	api := cors(s.requireAuth(mux))
+	api := securityHeaders(s.requireAuth(mux))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.Handle("/", s.webuiHandler())
@@ -1066,8 +1119,16 @@ func (s *Server) Handler() http.Handler {
 
 // --- handlers ---
 
+// health 是**未鉴权**探活端点， deliberately 不携带任何身份信息——
+// 公网部署时 service 名与精确版本号是最容易被测绘引擎（FOFA/shodan 类）
+// 当作 body 指纹的内容。版本查询走鉴权的 /api/version。
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"ok": true, "service": "artex", "version": BuildVersion})
+	writeJSON(w, 200, map[string]any{"ok": true, "status": "ok"})
+}
+
+// version 是鉴权的版本查询（更新卡轮询换装完成用）。
+func (s *Server) version(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{"service": "artex", "version": BuildVersion})
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
@@ -3540,14 +3601,18 @@ func (s *Server) settingsPayload() map[string]any {
 		"web_search_backend":                   backend,
 		"brave_key_set":                        strings.TrimSpace(braveKey) != "",
 		"tavily_key_set":                       strings.TrimSpace(tavilyKey) != "",
-		"web_search_proxy":                     proxy,             // 独立出口代理(http/https/socks5)，空=直连
-		"global_proxy":                         s.m.GlobalProxy(), // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
+		"web_search_proxy":                     proxy,
+		"global_proxy":                         s.m.GlobalProxy(),
+		"install_proxy":                        s.installProxy(),
 		"show_egress_ip":                       s.m.pg.GetBool(settingShowEgressIP, false),
-		"python_interpreter":                   strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
-		"workers":                              s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
-		"worker_pools":                         s.m.WorkerPools(),           // 非空时按池顺序绑定 worker 会话
-		"task_concurrency_enabled":             concOn,                      // 任务并发上限开关(默认关)
-		"task_concurrency_limit":               concLimit,                   // 同时运行任务上限(开启后默认5)
+		"python_interpreter":                   strings.TrimSpace(pyStored),
+		"workers":                              s.m.Workers(),
+		"worker_pools":                         s.m.WorkerPools(),
+		"compaction_max_tokens":                s.m.CompactionMaxTokens(),
+		"compaction_timeout_seconds":           s.m.CompactionTimeout(),
+		"compaction_max_members":               s.m.CompactionMaxMembers(),
+		"task_concurrency_enabled":             concOn,
+		"task_concurrency_limit":               concLimit,
 		// LLM 轮询(故障转移)。默认关；开启后走全局激活配置的 agent 在当前配置不可用时
 		// 自动切到下一个配置。bind_fallback 仅在轮询开启时有意义(默认关)。
 		"llm_pool_enabled":       s.m.LLMPoolEnabled(),
@@ -3566,6 +3631,9 @@ func (s *Server) settingsPayload() map[string]any {
 		"notify_enabled":             s.m.pg.GetBool(settingNotifyEnabled, true),
 		"notify_public_base_url":     notifyPublicBaseURL(s.m.pg),
 		"notify_digest_interval_min": notifyDigestIntervalMin(s.m.pg),
+		// 漏洞情报/回连配置(net_context 工具读取展示给 agent)
+		"egress_hint":     egressHint(s.m.pg),
+		"egress_port_map": egressPortMap(s.m.pg),
 	}
 }
 
@@ -3621,16 +3689,19 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		LLMRecord           *bool `json:"llm_record"` // LLM 录制开关（默认关）；即时生效，无需重建 agent
 		// Web search. WebSearchEnabled/Backend toggle the tool + backend; BraveKey/TavilyKey
 		// are optional — omit (null) to leave a stored key untouched, send "" to clear.
-		WebSearchEnabled *bool         `json:"web_search_enabled"`
-		WebSearchBackend *string       `json:"web_search_backend"`
-		BraveKey         *string       `json:"brave_search_api_key"`
-		TavilyKey        *string       `json:"tavily_search_api_key"`
-		WebSearchProxy   *string       `json:"web_search_proxy"`   // 独立出口代理(http/https/socks5)；null=不改，""=清空
-		GlobalProxy      *string       `json:"global_proxy"`       // 全局出口代理(http/https/socks5)；null=不改，""=清空(直连)
-		ShowEgressIP     *bool         `json:"show_egress_ip"`     // 在顶栏显示直连/全局代理出口 IP；默认关
-		PythonInterp     *string       `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
-		Workers          *int          `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
-		WorkerPools      *[]WorkerPool `json:"worker_pools"`
+		WebSearchEnabled     *bool         `json:"web_search_enabled"`
+		WebSearchBackend     *string       `json:"web_search_backend"`
+		BraveKey             *string       `json:"brave_search_api_key"`
+		TavilyKey            *string       `json:"tavily_search_api_key"`
+		WebSearchProxy       *string       `json:"web_search_proxy"`
+		GlobalProxy          *string       `json:"global_proxy"`
+		InstallProxy         *string       `json:"install_proxy"`
+		ShowEgressIP         *bool         `json:"show_egress_ip"`
+		PythonInterp         *string       `json:"python_interpreter"`
+		Workers              *int          `json:"workers"`
+		WorkerPools          *[]WorkerPool `json:"worker_pools"`
+		CompactionTimeoutSec *int          `json:"compaction_timeout_seconds"`
+		CompactionMaxMembers *int          `json:"compaction_max_members"`
 		// 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
 		ConcurrencyEnabled *bool `json:"task_concurrency_enabled"`
 		ConcurrencyLimit   *int  `json:"task_concurrency_limit"`
@@ -3654,6 +3725,10 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		NotifyEnabled    *bool   `json:"notify_enabled"`
 		NotifyBaseURL    *string `json:"notify_public_base_url"`
 		NotifyDigestMins *int    `json:"notify_digest_interval_min"`
+		// 漏洞情报/回连:对外可达地址说明与端口映射说明(自由文本,net_context
+		// 工具读取展示给 agent)。null=不改,空串=清空。
+		EgressHint    *string `json:"egress_hint"`
+		EgressPortMap *string `json:"egress_port_map"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -3698,6 +3773,18 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// 推送全局项:投递引擎每轮重新读取,所以即时生效、无需重启。
+	if req.EgressHint != nil {
+		if err := s.m.pg.SetSetting("egress_hint", strings.TrimSpace(*req.EgressHint)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.EgressPortMap != nil {
+		if err := s.m.pg.SetSetting("egress_port_map", strings.TrimSpace(*req.EgressPortMap)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
 	if req.NotifyEnabled != nil {
 		if err := s.m.pg.SetBool(settingNotifyEnabled, *req.NotifyEnabled); err != nil {
 			writeErr(w, 500, err.Error())
@@ -3753,6 +3840,18 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, 400, err.Error())
 				return
 			}
+		}
+	}
+	if req.CompactionTimeoutSec != nil {
+		if err := s.m.SetCompactionTimeout(*req.CompactionTimeoutSec); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+	}
+	if req.CompactionMaxMembers != nil {
+		if err := s.m.SetCompactionMaxMembers(*req.CompactionMaxMembers); err != nil {
+			writeErr(w, 400, err.Error())
+			return
 		}
 	}
 	if req.ConcurrencyEnabled != nil || req.ConcurrencyLimit != nil {
@@ -3875,6 +3974,18 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ShowEgressIP != nil {
 		if err := s.m.pg.SetBool(settingShowEgressIP, *req.ShowEgressIP); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.InstallProxy != nil {
+		raw := strings.TrimSpace(*req.InstallProxy)
+		clean, err := hostd.ValidateProxy(raw)
+		if err != nil {
+			writeErr(w, 400, "安装代理无效："+err.Error())
+			return
+		}
+		if err := s.m.pg.SetSetting(settingInstallProxy, clean); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
@@ -4264,11 +4375,18 @@ func (s *Server) gc(w http.ResponseWriter, r *http.Request) {
 
 // --- utils ---
 
-func cors(next http.Handler) http.Handler {
+// securityHeaders 替代了原来的 cors 中间件：前端与 API 同源部署，
+// Access-Control-Allow-Origin:* 在这里没有任何正当用途，只会放宽跨站读取。
+// 同时补上公网部署需要的基础安全头。
+func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		// Next dev and the Go SSE endpoint use different ports on the same
-		// loopback host. Allow the gate cookie only for that local pairing.
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			h.Set("Cache-Control", "no-store")
+		}
 		origin := r.Header.Get("Origin")
 		u, err := url.Parse(origin)
 		host, _, hostErr := net.SplitHostPort(r.Host)
@@ -4277,12 +4395,12 @@ func cors(next http.Handler) http.Handler {
 		}
 		if err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Hostname() == host &&
 			(host == "localhost" || host == "127.0.0.1" || host == "::1") {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			h.Set("Access-Control-Allow-Origin", origin)
+			h.Set("Access-Control-Allow-Credentials", "true")
+			h.Add("Vary", "Origin")
+			h.Set("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+			h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		}
-		w.Header().Add("Vary", "Origin")
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(204)
 			return
