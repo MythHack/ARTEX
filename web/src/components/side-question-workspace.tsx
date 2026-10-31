@@ -64,7 +64,9 @@ function SidePanel({
   const [confirm, setConfirm] = useState(false);
   const viewport = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
-  const tail = side.items.at(-1);
+  // Array.prototype.at 要 Chrome 92 / Safari 15.4 起才支持；旧 WebView 上
+  // 直接调用会抛 TypeError 并拖垮整个页面，这里用等价的下标访问。
+  const tail = side.items.length > 0 ? side.items[side.items.length - 1] : undefined;
   // biome-ignore lint/correctness/useExhaustiveDependencies: New cumulative text scrolls only readers who remain at the bottom.
   useEffect(() => {
     if (pinned.current && viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight;

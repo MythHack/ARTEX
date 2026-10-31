@@ -2,7 +2,7 @@
 
 import * as React from "react";
 
-import { CheckIcon, CopyIcon, FileTextIcon } from "lucide-react";
+import { CheckIcon, CopyIcon, FileDownIcon, FileTextIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Markdown } from "@/components/markdown";
@@ -80,6 +80,11 @@ export function ReportTab({ taskId }: { taskId: string }) {
           {report && (
             <Button size="sm" variant="outline" onClick={copy}>
               {copied ? <CheckIcon /> : <CopyIcon />} 复制
+            </Button>
+          )}
+          {report && (
+            <Button size="sm" variant="outline" onClick={() => api.downloadTaskDocx(taskId)}>
+              <FileDownIcon /> 导出 Word
             </Button>
           )}
         </div>

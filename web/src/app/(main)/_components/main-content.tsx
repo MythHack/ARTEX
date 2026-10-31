@@ -12,7 +12,6 @@ import { cn } from "@/lib/utils";
 
 import { EgressIpNavbar, EgressIpProvider } from "./egress-ip-banner";
 import { LiveClock } from "./live-clock";
-import { AccountSwitcher } from "./sidebar/account-switcher";
 import { LayoutControls } from "./sidebar/layout-controls";
 import { SearchDialog } from "./sidebar/search-dialog";
 import { ThemeSwitcher } from "./sidebar/theme-switcher";
@@ -48,8 +47,8 @@ function MainContentInner({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     api
-      .health()
-      .then((h) => setVersion((h.version ?? "").replace(/^v(?=\d)/, "")))
+      .version()
+      .then((v) => setVersion((v.version ?? "").replace(/^v(?=\d)/, "")))
       .catch(() => setVersion(""));
   }, []);
 
@@ -85,7 +84,6 @@ function MainContentInner({ children }: { children: ReactNode }) {
             <UpdateBadge />
             <LayoutControls />
             <ThemeSwitcher />
-            <AccountSwitcher users={[currentUser]} />
           </div>
         </div>
       </header>

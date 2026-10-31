@@ -448,6 +448,7 @@ export interface TaskNode {
   source_task_id?: string;
   inherited?: boolean;
   delete_reason?: string; // 意图假删除(state='deleted')时的删除原因
+  blocked_reason?: string; // 意图为什么停（撞步数上限/运行超时/任务收尾/被终止/出错）
 }
 
 // 播报板一页:按创建顺序分页的节点 + 这一页涉及的边 + 边另一端的节点(refs,按 id 索引),
@@ -1001,10 +1002,13 @@ export interface Settings {
   // 全局出口代理(http/https/socks5，可带 user:pass)，所有目标流量走它。开启流量捕获时作为
   // MITM 上游；关闭捕获时直接注入 agent 的 bash/WebFetch。空=直连。
   global_proxy?: string;
-  show_egress_ip?: boolean; // 在顶栏显示直连 / 全局代理出口 IP；默认关闭
-  python_interpreter?: string; // 自定义脚本工具的 python 解释器路径(空=运行时检测)
-  workers?: number; // 并发工作 agent 数(默认3)；对之后启动的任务生效
+  show_egress_ip?: boolean;
+  install_proxy?: string;
+  python_interpreter?: string;
+  workers?: number;
   worker_pools: WorkerPool[];
+  compaction_timeout_seconds?: number;
+  compaction_max_members?: number;
   // 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
   task_concurrency_enabled?: boolean; // 默认 false
   task_concurrency_limit?: number; // 开启后默认 5
@@ -1030,6 +1034,9 @@ export interface Settings {
   notify_enabled?: boolean; // 推送总开关，默认开；用于维护期一键止血
   notify_public_base_url?: string; // 漏洞详情回链的外部访问地址；空=消息不带回链
   notify_digest_interval_min?: number; // 汇总模式周期（分钟），默认 30
+  // ---- 漏洞情报/回连（net_context 工具读取展示给 agent）----
+  egress_hint?: string; // 对外可达地址说明(公网 IP/宿主内网地址等,自由文本)
+  egress_port_map?: string; // 端口映射说明(容器端口→宿主端口)
 }
 
 export interface WorkerPool {
@@ -1211,6 +1218,7 @@ export interface Agent {
   run_seconds?: number; // worker 单次运行墙钟上限(秒)；0 = 无限制
   web_search?: boolean; // 是否启用网络搜索(受系统全局开关门控)
   interactive_shell?: boolean; // 是否启用交互式 shell(持久 PTY 会话工具族)
+  local_exec?: boolean; // 是否可在本机执行命令/写文件(Bash/Write/Edit)；false = 只能经工具操作平台(如派任务)
   // P3 触发后处理策略(仅自定义 agent 有意义)
   trigger_run_mode?: "serial" | "parallel"; // 串行排队 / 每次触发各自并发一个会话
   trigger_merge_mode?: "by_task" | "all" | "none"; // 仅 serial：同任务合并 / 全部合并 / 不合并
@@ -1277,12 +1285,21 @@ export interface MCPTool {
 // ---- Skills ----
 // Fields align with the agentskills.io open specification.
 // description covers both "what the skill does" and "when to use it".
+// SkillTags 是 skill 的标准化标签（SKILL.md frontmatter 的 tags 块）。
+// cwe / attack 是 MITRE 框架编号，class 是平台内部类别。
+export interface SkillTags {
+  cwe?: string[];
+  attack?: string[];
+  class?: string[];
+}
+
 export interface SkillItem {
   name: string; // unique key = directory name
   description?: string; // required per spec; covers what + when to use
   license?: string; // optional: SPDX identifier or free text
   compatibility?: string; // optional: environment requirements
   mcps?: string[]; // MCP server names this skill unlocks on load
+  tags?: SkillTags; // 标准化标签（CWE/ATT&CK/类别）——能力矩阵与按类检索的入口
   files: string[]; // files in the skill directory
   // 调用统计（skill_usage 账本）。从未被调用过的 skill：calls=0、last_used 缺省。
   calls: number;
@@ -1355,7 +1372,7 @@ export interface SystemMetrics {
 }
 
 // ---- Intercept Rules ----
-export type InterceptAction = "allow" | "deny" | "ask";
+export type InterceptAction = "allow" | "deny" | "ask" | "judge";
 export type InterceptMatchTarget = "tool_name" | "tool_input";
 export type InterceptMatchType = "string" | "regex";
 
@@ -1937,4 +1954,213 @@ export interface EgressReport {
   agent_proxy: string;
   checks: EgressCheck[];
   warnings?: string[];
+}
+// ── 宿主环境:工具体检 + 一键安装 ──────────────────────────────
+
+/** 一条体检结果。installable=false 表示官方只提供交互式安装器（如 msfconsole）。 */
+export interface HostTool {
+  id: string;
+  name: string;
+  bin: string;
+  available: boolean;
+  installable: boolean;
+  purpose: string;
+  install?: string;
+  kind: "apt" | "github" | "pip" | "manual";
+  /** 攻击面分类，页面按它分组。 */
+  category: "network" | "dns" | "web" | "cred" | "code" | "pivot" | "oob" | "exploit" | "material" | "runtime" | "middleware" | "";
+}
+
+/** 一键安装是否可用，取决于特权助手 artex-hostd 是否在线（Docker 部署下不在线）。 */
+export interface HostenvInstaller {
+  available: boolean;
+  reason: string;
+  /** 助手版本；空串=老版本不支持上报（0.3.22 之前）。 */
+  version?: string;
+  /** 老助手既不上报版本也无法自我换装，需要重跑一次 install.sh 引导。 */
+  upgrade_required?: boolean;
+  socket: string;
+  proxy: string;
+}
+
+export interface HostenvStatus {
+  tools: HostTool[];
+  deploy_mode: "docker" | "host";
+  installer: HostenvInstaller;
+}
+
+/**
+ * 代理自测结果。ok=false 表示「测了，不通」——不是接口错误。
+ * hint 是可执行的修复建议（协议不匹配/认证缺失/超时等）。
+ */
+export interface ProxyCheckResult {
+  ok: boolean;
+  proxy: string;
+  scheme?: string;
+  latency_ms: number;
+  status: number;
+  /** 出口 IP；用于确认流量确实走了代理。 */
+  exit_ip?: string;
+  error?: string;
+  hint?: string;
+}
+
+/** 一次安装任务。log 是累积输出，随轮询增长。 */
+export interface InstallJob {
+  id: string;
+  tool_id: string;
+  tool_name: string;
+  state: "queued" | "running" | "done" | "failed" | "cancelled";
+  exit_code: number;
+  error?: string;
+  started_at: string;
+  ended_at?: string;
+  log: string;
+}
+
+/** 批量安装结果：started 项已进入助手队列（串行执行），skipped 项带拒绝原因。 */
+export interface InstallBatchResult {
+  started: { job_id: string; tool_id: string }[];
+  skipped: { tool_id: string; reason: string }[];
+}
+
+/** 代理池：一个上游代理的持久化条目。 */
+export interface ProxyPoolEntry {
+  url: string;
+  name: string;
+  enabled: boolean;
+  weight: number;
+}
+
+/** 代理池运行态：熔断计数、最近成功/失败时间、熔断剩余秒数。 */
+export interface ProxyPoolRunning {
+  url: string;
+  name: string;
+  failures: number;
+  weight?: number;
+  last_ok?: string;
+  last_fail?: string;
+  break_remaining?: number;
+}
+
+export interface ProxyPoolState {
+  entries: ProxyPoolEntry[];
+  strategy: string;
+  running: ProxyPoolRunning[];
+  capturing: boolean;
+  check_target?: string;
+  health_minutes?: number;
+  health_cooldown?: number;
+  last_check?: { at: string; target: string; count: number; ok_count: number; auto?: boolean } | null;
+}
+
+/** 漏洞情报同步配置（读取时凭据已掩码，只回 *_set 布尔）。 */
+export interface VulnIntelConfig {
+  enabled: boolean;
+  nvd_api_key: string;
+  nvd_key_set: boolean;
+  github_token: string;
+  github_token_set: boolean;
+  proxy: string;
+  poc_enabled: boolean;
+  backfill_days: number;
+  max_runtime_minutes: number;
+  maintenance_proxy: string;
+}
+
+/** 保存漏洞情报配置：凭据字段省略=保持不变，传 "-" 清除。 */
+export interface VulnIntelConfigPatch {
+  enabled?: boolean;
+  nvd_api_key?: string;
+  github_token?: string;
+  proxy?: string;
+  poc_enabled?: boolean;
+  backfill_days?: number;
+  max_runtime_minutes?: number;
+}
+
+export interface VulnIntelSource {
+  source: string;
+  last_sync_at?: string;
+  cursor: string;
+  total_synced: number;
+  last_error: string;
+  enabled: boolean;
+  error_hint?: string;
+  ok?: boolean;
+}
+
+export interface VulnIntelStatus {
+  enabled: boolean;
+  nuclei_templates_dir: string;
+  sources: VulnIntelSource[];
+  counts: { cves: number; kev: number; pocs: number };
+  config?: VulnIntelConfig;
+  sync_running?: boolean;
+  sync_started_at?: number;
+  next_tick_hint?: string;
+  nuclei?: {
+    dir: string;
+    exists: boolean;
+    is_git: boolean;
+    templates: number;
+    updated_at?: string;
+    hint: string;
+  };
+}
+
+/** 回连接收器：单条会话捕获（后端 listener.Session）。 */
+export interface ListenerSession {
+  id: string;
+  remote: string;
+  connected_at: string;
+  last_active: string;
+  bytes_in: number;
+  /** 捕获的前 64KB（UTF-8 容错解码）——反弹 shell 初始输出 / OOB 请求行 / banner。 */
+  preview: string;
+  open: boolean;
+}
+
+/** 回连接收器视图（GET /api/listeners 行）。 */
+export interface ListenerView {
+  name: string;
+  port: number;
+  started_at: string;
+  sessions: ListenerSession[];
+}
+
+/** 监听器启动响应：connect_back 是 payload 回连地址的唯一可信来源。 */
+export interface ListenerStartResp {
+  name: string;
+  port: number;
+  started_at: string;
+  connect_back: ConnectBack;
+}
+
+/** C2 出口解析结果：目标该连哪里由平台判定（direct/ssh 中继/manual 三形态）。 */
+export interface ConnectBack {
+  mode: "direct" | "ssh" | "manual" | string;
+  lhost: string;
+  lport: number;
+  via?: string;
+}
+
+/** C2 出口配置（GET /api/c2/config，密码脱敏只回 has_pass）。 */
+export interface C2Config {
+  mode: "direct" | "ssh" | "manual" | string;
+  host: string;
+  ssh: string;
+  key: string;
+  iface: string;
+  has_pass: boolean;
+}
+
+/** C2 配置保存体：字段为 undefined 时后端保持不变；password 传 "" 清空。 */
+export interface C2ConfigPatch {
+  mode?: string;
+  host?: string;
+  ssh?: string;
+  password?: string;
+  key?: string;
+  iface?: string;
 }

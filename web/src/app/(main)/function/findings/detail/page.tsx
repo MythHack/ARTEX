@@ -5,7 +5,7 @@ import * as React from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
-import { ArrowLeftIcon, ArrowUpRightIcon, BotIcon, FileTextIcon, Loader2Icon, ShieldAlertIcon } from "lucide-react";
+import { ArrowLeftIcon, ArrowUpRightIcon, BotIcon, FileDownIcon, FileTextIcon, Loader2Icon, ShieldAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { CopyButton } from "@/components/copy-button";
@@ -56,7 +56,7 @@ function usesStructuredReproduction(report: string) {
 function FieldRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="flex items-start justify-between gap-3 py-2.5">
-      <span className="shrink-0 pt-0.5 text-xs text-muted-foreground">{label}</span>
+      <span className="shrink-0 pt-0.5 text-muted-foreground text-xs">{label}</span>
       <div className="flex min-w-0 flex-col items-end gap-1 text-right text-sm">{children}</div>
     </div>
   );
@@ -100,7 +100,7 @@ function FindingDetailInner() {
         toast.success(`严重等级已改为「${statusMeta("severity", next).label}」`);
       } catch (e) {
         setFinding((cur) => (cur ? { ...cur, severity: prev } : cur));
-        toast.error("更新失败：" + (e as Error).message);
+        toast.error(`更新失败：${(e as Error).message}`);
       }
     },
     [finding, id],
@@ -117,7 +117,7 @@ function FindingDetailInner() {
         toast.success(`处理状态已改为「${statusMeta("finding", next).label}」`);
       } catch (e) {
         setFinding((cur) => (cur ? { ...cur, status: prev } : cur));
-        toast.error("更新失败：" + (e as Error).message);
+        toast.error(`更新失败：${(e as Error).message}`);
       }
     },
     [finding, id],
@@ -182,8 +182,11 @@ function FindingDetailInner() {
           <h1 className="max-w-md truncate text-sm font-semibold" title={title}>
             {title}
           </h1>
-          <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">#{finding.id}</code>
+          <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-muted-foreground text-xs">#{finding.id}</code>
           <Separator orientation="vertical" className="mx-1 h-4" />
+          <Button size="sm" variant="outline" onClick={() => api.downloadFindingDocx(finding.id)}>
+            <FileDownIcon /> 导出 Word
+          </Button>
           <StatusBadge domain="severity" value={finding.severity} dot />
           <StatusBadge domain="finding" value={finding.status} dot />
           <Button variant="outline" size="sm" onClick={() => setAutoChatOpen(true)} title="在当前页面打开 Auto Agent 对话">
@@ -212,9 +215,10 @@ function FindingDetailInner() {
                   <CardTitle className="text-sm">摘要</CardTitle>
                 </CardHeader>
                 <CardContent>
-                  <p className="text-sm leading-relaxed whitespace-pre-wrap">{finding.summary || "（无摘要）"}</p>
+                  <p className="whitespace-pre-wrap text-sm leading-relaxed">{finding.summary || "（无摘要）"}</p>
                 </CardContent>
               </Card>
+              <FindingRetestPanel key={id} findingId={id} readOnly={finding.inherited} onCompleted={load} />
               {structuredReproduction ? (
                 <FindingReproductionPanel finding={finding} contextTask={contextTaskId || undefined} />
               ) : (

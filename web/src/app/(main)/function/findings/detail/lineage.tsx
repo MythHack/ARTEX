@@ -34,7 +34,7 @@ export function FindingLineageView({ findingId }: { findingId: string }) {
 
   if (loaded && nodes.length === 0) {
     return (
-      <p className="text-muted-foreground p-6 text-sm">
+      <p className="p-6 text-muted-foreground text-sm">
         无链路可展示（该漏洞未关联探索节点，或所属任务已删除）。
       </p>
     );

@@ -143,10 +143,10 @@ function AuthenticatedImage({
 // Tailwind-styled element overrides (no typography plugin in this project, so we
 // style each element). `node` is stripped — it's not a valid DOM attribute.
 const components: Components = {
-  h1: ({ node, ...p }) => <div className="mt-2.5 text-base font-semibold" {...p} />,
-  h2: ({ node, ...p }) => <div className="mt-2 text-sm font-semibold" {...p} />,
-  h3: ({ node, ...p }) => <div className="mt-1.5 text-sm font-medium text-foreground/90" {...p} />,
-  h4: ({ node, ...p }) => <div className="mt-1.5 text-sm font-medium text-foreground/90" {...p} />,
+  h1: ({ node, ...p }) => <div className="mt-2.5 font-semibold text-base" {...p} />,
+  h2: ({ node, ...p }) => <div className="mt-2 font-semibold text-sm" {...p} />,
+  h3: ({ node, ...p }) => <div className="mt-1.5 font-medium text-foreground/90 text-sm" {...p} />,
+  h4: ({ node, ...p }) => <div className="mt-1.5 font-medium text-foreground/90 text-sm" {...p} />,
   p: ({ node, ...p }) => <p className="leading-relaxed" {...p} />,
   ul: ({ node, ...p }) => <ul className="my-1 list-disc space-y-0.5 pl-5" {...p} />,
   ol: ({ node, ...p }) => <ol className="my-1 list-decimal space-y-0.5 pl-5" {...p} />,
@@ -177,7 +177,7 @@ const components: Components = {
   },
   hr: () => <hr className="my-2 border-border" />,
   blockquote: ({ node, ...p }) => (
-    <blockquote className="my-1 border-l-2 border-border pl-2.5 text-muted-foreground" {...p} />
+    <blockquote className="my-1 border-border border-l-2 pl-2.5 text-muted-foreground" {...p} />
   ),
   pre: ({ node, ...p }) => (
     <pre className="my-1.5 max-w-full overflow-x-auto whitespace-pre-wrap break-words rounded-md bg-muted/70 p-2.5 text-xs leading-relaxed [overflow-wrap:anywhere]" {...p} />
@@ -185,7 +185,7 @@ const components: Components = {
   code: ({ node, className, children, ...rest }) => {
     const block = /language-/.test(className || "");
     return block ? (
-      <code className={"font-mono text-xs " + (className || "")} {...rest}>
+      <code className={`font-mono text-xs${className || ""}`} {...rest}>
         {children}
       </code>
     ) : (

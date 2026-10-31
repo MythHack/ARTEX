@@ -55,6 +55,10 @@ import type {
   RepeaterSendRequest,
   RepeaterSendResponse,
   IntelligencePage,
+  HostenvStatus,
+  InstallBatchResult,
+  InstallJob,
+  ProxyCheckResult,
   IntentAsset,
   InterceptApprovalFilter,
   InterceptApprovalRow,
@@ -111,9 +115,18 @@ import type {
   TrafficEvidenceRole,
   TrafficHost,
   TrafficResp,
+  ProxyPoolState,
+  C2Config,
+  C2ConfigPatch,
+  ConnectBack,
+  ListenerSession,
+  ListenerStartResp,
+  ListenerView,
   UpdateCheck,
   UpdateSettings,
   UsageStats,
+  VulnIntelConfigPatch,
+  VulnIntelStatus,
   WorkspaceFile,
   WorkspaceListing,
   SystemMetrics,
@@ -154,7 +167,10 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // Keep the status-based fallback for empty or non-JSON error responses.
     }
-    throw new Error(message);
+    // 带上网关状态码：调用方要能区分「资源不存在(404)」与「服务端临时故障(5xx)」——
+    // 前者的正确反应是**停止**对它的轮询，后者的正确反应是继续重试。原来只有
+    // 一句 message，两者无法区分，页面只能对 404 也一直轮询下去。
+    throw Object.assign(new Error(message), { status: r.status });
   }
   if (r.status === 204) return undefined as T;
   return r.json();
@@ -292,7 +308,8 @@ function schedulePayload(input: ScheduleInput) {
 
 export const api = {
   // 后端应用版本号（release 时由 ldflags 注入，默认 "dev"）。
-  health: () => get<{ ok: boolean; service: string; version: string }>("/health"),
+  health: () => get<{ ok: boolean; status: string }>("/health"),
+  version: () => get<{ service: string; version: string }>("/version"),
   systemMetrics: () => get<SystemMetrics>("/system/metrics"),
 
   // ---- auth ----
@@ -978,7 +995,56 @@ export const api = {
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
   // 不塞进扁平的 settings 键值里。
   notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
-  notifyChannels: () => get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
+  proxyPoolGet: () => get<ProxyPoolState>(`/proxypool`),
+  proxyPoolPut: (payload: {
+    entries: { url: string; name: string; enabled: boolean; weight: number }[];
+    strategy: string;
+  }) => put<ProxyPoolState>(`/proxypool`, payload),
+  // 批量导入：一行一个代理，自动识别 host:port / http(s):// / socks5:// / host:port:user:pass
+  proxyPoolBulk: (payload: { text: string; mode?: "append" | "replace"; strategy?: string; weight?: number }) =>
+    post<{
+      ok: boolean;
+      added: number;
+      updated: number;
+      total: number;
+      invalid: { line: number; raw: string; reason: string }[];
+    }>(`/proxypool/bulk`, payload),
+  // 连通性验证：urls 为空 = 全部已启用条目
+  proxyPoolCheck: (payload: { urls?: string[]; target?: string; timeout_seconds?: number; break_on_fail?: boolean }) =>
+    post<{
+      target: string;
+      results: { index: number; url: string; ok: boolean; latency_ms: number; exit_ip?: string; error?: string; checked_at: string }[];
+    }>(`/proxypool/check`, payload),
+  vulnintelStatus: () => get<VulnIntelStatus>(`/vulnintel/status`),
+  vulnintelSaveConfig: (payload: VulnIntelConfigPatch) => put<{ ok: boolean }>(`/vulnintel/config`, payload),
+  vulnintelSyncNow: () => post<{ accepted: boolean }>(`/vulnintel/sync`, {}),
+  vulnintelProbe: (payload?: { proxy?: string }) =>
+    post<{
+      proxy: string;
+      effective: boolean;
+      results: { source: string; target: string; ok: boolean; status: number; latency_ms: number; error?: string; hint?: string }[];
+    }>(`/vulnintel/probe`, payload ?? {}),
+  // 宿主工具体检:本机 PATH 里的渗透工具可用性(二进制部署形态的家底)
+  toolsInventory: () =>
+    get<{
+      tools: { name: string; bin: string; available: boolean; purpose: string; install?: string }[];
+      summary: { available: string[]; missing: { name: string; install: string }[]; hint: string };
+      deploy_mode: "docker" | "host";
+    }>(`/tools/inventory`),
+  // 宿主环境:体检(含一键安装可用性)+ 一键安装(由特权助手 artex-hostd 执行)
+  hostenvStatus: () => get<HostenvStatus>(`/hostenv/status`),
+  hostenvInstall: (id: string) => post<InstallJob>(`/hostenv/install`, { id }),
+  hostenvInstallBatch: (ids: string[]) => post<InstallBatchResult>(`/hostenv/install-batch`, { ids }),
+  hostenvJob: (jobId: string) => get<InstallJob>(`/hostenv/jobs/${jobId}`),
+  hostenvCancel: (jobId: string) => post<{ ok: boolean }>(`/hostenv/jobs/${jobId}/cancel`, {}),
+  // 代理自测：proxy 传空串 + use_current=true 则测当前生效的代理
+  hostenvProxyCheck: (proxy?: string, useCurrent?: boolean) =>
+    post<ProxyCheckResult>(`/hostenv/proxy-check`, {
+      proxy: proxy ?? "",
+      use_current: useCurrent ?? false,
+    }),
+  notifyChannels: () =>
+    get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
   notifyCreateChannel: (payload: {
     name: string;
     kind: string;
@@ -1023,6 +1089,34 @@ export const api = {
     });
     if (!r.ok) throw new Error(`report: ${r.status}`);
     return r.text();
+  },
+  // 任务总报告 Word 导出(浏览器侧触发下载;需带 JWT)
+  downloadTaskDocx: async (task: string) => {
+    const token = getToken();
+    const r = await fetch(`/api/report/export${tq(task)}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!r.ok) throw new Error(`docx: ${r.status}`);
+    const blob = await r.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `artex-report-${task || "active"}-${new Date().toISOString().slice(0, 10)}.docx`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  },
+  // 单漏洞 Word 导出
+  downloadFindingDocx: async (id: number | string) => {
+    const token = getToken();
+    const r = await fetch(`/api/findings/${id}/export`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!r.ok) throw new Error(`docx: ${r.status}`);
+    const blob = await r.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `artex-finding-${id}-${new Date().toISOString().slice(0, 10)}.docx`;
+    a.click();
+    URL.revokeObjectURL(a.href);
   },
   chatMentions: (kind: string, query: string, signal?: AbortSignal, cursor = "") =>
     http<{ items: ChatMention[]; next_cursor?: string }>(
@@ -1220,6 +1314,7 @@ export const api = {
       run_seconds?: number;
       web_search?: boolean;
       interactive_shell?: boolean;
+      local_exec?: boolean;
       trigger_run_mode?: "serial" | "parallel";
       trigger_merge_mode?: "by_task" | "all" | "none";
       trigger_max_parallel?: number;
@@ -1467,4 +1562,18 @@ export const api = {
   // 202 即返回，实际下载在后台跑，进度走 /api/update/stream。
   applyUpdate: () => post<{ ok: boolean; target: string }>(`/update/apply`),
   rollbackUpdate: () => post<{ ok: boolean }>(`/update/rollback`),
+
+  // ---- C2 出口 / 回连接收器（红队作战）----
+  // C2 出口配置：password 传 "" 清空、undefined 保持不变；回显已脱敏（只回 has_pass）。
+  c2Config: () => get<C2Config>(`/c2/config`),
+  saveC2Config: (patch: C2ConfigPatch) => put<C2Config>(`/c2/config`, patch),
+  // 监听器：list 自带各监听器的会话快照；start 返回解析后的回连地址 connect_back
+  // ——payload 里的 LHOST/LPORT 以它为准（direct/ssh 中继/manual 由平台判定）。
+  listeners: () => get<{ listeners: ListenerView[] }>(`/listeners`),
+  startListener: (name: string, port: number) =>
+    post<ListenerStartResp>(`/listeners`, { name, port }),
+  stopListener: (name: string) =>
+    post<{ stopped: string; sessions: ListenerSession[] }>(`/listeners/${encodeURIComponent(name)}/stop`),
+  listenerSessions: (name: string) =>
+    get<{ name: string; sessions: ListenerSession[] }>(`/listeners/${encodeURIComponent(name)}`),
 };

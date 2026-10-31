@@ -1,6 +1,5 @@
 "use client";
 
-import * as React from "react";
 
 import { PlusIcon, Trash2Icon } from "lucide-react";
 
@@ -87,7 +86,7 @@ export function AssetInterceptRulesEditor({
               type="button"
               size="icon"
               variant="ghost"
-              className="text-destructive hover:text-destructive size-8 shrink-0"
+              className="size-8 shrink-0 text-destructive hover:text-destructive"
               onClick={() => remove(i)}
             >
               <Trash2Icon className="size-4" />

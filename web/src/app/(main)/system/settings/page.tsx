@@ -19,6 +19,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Field, FieldContent, FieldDescription, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
@@ -80,6 +81,8 @@ export default function SystemSettingsPage() {
   const [savingWorkers, setSavingWorkers] = React.useState(false);
   const [workerPools, setWorkerPools] = React.useState<WorkerPool[]>([]);
   const [llmProfiles, setLlmProfiles] = React.useState<LLMProfile[]>([]);
+  const [compactionTimeout, setCompactionTimeout] = React.useState("0");
+  const [compactionMembers, setCompactionMembers] = React.useState("0");
   // 操作约束注入范围(默认都开)。
   const [injectPlanner, setInjectPlanner] = React.useState(true);
   const [injectWorker, setInjectWorker] = React.useState(true);
@@ -121,6 +124,8 @@ export default function SystemSettingsPage() {
     setPyInterp(s.python_interpreter ?? "");
     setWorkers(String(s.workers ?? 3));
     setWorkerPools(s.worker_pools ?? []);
+    setCompactionTimeout(String(s.compaction_timeout_seconds ?? 0));
+    setCompactionMembers(String(s.compaction_max_members ?? 0));
     setInjectPlanner(s.constraints_inject_planner !== false);
     setInjectWorker(s.constraints_inject_worker !== false);
     setNoaCompaction(!!s.noa_compaction);
@@ -179,7 +184,7 @@ export default function SystemSettingsPage() {
         apply(s);
         toast.success("已保存并发工作 agent 数（对之后启动的任务生效）");
       })
-      .catch((e) => toast.error("保存失败：" + (e as Error).message))
+      .catch((e) => toast.error(`保存失败：${(e as Error).message}`))
       .finally(() => setSavingWorkers(false));
   };
 
@@ -193,7 +198,7 @@ export default function SystemSettingsPage() {
         apply(s);
         toast.success("已保存 Python 解释器配置");
       })
-      .catch((e) => toast.error("保存失败：" + (e as Error).message))
+      .catch((e) => toast.error(`保存失败：${(e as Error).message}`))
       .finally(() => setSaving(false));
   };
   const detectPython = () => {
@@ -369,8 +374,18 @@ export default function SystemSettingsPage() {
   // 保存内置 compaction 的 body 预算;compactor 每次 compress 都重读,即时生效。
   const saveCompactionBudget = () => {
     const n = Number(compactionMaxTokens);
+    const to = Number(compactionTimeout);
+    const m = Number(compactionMembers);
     if (!Number.isInteger(n) || n < 512 || n > 128000) {
       toast.error("压缩输出上限需为 512 到 128000 之间的整数");
+      return;
+    }
+    if (!Number.isInteger(to) || to < 0) {
+      toast.error("超时必须是不小于 0 的整数秒（0 = 默认）");
+      return;
+    }
+    if (!Number.isInteger(m) || m < 0) {
+      toast.error("单块节点数必须是不小于 0 的整数（0 = 默认）");
       return;
     }
     if (compactionThinking !== "disabled" && compactionThinking !== "enabled") {
@@ -379,7 +394,12 @@ export default function SystemSettingsPage() {
     }
     setSavingCompaction(true);
     api
-      .setSettings({ compaction_max_tokens: n, compaction_thinking: compactionThinking })
+      .setSettings({
+        compaction_max_tokens: n,
+        compaction_thinking: compactionThinking,
+        compaction_timeout_seconds: to,
+        compaction_max_members: m,
+      })
       .then((s) => {
         apply(s);
         toast.success("已保存冷节点压缩预算（对下一次压缩即时生效）");
@@ -412,7 +432,7 @@ export default function SystemSettingsPage() {
         toast.success("已保存网络搜索配置");
       })
       .catch((e) => {
-        toast.error("保存失败：" + (e as Error).message);
+        toast.error(`保存失败：${(e as Error).message}`);
         api
           .settings()
           .then(apply)
@@ -430,7 +450,7 @@ export default function SystemSettingsPage() {
         setBraveKeyInput("");
         toast.success("已保存 Brave API Key");
       })
-      .catch((e) => toast.error("保存失败：" + (e as Error).message))
+      .catch((e) => toast.error(`保存失败：${(e as Error).message}`))
       .finally(() => setSavingKey(false));
   };
 
@@ -443,7 +463,7 @@ export default function SystemSettingsPage() {
         setTavilyKeyInput("");
         toast.success("已保存 Tavily API Key");
       })
-      .catch((e) => toast.error("保存失败：" + (e as Error).message))
+      .catch((e) => toast.error(`保存失败：${(e as Error).message}`))
       .finally(() => setSavingTavilyKey(false));
   };
 
@@ -455,7 +475,7 @@ export default function SystemSettingsPage() {
         apply(s);
         toast.success(proxyInput.trim() ? "已保存出口代理" : "已清除出口代理（改为直连）");
       })
-      .catch((e) => toast.error("保存失败：" + (e as Error).message))
+      .catch((e) => toast.error(`保存失败：${(e as Error).message}`))
       .finally(() => setSavingProxy(false));
   };
 
@@ -470,7 +490,7 @@ export default function SystemSettingsPage() {
         if (showEgressIp) void probeEgress().catch(() => undefined);
         toast.success(globalProxyInput.trim() ? "已保存全局代理" : "已清除全局代理（改为直连）");
       })
-      .catch((e) => toast.error("保存失败：" + (e as Error).message))
+      .catch((e) => toast.error(`保存失败：${(e as Error).message}`))
       .finally(() => setSavingGlobalProxy(false));
   };
 
@@ -531,9 +551,9 @@ export default function SystemSettingsPage() {
       })
       .then((r) => {
         if (r.ok) toast.success(`搜索测试成功 · ${r.backend} 返回 ${r.count} 条结果`);
-        else toast.error("搜索测试失败：" + (r.error || "未知错误"));
+        else toast.error(`搜索测试失败：${r.error || "未知错误"}`);
       })
-      .catch((e) => toast.error("搜索测试失败：" + (e as Error).message))
+      .catch((e) => toast.error(`搜索测试失败：${(e as Error).message}`))
       .finally(() => setTesting(false));
   };
 
@@ -557,7 +577,7 @@ export default function SystemSettingsPage() {
   return (
     <div className="flex flex-1 flex-col gap-4 md:gap-6">
       <div>
-        <h1 className="text-xl font-semibold tracking-tight">系统配置</h1>
+        <h1 className="font-semibold text-xl tracking-tight">系统配置</h1>
         <p className="text-muted-foreground text-sm">全局运行时开关</p>
         <div className="relative mt-4 max-w-xl">
           <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2" />
@@ -1057,6 +1077,34 @@ export default function SystemSettingsPage() {
                       <SelectItem value="enabled">开启</SelectItem>
                     </SelectContent>
                   </Select>
+                </div>
+                <div className="w-40">
+                  <Label htmlFor="compaction-timeout" className="text-sm font-normal text-muted-foreground">
+                    单次超时（秒，0=默认）
+                  </Label>
+                  <Input
+                    id="compaction-timeout"
+                    className="mt-1"
+                    inputMode="numeric"
+                    value={compactionTimeout}
+                    disabled={!loaded || savingCompaction}
+                    onChange={(e) => setCompactionTimeout(e.target.value)}
+                    placeholder="0"
+                  />
+                </div>
+                <div className="w-40">
+                  <Label htmlFor="compaction-members" className="text-sm font-normal text-muted-foreground">
+                    单块节点上限（0=默认）
+                  </Label>
+                  <Input
+                    id="compaction-members"
+                    className="mt-1"
+                    inputMode="numeric"
+                    value={compactionMembers}
+                    disabled={!loaded || savingCompaction}
+                    onChange={(e) => setCompactionMembers(e.target.value)}
+                    placeholder="0"
+                  />
                 </div>
                 <Button onClick={saveCompactionBudget} disabled={!loaded || savingCompaction}>
                   {savingCompaction ? "保存中…" : "保存"}

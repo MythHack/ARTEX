@@ -74,7 +74,7 @@ function Row({
                 </Badge>
               )}
             </div>
-            <span className="truncate text-xs text-muted-foreground">{f.summary}</span>
+            <span className="truncate text-muted-foreground text-xs">{f.summary}</span>
           </div>
         </button>
         <Badge variant="outline">流量证据 {f.traffic_count ?? 0} 条</Badge>
@@ -89,7 +89,7 @@ function Row({
                 {a.label}
               </code>
             ))}
-            {f.assets.length > 2 && <span className="text-xs text-muted-foreground">+{f.assets.length - 2}</span>}
+            {f.assets.length > 2 && <span className="text-muted-foreground text-xs">+{f.assets.length - 2}</span>}
           </div>
         )}
         {f.finding_id && !f.inherited ? (
@@ -110,7 +110,7 @@ function Row({
         ) : (
           <StatusBadge domain="finding" value={f.status} dot />
         )}
-        <span className="hidden shrink-0 text-xs text-muted-foreground md:block">
+        <span className="hidden shrink-0 text-muted-foreground text-xs md:block">
           {new Date(f.ts).toLocaleString("zh-CN")}
         </span>
         {f.finding_id && (
@@ -126,8 +126,8 @@ function Row({
       </div>
       {open && (
         <div className="bg-muted/30 px-4 pb-4 pl-11">
-          <div className="mb-1 text-xs font-medium text-muted-foreground">证据 / PoC</div>
-          <pre className="overflow-auto rounded-md border bg-background p-3 font-mono text-xs whitespace-pre-wrap">
+          <div className="mb-1 font-medium text-muted-foreground text-xs">证据 / PoC</div>
+          <pre className="overflow-auto whitespace-pre-wrap rounded-md border bg-background p-3 font-mono text-xs">
             {f.evidence}
           </pre>
         </div>
@@ -177,7 +177,7 @@ export function FindingsTab({ taskId }: { taskId: string }) {
       toast.success(`已标记为「${statusMeta("finding", next).label}」`);
     } catch (e) {
       setFindings((cur) => cur.map((x) => (x.id === f.id ? { ...x, status: prev } : x)));
-      toast.error("更新失败：" + (e as Error).message);
+      toast.error(`更新失败：${(e as Error).message}`);
     }
   }, []);
 

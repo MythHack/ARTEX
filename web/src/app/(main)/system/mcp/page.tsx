@@ -19,6 +19,16 @@ import {
   SheetTitle,
   SheetDescription,
 } from "@/components/ui/sheet";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
 import type { MCPServer, MCPTool, Agent } from "@/lib/types";
@@ -50,6 +60,9 @@ export default function MCPPage() {
 
   const [open, setOpen] = React.useState(false);
   const [editing, setEditing] = React.useState<MCPServer | null>(null); // null = add mode
+  // 删除二次确认（对齐 tasks/skills 的标准交互：删除直接改 agent 可用的工具面，必须确认）
+  const [pendingDelete, setPendingDelete] = React.useState<MCPServer | null>(null);
+  const [deleting, setDeleting] = React.useState(false);
   const [tab, setTab] = React.useState<"config" | "tools">("config");
   const [form, setForm] = React.useState<FormState>(emptyForm);
   const [saving, setSaving] = React.useState(false);
@@ -176,7 +189,7 @@ export default function MCPPage() {
       if (!editing) setOpen(false);
       load();
     } catch (e) {
-      toast.error("保存失败：" + (e as Error).message);
+      toast.error(`保存失败：${(e as Error).message}`);
     } finally {
       setSaving(false);
     }
@@ -191,20 +204,24 @@ export default function MCPPage() {
       toast.success(`发现 ${t.length} 个工具`);
       load();
     } catch (e) {
-      toast.error("刷新失败：" + (e as Error).message);
+      toast.error(`刷新失败：${(e as Error).message}`);
     } finally {
       setRefreshing(false);
     }
   }
 
   async function removeServer(s: MCPServer) {
+    setDeleting(true);
     try {
       await api.deleteMcpServer(s.id);
       toast.success(`已删除：${s.name}`);
       setOpen(false);
       load();
+      setPendingDelete(null);
     } catch (e) {
-      toast.error("删除失败：" + (e as Error).message);
+      toast.error(`删除失败：${(e as Error).message}`);
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -213,7 +230,7 @@ export default function MCPPage() {
       await api.saveMcpServer({ ...s, enabled: !s.enabled });
       load();
     } catch (e) {
-      toast.error("操作失败：" + (e as Error).message);
+      toast.error(`操作失败：${(e as Error).message}`);
     }
   }
 
@@ -224,7 +241,7 @@ export default function MCPPage() {
       toast.success(`${on ? "取消" : "授予"}「${agentName}」可见`);
       load();
     } catch (e) {
-      toast.error("操作失败：" + (e as Error).message);
+      toast.error(`操作失败：${(e as Error).message}`);
     }
   }
 
@@ -347,7 +364,7 @@ export default function MCPPage() {
               <div key={t.name} className="py-2.5">
                 <code className="font-mono text-sm">{t.name}</code>
                 {t.description && (
-                  <p className="text-muted-foreground mt-0.5 text-xs leading-relaxed">
+                  <p className="mt-0.5 text-muted-foreground text-xs leading-relaxed">
                     {t.description}
                   </p>
                 )}
@@ -362,7 +379,7 @@ export default function MCPPage() {
   return (
     <div className="flex flex-1 flex-col gap-4 md:gap-6">
       <div>
-        <h1 className="text-xl font-semibold tracking-tight">MCP</h1>
+        <h1 className="font-semibold text-xl tracking-tight">MCP</h1>
         <p className="text-muted-foreground text-sm">外部 MCP 工具服务器 · 按 Agent 授权可见</p>
       </div>
 
@@ -370,7 +387,7 @@ export default function MCPPage() {
         <button
           type="button"
           onClick={openAdd}
-          className="text-foreground/70 border-foreground/70 hover:bg-muted/60 hover:shadow-sm flex min-h-[116px] flex-col items-center justify-center gap-2 rounded-xl border border-dashed transition"
+          className="flex min-h-[116px] flex-col items-center justify-center gap-2 rounded-xl border border-foreground/70 border-dashed text-foreground/70 transition hover:bg-muted/60 hover:shadow-sm"
         >
           <PlusIcon className="size-6" />
           <span className="text-sm">添加 MCP</span>
@@ -380,11 +397,11 @@ export default function MCPPage() {
           <Card
             key={s.id}
             onClick={() => openEdit(s)}
-            className="hover:border-primary/60 cursor-pointer gap-3 transition hover:shadow-sm"
+            className="cursor-pointer gap-3 transition hover:border-primary/60 hover:shadow-sm"
           >
             <CardHeader>
               <div className="flex items-center gap-2">
-                <ServerIcon className="text-muted-foreground size-4 shrink-0" />
+                <ServerIcon className="size-4 shrink-0 text-muted-foreground" />
                 <CardTitle className="truncate text-base">{s.name}</CardTitle>
                 <Badge variant="outline" className="uppercase">
                   {s.transport}
@@ -399,7 +416,7 @@ export default function MCPPage() {
                     size="icon"
                     variant="outline"
                     aria-label="删除"
-                    onClick={() => removeServer(s)}
+                    onClick={() => setPendingDelete(s)}
                   >
                     <Trash2Icon className="text-destructive" />
                   </Button>
@@ -477,6 +494,27 @@ export default function MCPPage() {
           )}
         </SheetContent>
       </Sheet>
+
+      {/* ── 删除二次确认 ── */}
+      <AlertDialog open={!!pendingDelete} onOpenChange={(o) => { if (!o) setPendingDelete(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除 MCP 服务器「{pendingDelete?.name}」？</AlertDialogTitle>
+            <AlertDialogDescription>
+              将移除该服务器及其全部工具发现结果；引用其工具的 Agent 会立即失去这些工具。此操作不可撤销。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={deleting}
+              onClick={(e) => { e.preventDefault(); if (pendingDelete) void removeServer(pendingDelete); }}
+            >
+              {deleting ? "删除中…" : "删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

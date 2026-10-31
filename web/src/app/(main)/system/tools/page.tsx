@@ -34,7 +34,18 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { api } from "@/lib/api";
+import { cloneJson } from "@/lib/json";
 import type { Agent, Tool } from "@/lib/types";
 
 // Traffic tools are host tools gated by the global 流量捕获 switch: bindable, but
@@ -111,7 +122,7 @@ function coerceDefault(type: string, raw: string): unknown {
 // applyRows writes edited rows back into a deep-copied schema (structure untouched).
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function applyRows(schema: Record<string, any>, rows: ParamRow[]): Record<string, any> {
-  const next = structuredClone(schema ?? {});
+  const next = cloneJson(schema ?? {});
   const props = (next.properties ?? {}) as Record<string, Record<string, unknown>>;
   for (const r of rows) {
     if (r.parentKey) {
@@ -180,7 +191,7 @@ function ToolEditor({
       onSaved();
       onClose();
     } catch (e) {
-      toast.error("保存失败：" + (e as Error).message);
+      toast.error(`保存失败：${(e as Error).message}`);
     } finally {
       setSaving(false);
     }
@@ -192,7 +203,7 @@ function ToolEditor({
       onSaved();
       onClose();
     } catch (e) {
-      toast.error("恢复失败：" + (e as Error).message);
+      toast.error(`恢复失败：${(e as Error).message}`);
     }
   }
 
@@ -200,7 +211,7 @@ function ToolEditor({
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4">
         {trafficGated && (
-          <div className="border-amber-500/40 bg-amber-500/10 text-muted-foreground rounded-md border px-3 py-2 text-xs">
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-muted-foreground text-xs">
             该工具依赖<b>流量捕获</b>。请先在「系统配置」开启流量捕获，才能绑定给 Agent 并启用。
           </div>
         )}
@@ -217,7 +228,7 @@ function ToolEditor({
                     onCheckedChange={() => toggleAgent(ag.key)}
                   />
                   {ag.name}
-                  <span className="text-muted-foreground font-mono text-xs">{ag.key}</span>
+                  <span className="font-mono text-muted-foreground text-xs">{ag.key}</span>
                 </label>
               ))}
               {agents.length === 0 && <span className="text-muted-foreground text-xs">（无 Agent）</span>}
@@ -250,14 +261,14 @@ function ToolEditor({
           {rows.length === 0 && <span className="text-muted-foreground text-xs">（无参数）</span>}
           {rows.map((r, i) => (
             <div
-              key={(r.parentKey ?? "") + "." + r.name}
+              key={`${r.parentKey ?? ""}.${r.name}`}
               className={r.parentKey
-                ? "border-l-2 border-muted ml-3 pl-3 grid gap-2 py-2"
+                ? "ml-3 grid gap-2 border-muted border-l-2 py-2 pl-3"
                 : "grid gap-2 rounded-md border p-3"
               }
             >
               <div className="flex flex-wrap items-center gap-2">
-                {r.parentKey && <span className="text-muted-foreground font-mono text-[10px]">↳</span>}
+                {r.parentKey && <span className="font-mono text-[10px] text-muted-foreground">↳</span>}
                 <span className="font-mono text-sm">{r.name}</span>
                 <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
                   {r.type || "?"}
@@ -268,12 +279,12 @@ function ToolEditor({
                   </Badge>
                 )}
                 {r.parentKey && (
-                  <span className="text-muted-foreground text-[10px]">items 子字段</span>
+                  <span className="text-[10px] text-muted-foreground">items 子字段</span>
                 )}
               </div>
               <div className="grid gap-2">
                 <div className="grid gap-1">
-                  <Label className="text-muted-foreground text-[11px]">描述</Label>
+                  <Label className="text-[11px] text-muted-foreground">描述</Label>
                   <Input
                     className="text-xs"
                     value={r.description}
@@ -281,7 +292,7 @@ function ToolEditor({
                   />
                 </div>
                 <div className="grid gap-1">
-                  <Label className="text-muted-foreground text-[11px]">默认值</Label>
+                  <Label className="text-[11px] text-muted-foreground">默认值</Label>
                   <Input
                     className="text-xs"
                     placeholder={r.scalar ? "（空=无默认）" : "仅标量支持"}
@@ -315,10 +326,10 @@ function ToolGridCard({ tool, onClick }: { tool: Tool; onClick: () => void }) {
     <button
       type="button"
       onClick={onClick}
-      className="hover:border-primary/50 hover:bg-muted/40 focus-visible:ring-ring flex flex-col gap-2 rounded-lg border p-4 text-left transition-colors focus-visible:ring-2 focus-visible:outline-none"
+      className="flex flex-col gap-2 rounded-lg border p-4 text-left transition-colors hover:border-primary/50 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
     >
       <div className="flex flex-wrap items-center gap-2">
-        <span className="font-mono text-sm font-medium">{tool.key}</span>
+        <span className="font-medium font-mono text-sm">{tool.key}</span>
         {tool.system ? (
           <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
             系统
@@ -334,7 +345,7 @@ function ToolGridCard({ tool, onClick }: { tool: Tool; onClick: () => void }) {
           </Badge>
         )}
         {!tool.enabled && (
-          <Badge variant="outline" className="text-destructive px-1.5 py-0 text-[10px]">
+          <Badge variant="outline" className="px-1.5 py-0 text-[10px] text-destructive">
             已停用
           </Badge>
         )}
@@ -346,12 +357,12 @@ function ToolGridCard({ tool, onClick }: { tool: Tool; onClick: () => void }) {
           调用 {tool.calls ?? 0}
         </Badge>
       </div>
-      <p className="text-muted-foreground line-clamp-1 h-4 text-xs">
+      <p className="line-clamp-1 h-4 text-muted-foreground text-xs">
         {tool.description || "（无描述）"}
       </p>
       <div className="mt-auto flex flex-wrap gap-1 pt-1">
         {tool.agents.length === 0 && (
-          <span className="text-muted-foreground text-[10px]">（未绑定 Agent）</span>
+          <span className="text-[10px] text-muted-foreground">（未绑定 Agent）</span>
         )}
         {tool.agents.map((a) => (
           <Badge key={a} variant="outline" className="px-1.5 py-0 text-[10px]">
@@ -402,11 +413,11 @@ export default function ToolsPage() {
     <div className="flex flex-1 flex-col gap-4 md:gap-6">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">工具</h1>
+          <h1 className="font-semibold text-xl tracking-tight">工具</h1>
           <p className="text-muted-foreground text-sm">系统工具的描述/绑定，以及自定义工具(command/script/http)</p>
         </div>
         <div className="relative w-64">
-          <SearchIcon className="text-muted-foreground absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2" />
+          <SearchIcon className="absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input
             className="h-8 pl-8 text-sm"
             placeholder="搜索工具名、描述、Agent…"
@@ -434,7 +445,7 @@ export default function ToolsPage() {
             </CardHeader>
             <CardContent>
               {systemTools.length === 0 ? (
-                <p className="text-muted-foreground py-6 text-center text-sm">
+                <p className="py-6 text-center text-muted-foreground text-sm">
                   {query.trim() ? "没有匹配的系统工具" : "（暂无系统工具，等待后端 seed）"}
                 </p>
               ) : (
@@ -467,7 +478,7 @@ export default function ToolsPage() {
             </CardHeader>
             <CardContent>
               {customTools.length === 0 ? (
-                <p className="text-muted-foreground py-6 text-center text-sm">
+                <p className="py-6 text-center text-muted-foreground text-sm">
                   {query.trim() ? "没有匹配的自定义工具" : "（暂无自定义工具，点击右上角「新建自定义工具」）"}
                 </p>
               ) : (
@@ -485,7 +496,7 @@ export default function ToolsPage() {
       <Sheet open={!!selected} onOpenChange={(o) => !o && setSelectedKey(null)}>
         <SheetContent
           side="right"
-          className="gap-0 p-0 data-[side=right]:w-[30vw] data-[side=right]:sm:max-w-[30vw]"
+          className="w-full! max-w-none! gap-0 p-0 sm:w-[30vw]! sm:max-w-[30vw]!"
         >
           {selected && (
             <>
@@ -560,6 +571,8 @@ function CustomToolDialog({
   const [paramsText, setParamsText] = React.useState("");
   const [testing, setTesting] = React.useState(false);
   const [testResult, setTestResult] = React.useState<{ output: string; is_error: boolean } | null>(null);
+  // 删除二次确认：自定义工具是脚本/命令执行面，删错直接影响依赖它的 Agent。
+  const [confirmDel, setConfirmDel] = React.useState(false);
 
   // (re)load form state when opening.
   React.useEffect(() => {
@@ -634,19 +647,22 @@ function CustomToolDialog({
       toast.success(isNew ? "已创建自定义工具" : "已保存");
       onSaved();
     } catch (e) {
-      toast.error("保存失败：" + (e as Error).message);
+      toast.error(`保存失败：${(e as Error).message}`);
     } finally {
       setSaving(false);
     }
   }
   async function del() {
     if (!tool) return;
+    setSaving(true);
     try {
       await api.deleteCustomTool(tool.key);
       toast.success("已删除");
       onSaved();
     } catch (e) {
-      toast.error("删除失败：" + (e as Error).message);
+      toast.error(`删除失败：${(e as Error).message}`);
+    } finally {
+      setSaving(false);
     }
   }
   // runTest dry-runs the CURRENT form (unsaved) with the sample params, so a
@@ -675,7 +691,7 @@ function CustomToolDialog({
     <Sheet open={!!edit} onOpenChange={(o) => !o && onClose()}>
       <SheetContent
         side="right"
-        className="flex flex-col gap-0 p-0 data-[side=right]:w-[45vw] data-[side=right]:sm:max-w-[45vw] data-[side=right]:min-w-[480px]"
+        className="flex w-full! max-w-none! flex-col gap-0 p-0 sm:w-[45vw]! sm:min-w-[480px]! sm:max-w-[45vw]!"
       >
         <SheetHeader className="px-4">
           <SheetTitle>{isNew ? "新建自定义工具" : `编辑 ${tool?.key}`}</SheetTitle>
@@ -748,7 +764,7 @@ function CustomToolDialog({
               <div className="flex items-center gap-4">
                 <div className="grid gap-1.5">
                   <Label className="text-xs">代理 URL（空=直连）</Label>
-                  <Input className="font-mono text-xs w-56" value={ex.proxy} onChange={(e) => setEx({ ...ex, proxy: e.target.value })} />
+                  <Input className="w-56 font-mono text-xs" value={ex.proxy} onChange={(e) => setEx({ ...ex, proxy: e.target.value })} />
                 </div>
                 <label className="mt-4 flex items-center gap-2 text-sm">
                   <Checkbox checked={ex.use_recording_proxy} onCheckedChange={(v) => setEx({ ...ex, use_recording_proxy: !!v })} />
@@ -784,7 +800,7 @@ function CustomToolDialog({
               {agents.map((a) => (
                 <label key={a.key} className="flex items-center gap-2 text-sm">
                   <Checkbox checked={bound.includes(a.key)} onCheckedChange={() => toggleAgent(a.key)} />
-                  {a.name}<span className="text-muted-foreground font-mono text-xs">{a.key}</span>
+                  {a.name}<span className="font-mono text-muted-foreground text-xs">{a.key}</span>
                 </label>
               ))}
             </div>
@@ -803,7 +819,7 @@ function CustomToolDialog({
 
           {kind !== "shell" && (
             <div className="grid gap-1.5 rounded-md border p-3">
-              <Label className="text-xs font-medium">测试运行（用当前表单，不会保存）</Label>
+              <Label className="font-medium text-xs">测试运行（用当前表单，不会保存）</Label>
               <Textarea className="font-mono text-xs" rows={2} value={paramsText}
                 placeholder={'示例参数 JSON，如 {"target":"example.com"}'}
                 onChange={(e) => setParamsText(e.target.value)} />
@@ -815,7 +831,7 @@ function CustomToolDialog({
               {testResult && (
                 <pre
                   className={
-                    "max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-xs " +
+                    "max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-xs" +
                     (testResult.is_error ? "text-destructive" : "")
                   }
                 >
@@ -832,11 +848,32 @@ function CustomToolDialog({
             <SaveIcon /> {isNew ? "创建" : "保存"}
           </Button>
           {!isNew && (
-            <Button size="sm" variant="outline" className="text-destructive" onClick={del}>
+            <Button size="sm" variant="outline" className="text-destructive" onClick={() => setConfirmDel(true)}>
               <Trash2Icon /> 删除
             </Button>
           )}
         </div>
+
+        {/* ── 删除二次确认 ── */}
+        <AlertDialog open={confirmDel} onOpenChange={setConfirmDel}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>删除自定义工具「{tool?.key}」？</AlertDialogTitle>
+              <AlertDialogDescription>
+                绑定该工具的 Agent 将立即失去它；依赖它的任务步骤会开始失败。此操作不可撤销。
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={saving}>取消</AlertDialogCancel>
+              <AlertDialogAction
+                disabled={saving}
+                onClick={(e) => { e.preventDefault(); void del(); }}
+              >
+                {saving ? "删除中…" : "删除"}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </SheetContent>
     </Sheet>
   );

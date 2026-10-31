@@ -82,13 +82,13 @@ export function UpdateCard() {
       .then((r) => {
         setInfo(r);
         if (!quiet) {
-          if (r.error) toast.error("检查更新失败：" + r.error);
+          if (r.error) toast.error(`检查更新失败：${r.error}`);
           else if (r.has_update) toast.success(`发现新版本 ${r.latest}`);
           else if (r.comparable) toast.success("当前已是最新版本");
         }
       })
       .catch((e) => {
-        if (!quiet) toast.error("检查更新失败：" + (e as Error).message);
+        if (!quiet) toast.error(`检查更新失败：${(e as Error).message}`);
       })
       .finally(() => setChecking(false));
   }, []);
@@ -126,7 +126,8 @@ export function UpdateCard() {
     while (Date.now() < deadline) {
       await sleep(2000);
       try {
-        const r = await fetch("/api/health", { cache: "no-store" });
+        // /api/health 已去身份（公网指纹治理）：版本查询走鉴权的 /api/version。
+        const r = await fetch("/api/version", { cache: "no-store" });
         if (r.ok) {
           const j = (await r.json()) as { version?: string };
           if (j.version && j.version !== fromVersion) {
@@ -161,7 +162,7 @@ export function UpdateCard() {
         if (p.phase === "failed") {
           es.close();
           setBusy(false);
-          toast.error("更新失败：" + (p.error || p.message));
+          toast.error(`更新失败：${p.error || p.message}`);
           return;
         }
         if (p.phase === "staged") {
@@ -195,16 +196,13 @@ export function UpdateCard() {
 
     setBusy(true);
     setProgress({ phase: "downloading", percent: 0, message: "准备中…" });
-    api
-      .applyUpdate()
-      .then(() => {
-        openStream(from);
-      })
-      .catch((e) => {
-        setBusy(false);
-        setProgress(null);
-        toast.error("启动更新失败：" + (e as Error).message);
-      });
+    const es = openStream(from);
+    api.applyUpdate().catch((e) => {
+      es.close();
+      setBusy(false);
+      setProgress(null);
+      toast.error(`启动更新失败：${(e as Error).message}`);
+    });
   };
 
   const doRollback = () => {
@@ -225,7 +223,7 @@ export function UpdateCard() {
       })
       .catch((e) => {
         setBusy(false);
-        toast.error("回滚失败：" + (e as Error).message);
+        toast.error(`回滚失败：${(e as Error).message}`);
       });
   };
 
@@ -313,7 +311,7 @@ export function UpdateCard() {
               href={info.html_url}
               target="_blank"
               rel="noreferrer"
-              className="inline-flex items-center gap-1 text-xs text-muted-foreground underline-offset-4 hover:underline"
+              className="inline-flex items-center gap-1 text-muted-foreground text-xs underline-offset-4 hover:underline"
             >
               更新日志 <ExternalLinkIcon className="size-3" />
             </a>
@@ -321,45 +319,45 @@ export function UpdateCard() {
         </div>
 
         {info?.boot_notice && (
-          <p className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-400">
+          <p className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-amber-700 text-xs dark:text-amber-400">
             <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
             {info.boot_notice}
           </p>
         )}
 
         {info?.error && (
-          <p className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
+          <p className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-destructive text-xs">
             <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
             无法连接 GitHub：{info.error}
             {"　"}可配置更新代理或切换为直连后重试。
           </p>
         )}
 
-        {info && !info.comparable && info.reason && <p className="text-xs text-muted-foreground">{info.reason}</p>}
+        {info && !info.comparable && info.reason && <p className="text-muted-foreground text-xs">{info.reason}</p>}
 
         {info?.has_update && info.asset_available === false && (
-          <p className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
+          <p className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-2 text-destructive text-xs">
             <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
             {info.latest} 没有提供 {info.os}/{info.arch} 的发布包（缺少 {info.asset}），无法自动更新。
           </p>
         )}
 
         {info?.has_update && info.asset_available !== false && (
-          <p className="text-xs text-muted-foreground">
+          <p className="text-muted-foreground text-xs">
             将下载 <span className="font-mono">{info.asset}</span>
             {info.size ? `（${humanSize(info.size)}）` : ""}，校验 SHA256 并冒烟测试后才会替换，失败自动保留当前版本。
           </p>
         )}
 
         {info && !info.has_update && info.comparable && !info.error && (
-          <p className="flex items-center gap-2 text-xs text-muted-foreground">
+          <p className="flex items-center gap-2 text-muted-foreground text-xs">
             <CheckCircle2Icon className="size-3.5 text-emerald-600" />
             当前已是最新版本。
           </p>
         )}
 
         {info?.mode === "docker" && info.has_update && (
-          <p className="text-xs text-muted-foreground">
+          <p className="text-muted-foreground text-xs">
             Docker 下的更新只替换程序本身，不更新镜像里的 playwright / nmap 等工具链，且
             <span className="font-mono"> docker compose up -d </span>
             重建容器后会退回镜像自带的版本。需要连镜像一起升级请执行
@@ -376,7 +374,7 @@ export function UpdateCard() {
         {showProgress && (
           <div className="space-y-1.5">
             <Progress value={pct} className={downloading ? undefined : "animate-pulse"} />
-            <p className="text-xs text-muted-foreground">
+            <p className="text-muted-foreground text-xs">
               {restarting ? "正在重启并应用新版本，请稍候（页面会自动刷新）…" : progress?.message}
             </p>
           </div>
@@ -418,7 +416,7 @@ export function UpdateCard() {
           )}
         </div>
 
-        <p className="text-xs text-muted-foreground">
+        <p className="text-muted-foreground text-xs">
           一键更新依赖守护脚本重启程序。请通过 <span className="font-mono">start.sh</span>（Windows 为
           <span className="font-mono"> start.bat</span>）启动 ARTEX；直接运行 artex 本体时，程序退出后不会被自动拉起。
         </p>
