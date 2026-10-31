@@ -1,7 +1,6 @@
 package selfupdate
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -9,7 +8,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 )
@@ -175,26 +173,7 @@ func verifyStaged(p Paths) error {
 // smokeTest 用 -h 拉起新二进制，确认它在当前系统上真的能执行。
 // 这能挡掉下载截断、架构选错（exec format error）、缺依赖等一大类问题。
 func smokeTest(bin string) error {
-	if err := os.Chmod(bin, 0o755); err != nil {
-		return fmt.Errorf("赋予执行权限: %w", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, bin, "-h")
-	cmd.Env = append(os.Environ(), smokeEnv+"=1")
-	out, err := cmd.CombinedOutput()
-	if ctx.Err() != nil {
-		return errors.New("冒烟测试超时（新二进制无响应）")
-	}
-	if err != nil {
-		snippet := strings.TrimSpace(string(out))
-		if len(snippet) > 300 {
-			snippet = snippet[:300] + "…"
-		}
-		return fmt.Errorf("冒烟测试失败: %v: %s", err, snippet)
-	}
-	return nil
+	return smokeTestWithArgs(bin, []string{"-h"})
 }
 
 // swap 把当前二进制换成暂存的新版本。

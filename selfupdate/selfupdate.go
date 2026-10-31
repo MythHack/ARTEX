@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -111,6 +112,14 @@ func cleanStaged(p Paths) {
 	_ = os.Remove(p.New)
 	_ = os.Remove(p.Sum)
 }
+
+// versionTagRe 只接受纯净的三段式版本号（可带 v 前缀）。
+var versionTagRe = regexp.MustCompile(`^v?\d+\.\d+\.\d+$`)
+
+// ValidVersionTag 报告字符串是否是允许的版本号形态。hostd 的 /self-upgrade 用它
+// 做入参校验——那个参数最终会拼进 GitHub API 的 URL，必须收窄形态。
+// 刻意**不做 TrimSpace**：带空白的输入直接拒绝，而不是悄悄纠正后再用。
+func ValidVersionTag(s string) bool { return versionTagRe.MatchString(s) }
 
 // CompareVersions 比较两个版本号，返回 -1/0/1（a<b / a==b / a>b）。
 // ok=false 表示至少一边不是可比较的版本号（例如本地开发构建的 "dev" 或

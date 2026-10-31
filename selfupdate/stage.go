@@ -61,41 +61,17 @@ func stageAt(ctx context.Context, c *http.Client, rel *Release, currentVersion s
 		return err
 	}
 
-	name := AssetName(rel.TagName, runtime.GOOS, runtime.GOARCH)
-	asset, ok := rel.FindAsset(name)
-	if !ok {
-		return fmt.Errorf("该版本没有提供 %s/%s 的发布包（缺少 %s）", runtime.GOOS, runtime.GOARCH, name)
-	}
-
-	prog(PhaseDownload, 0, "获取校验和清单…")
-	sums, err := fetchSums(ctx, c, rel)
-	if err != nil {
-		return err
-	}
-	want, ok := sums[name]
-	if !ok {
-		return fmt.Errorf("%s 未收录 %s，拒绝安装未经校验的二进制", sumsAsset, name)
-	}
-
-	// 临时文件全部落在目标目录里，保证最后的 rename 是同一文件系统内的原子操作
-	// （跨设备 rename 会失败，而 /tmp 常常是独立挂载点）。
-	zipPath := p.New + ".zip.part"
 	binPath := p.New + ".part"
-	defer func() {
-		_ = os.Remove(zipPath)
-		_ = os.Remove(binPath)
-	}()
+	defer func() { _ = os.Remove(binPath) }()
 
-	prog(PhaseDownload, 0, fmt.Sprintf("下载 %s（%s）…", name, humanSize(asset.Size)))
-	got, err := download(ctx, c, asset, zipPath, prog)
+	// 下载与校验走共享实现（bundle.go）：伴随二进制 artex-hostd 的自我换装用的是
+	// 同一份逻辑，避免两边各写一份、迟早有一处漏校验。
+	// 临时文件落在程序目录，保证最后的 rename 是同文件系统内的原子操作。
+	zipPath, err := FetchVerifiedZip(ctx, c, rel, p.Dir, prog)
 	if err != nil {
 		return err
 	}
-
-	prog(PhaseVerify, -1, "校验 SHA256…")
-	if !strings.EqualFold(got, want) {
-		return fmt.Errorf("SHA256 不匹配：期望 %s，实际 %s（下载损坏或被篡改）", short(want), short(got))
-	}
+	defer func() { _ = os.Remove(zipPath) }()
 
 	prog(PhaseExtract, -1, "解压并冒烟测试…")
 	if err := extractBinary(zipPath, binPath); err != nil {
