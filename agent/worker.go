@@ -234,10 +234,12 @@ const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 2. 初次受阻（payload 被过滤 / 404 / 注入无回显）不代表已探透——把本意图的所有绕过手段走完再输出结论；
 3. 只在授权范围内操作。系统提示顶部若附【操作约束】，那是最高优先级红线：每条命令/探测执行前先自检，违反即不做（哪怕它落在你领到的意图里）。
 
+**探测阶段优先调用已配置的专用扫描/探测工具，避免重复用 Bash 手写同类脚本（只有当专用工具无法满足探测需求时才手写 Python）。**
+
 **边发现边写回**（写进图才算数，脑子/文字里的不算；每得一个结果立刻写，别攒到最后被步数耗尽丢掉）。三种写回，别串图：
 - **新资产/资源 → insert_assets（资产图）**：子域 / service / endpoint / 指纹 / 凭据 等一切资产【本身】。**这里只登记资产；探索结论/判断不写这里，用 record_fact。**
 - **探索结论/事实 → record_fact（探索图，传 intent_id）**：都用它。**多个观察汇总成【一条】事实**（summary 一句总结 + detail写对总结的拓展，依靠真实的执行过程），不要一个属性一条、一意图通常只一条，拆碎会让图谱无限膨胀——**默认就写一条，能并进 detail 的都并进去**；仅当确有【彼此完全独立、无法归并】的结论时才用 facts 数组分条，这是极少数例外，不是常规。**只写增量**：只记这次【新得到】的，别把已有事实换措辞重记（只印证已有、无新增就不必记）。**只写真实看到的**：给 evidence（一行：命令+最能证明的一两行输出，简洁，细节在 detail）、标 confidence（observed=直接看到 / inferred=据现象推断）。
-- **确认漏洞 → report_finding（探索图，含 PoC，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。触发不了但有嫌疑 → 用 record_fact 记一条 inferred 事实（嫌疑点+为何未触发）交规划者，别硬记成 finding。
+- **确认漏洞 → report_finding（探索图，含 PoC、cwe_id、cvss_vector，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据且产生实质安全危害才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认。**严禁把未闭环的能力原语当漏洞上报**：①盲上传成功但无读回链/不解析执行；②回调或状态接口返回 success 但未实证订单/业务状态真实翻转；③用已知参数加密再解密回原参数的自引用闭环；④短信/邮件等无回显接口仅返回成功但未经人工确认收到；⑤纯存在性枚举 Oracle 无数据产出——以上一律只准用 record_fact 记录交规划者继续深挖。**同源去重**：若 finding_list 中已有同根因漏洞（如同源站 catch-all 或同套多租户系统的 /metrics、相同接口缺陷），新域名/新宿主命中时严禁重复调 report_finding 刷数量，只记 record_fact。**CVSS v3.1 实证定级红线**（C/I/A 只按已实证结果填）：C:H 仅限已拿到可用凭据/密钥、百条以上真实业务敏感数据/PII 或完整源码；/metrics、Actuator、路由/配置暴露、单笔样本回显一律封顶 C:L（medium）；I:H 仅限已实证篡改核心业务状态或 RCE。
 
 
 完成本意图后用一句话总结你做了什么、写回了哪些事实。`
@@ -322,11 +324,75 @@ func renderIntentTask(intent *db.Node) string {
 // must NOT widen the worker's job — it still does only its assigned intent. Its sole
 // purpose is letting the worker read context (existing facts/assets/hints)
 // so it avoids redundant work and doesn't re-derive what others already found.
+func isNonWorkerHint(text string) bool {
+	for _, marker := range []string{
+		"规划者排期", "规划者持续排期", "报告阶段执行", "报告 Agent 出报告", "评级修订请求", "已作废，仅供存档",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func renderWorkerGraphOverview(data map[string]any) string {
 	// coverage 是给规划者判断「哪类测得少 / 要不要扩范围」的信号，与 worker「只做领到的
 	// 那条意图、别追未覆盖的点」的职责边界相悖 → 从 worker 视图里剔除。data 是本次 worker
 	// 专属的新 map，删键不影响 planner。
 	delete(data, "coverage")
+	// open_intents 是待领取队列（别的 worker 领的事），worker 无需全量携带（保留 frontier_open 计数即可）。
+	delete(data, "open_intents")
+	// 对 worker 进一步收敛各列表窗口与单条长度，避免每个意图启动都在首轮携带 35KB+ 的全局态势。
+	if rdi, ok := data["recent_done_intents"].([]map[string]any); ok && len(rdi) > 5 {
+		data["recent_done_intents"] = rdi[:5]
+	}
+	if rf, ok := data["recent_facts"].([]map[string]any); ok && len(rf) > 12 {
+		data["recent_facts"] = rf[:12]
+	}
+	if cds, ok := data["cold_digests"].([]map[string]any); ok {
+		if len(cds) > 6 {
+			cds = cds[:6]
+		}
+		trimmed := make([]map[string]any, 0, len(cds))
+		for _, cd := range cds {
+			cp := make(map[string]any, len(cd))
+			for k, v := range cd {
+				cp[k] = v
+			}
+			cp["body"] = clipOverviewRunes(cp["body"], 260)
+			trimmed = append(trimmed, cp)
+		}
+		data["cold_digests"] = trimmed
+	}
+	if fl, ok := data["finding_list"].([]map[string]any); ok {
+		if len(fl) > 6 {
+			fl = fl[:6]
+		}
+		trimmed := make([]map[string]any, 0, len(fl))
+		for _, f := range fl {
+			cp := make(map[string]any, len(f))
+			for k, v := range f {
+				cp[k] = v
+			}
+			cp["summary"] = clipOverviewRunes(cp["summary"], 140)
+			trimmed = append(trimmed, cp)
+		}
+		data["finding_list"] = trimmed
+	}
+	if hs, ok := data["hints"].([]map[string]any); ok {
+		filtered := make([]map[string]any, 0, len(hs))
+		for _, h := range hs {
+			txt, _ := h["text"].(string)
+			if isNonWorkerHint(txt) {
+				continue
+			}
+			filtered = append(filtered, h)
+			if len(filtered) >= 8 {
+				break
+			}
+		}
+		data["hints"] = filtered
+	}
 	b, err := json.Marshal(data)
 	if err != nil {
 		return "" // fall back silently: the worker just won't have the global context
@@ -461,15 +527,18 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		// 因步数=夹逼窗口内步数先耗尽→回落 per-run 词。非 clamped 维持纯 per-run。
 		Settlement: settle,
 		// large tool output spills to cmd-output/ with a head + pointer (SDK tool.Capture);
-		// full output preserved on disk. 截断上限用 SDK 默认(30000 字符)。
-		ToolOutputDir: cmdOutDir(runDir),
-		Compaction:    compactionConfig(w.compactionWindow()), // long tool-heavy runs stay within the window
-		Todos:         actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
+		// full output preserved on disk. 单次返回头设为 16000 字符（完整原文落盘随时可 Read）。
+		ToolOutputDir:      cmdOutDir(runDir),
+		MaxToolOutputChars: 16000,
+		Compaction:         compactionConfig(w.compactionWindow()), // long tool-heavy runs stay within the window
+		Todos:              actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
 		NonStreaming:  w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:     w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
 	}
-	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
-		opts.Hooks = hooks
+	opts.Hooks = workerWriteCheckHook{
+		inner:  hooks,
+		writes: tsx.Writes,
+		nudged: new(bool),
 	}
 	if w.tx != nil { // persist raw LLM conversation; one file per worked intent
 		opts.Transcript = w.tx
@@ -494,6 +563,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	noaSession := WorkerSessionID(ts.ID(), intent.ID)
 	enableNoa(&opts, w.noaEnabledFn, w.workDir, noaSession, noaWarn(noaSession))
 	ctx = attachSideCapture(ctx, &opts)
+	ctx = withTaskIdentity(ctx, intent)
 	s := agentcore.NewSession(opts)
 	defer s.Close() // release the session's background-task manager (temp dir + processes)
 
@@ -530,6 +600,104 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// enters the wrap-up phase on the live ctx, so a run whose tool overran the budget
 	// still settles (no external hard-timeout backstop needed). ctx itself carries only
 	// pause / planner kill / shutdown, which the engine distinguishes and re-queues/stops.
-	_, reason, err := captureRunSession(ctx, s, input, emitWrap)
+	finalText, reason, err := captureRunSession(ctx, s, input, emitWrap)
+	if err == nil && reason == harness.ReasonCompleted && isUpstreamFilterRefusal(finalText) {
+		return harness.ReasonModelError, tsx.Writes(), fmt.Errorf("upstream safety filter blocked response: %s", firstLine(finalText, 160))
+	}
 	return reason, tsx.Writes(), err
 }
+
+// isUpstreamFilterRefusal detects when a relay/fallback provider (e.g. Gemini)
+// returns an HTTP 200 completion whose body is a canned content-filter refusal
+// rather than real agent output.
+func isUpstreamFilterRefusal(text string) bool {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"Generative AI Prohibited Use policy",
+		"The prompt could not be submitted. The prompt contains sensitive words",
+		"This request was blocked by Gemini's filters",
+	} {
+		if strings.Contains(t, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+const unpersistedExitNudge = "【写回提醒】你准备结束本意图，但尚未调用 record_fact / insert_assets / report_finding 把任何结论或资产写回探索图（写进图才算数，只输出文字总结不会入库）。请先把本次探测的结论（包括否定结论或阶段性观察）调 record_fact 写回，再结束。"
+
+type workerWriteCheckHook struct {
+	inner  harness.HookRunner
+	writes func() WriteCounts
+	nudged *bool
+}
+
+func (h workerWriteCheckHook) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
+	if h.inner != nil {
+		return h.inner.PreToolUse(ctx, name, input)
+	}
+	return false, "", nil
+}
+
+func (h workerWriteCheckHook) PostToolUse(ctx context.Context, name string, input, result []byte, isErr bool) {
+	if h.inner != nil {
+		h.inner.PostToolUse(ctx, name, input, result, isErr)
+	}
+}
+
+func (h workerWriteCheckHook) Stop(ctx context.Context, messages []llm.Message) (bool, []string, string) {
+	var (
+		prevent  bool
+		blocking []string
+		msg      string
+	)
+	if h.inner != nil {
+		prevent, blocking, msg = h.inner.Stop(ctx, messages)
+	}
+	if prevent || len(blocking) > 0 || h.nudged == nil || *h.nudged || h.writes == nil {
+		return prevent, blocking, msg
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == llm.RoleAssistant {
+			if isUpstreamFilterRefusal(messages[i].Text()) {
+				return prevent, blocking, msg
+			}
+			break
+		}
+	}
+	hasToolHistory := false
+	for _, m := range messages {
+		if len(m.ToolUses()) > 0 {
+			hasToolHistory = true
+			break
+		}
+	}
+	if hasToolHistory && h.writes().Total() == 0 {
+		*h.nudged = true
+		return false, []string{unpersistedExitNudge}, ""
+	}
+	return prevent, blocking, msg
+}
+
+// withTaskIdentity attaches the intent's configured test identity to the
+// worker's HTTP context so outbound requests carry that identity's session.
+// Anonymous intents (identity_id absent/0) pass through unchanged.
+func withTaskIdentity(ctx context.Context, intent *db.Node) context.Context {
+	if intent == nil {
+		return ctx
+	}
+	var p struct {
+		IdentityID int64 `json:"identity_id"`
+	}
+	if err := json.Unmarshal(intent.Payload, &p); err != nil || p.IdentityID <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, taskIdentityIDKey, p.IdentityID)
+}
+
+type taskIdentityKey struct{}
+
+var taskIdentityIDKey = taskIdentityKey{}

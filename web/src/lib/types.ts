@@ -529,7 +529,6 @@ export interface Finding {
   summary: string;
   evidence: string;
   report?: string; // 详细报告(Markdown);仅详情接口返回,列表为空
-  report_conversation_id?: number;
   intent_id?: string;
   param_id?: string;
   task_id?: string;
@@ -1021,6 +1020,8 @@ export interface Settings {
   // worker/主 agent/对话)由 noa 接管上下文压缩,取代内置 compaction;每 run 读一次,对
   // 之后启动的 run 生效。
   noa_compaction?: boolean;
+  // CVSS v3.1 + CWE 定级校准开关(默认开)。report_finding 自动按 CVSS v3.1 算分并校准 severity。
+  cvss_enabled?: boolean;
   // 内置 compaction(冷节点压缩)的 body 调用预算。每次 compress 调用都重读,
   // 改完即对下一次压缩生效,无需重建 agent。
   compaction_max_tokens?: number; // 输出上限(含推理 token),默认 6000

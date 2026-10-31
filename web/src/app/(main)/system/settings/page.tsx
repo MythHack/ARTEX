@@ -11,6 +11,7 @@ import {
   SearchIcon,
   SettingsIcon,
   ShieldAlertIcon,
+  ShieldCheckIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -84,6 +85,8 @@ export default function SystemSettingsPage() {
   const [injectWorker, setInjectWorker] = React.useState(true);
   // 实验功能:noa 上下文压缩(默认关)。
   const [noaCompaction, setNoaCompaction] = React.useState(false);
+  // CVSS v3.1 + CWE 定级校准开关(默认开)。
+  const [cvssEnabled, setCvssEnabled] = React.useState(true);
   // 内置 compaction(冷节点压缩)的 body 调用预算;每次压缩调用都重读。
   const [compactionMaxTokens, setCompactionMaxTokens] = React.useState("6000");
   const [compactionThinking, setCompactionThinking] = React.useState("disabled");
@@ -121,6 +124,7 @@ export default function SystemSettingsPage() {
     setInjectPlanner(s.constraints_inject_planner !== false);
     setInjectWorker(s.constraints_inject_worker !== false);
     setNoaCompaction(!!s.noa_compaction);
+    setCvssEnabled(s.cvss_enabled !== false);
     setCompactionMaxTokens(String(s.compaction_max_tokens ?? 6000));
     setCompactionThinking(s.compaction_thinking === "enabled" ? "enabled" : "disabled");
   }, []);
@@ -344,6 +348,20 @@ export default function SystemSettingsPage() {
       })
       .catch((e) => {
         setNoaCompaction(!v); // revert on failure
+        toast.error(`保存失败：${(e as Error).message}`);
+      });
+  };
+
+  const toggleCVSSEnabled = (v: boolean) => {
+    setCvssEnabled(v);
+    api
+      .setSettings({ cvss_enabled: v })
+      .then((s) => {
+        apply(s);
+        toast.success(v ? "已开启 CVSS v3.1 + CWE 定级校准" : "已关闭 CVSS 定级校准（保留模型传入 severity）");
+      })
+      .catch((e) => {
+        setCvssEnabled(!v);
         toast.error(`保存失败：${(e as Error).message}`);
       });
   };
@@ -962,6 +980,30 @@ export default function SystemSettingsPage() {
                   checked={noaCompaction}
                   disabled={!loaded}
                   onCheckedChange={toggleNoaCompaction}
+                />
+              </CardContent>
+            </Card>
+
+            <Card className="mb-4 break-inside-avoid md:mb-6">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <ShieldCheckIcon className="size-4" />
+                  CVSS v3.1 + CWE 定级校准
+                </CardTitle>
+                <CardDescription>
+                  开启后 <code>report_finding</code> 将按 CVSS v3.1 标准公式自动算分并校准 severity，
+                  同时支持 CWE 弱点归类与同源去重。关闭后保留模型传入的 severity，不做 CVSS 实算。
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="flex items-center justify-between gap-4">
+                <Label htmlFor="cvss-enabled" className="text-sm font-normal text-muted-foreground">
+                  CVSS v3.1 + CWE 定级校准{cvssEnabled ? " · 已开启" : " · 已关闭"}
+                </Label>
+                <Switch
+                  id="cvss-enabled"
+                  checked={cvssEnabled}
+                  disabled={!loaded}
+                  onCheckedChange={toggleCVSSEnabled}
                 />
               </CardContent>
             </Card>

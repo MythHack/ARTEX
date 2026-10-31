@@ -299,6 +299,8 @@ const (
 	// 上截断成空正文)、thinking=disabled。每次 compress 调用都重读,改完即生效。
 	settingCompactionMaxTokens = "compaction_max_tokens"
 	settingCompactionThinking  = "compaction_thinking"
+	// CVSS v3.1 + CWE 定级校准开关(默认开)。开启后 report_finding 自动按 CVSS v3.1 算分并校准 severity。
+	settingCVSSEnabled = "cvss_enabled"
 	// defaultWebSearchBackend is used when web search is on but no backend was picked.
 	defaultWebSearchBackend = "ddgs"
 	// deepSeekWebSearchBackend borrows the active LLM profile instead of its own
@@ -688,6 +690,24 @@ func (m *Manager) NoaCompactionEnabled() bool {
 // the resolver reads it per run, so no rebuild is needed.
 func (m *Manager) SetNoaCompaction(on bool) error {
 	return m.pg.SetBool(settingNoaCompaction, on)
+}
+
+// CVSSEnabled reports whether CVSS v3.1 + CWE rating calibration is on
+// (默认开;settings.cvss_enabled). Read per report_finding call.
+func (m *Manager) CVSSEnabled() bool {
+	if m.pg == nil {
+		return true
+	}
+	v, ok, _ := m.pg.GetSetting(settingCVSSEnabled)
+	if !ok {
+		return true
+	}
+	return v == "true" || v == "1"
+}
+
+// SetCVSSEnabled persists the CVSS toggle. Effective on the next report_finding.
+func (m *Manager) SetCVSSEnabled(on bool) error {
+	return m.pg.SetBool(settingCVSSEnabled, on)
 }
 
 // CompactionMaxTokens returns the built-in compaction body-call output cap
@@ -2276,4 +2296,23 @@ func (t *Task) drainTriggers() []agent.TriggerEvent {
 	ev := t.pendingTriggers
 	t.pendingTriggers = nil
 	return ev
+}
+
+// canCoalesceTriggers reports whether the currently queued trigger events are
+// purely routine worker-done events (1..2 of them) with no finding or human
+// goal/hint/cancel directive. When true and the frontier still has unclaimed
+// intents, the planner loop can wait a longer coalescing window so parallel
+// worker completions batch into a single planning round.
+func (t *Task) canCoalesceTriggers(maxDoneBatch int) bool {
+	t.trigMu.Lock()
+	defer t.trigMu.Unlock()
+	if len(t.pendingTriggers) == 0 || len(t.pendingTriggers) >= maxDoneBatch {
+		return false
+	}
+	for _, ev := range t.pendingTriggers {
+		if ev.Kind != "done" {
+			return false
+		}
+	}
+	return true
 }

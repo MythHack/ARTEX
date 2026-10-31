@@ -11,7 +11,6 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -475,16 +474,6 @@ func (s *Server) toolUpdateFindingReport() actool.CoreTool {
 				if err := s.checkCaseReviewScope(ctx, "update_finding_report", findingCaseRequest{FindingID: json.RawMessage(i64s(fid))}); err != nil {
 					return actool.Errorf(err.Error()), nil
 				}
-				if f, err := s.m.pg.GetFinding(fid); err == nil && f != nil && f.TaskID != nil {
-					if err := s.archiveFindingScreenshots(*f.TaskID, a.Report); err != nil {
-						return actool.Errorf("归档报告截图失败: " + err.Error()), nil
-					}
-				}
-				if conversationID := intercept.ConvIDFromContext(ctx); conversationID > 0 {
-					if err := s.m.pg.SetFindingReportConversationID(fid, conversationID); err != nil {
-						return actool.Errorf("关联报告对话失败: " + err.Error()), nil
-					}
-				}
 			}
 			n, err := s.m.pg.SetFindingReportVersionByNodeID(ctx, nodeID, a.Report, a.EvidenceVersion)
 			if err != nil {
@@ -541,8 +530,9 @@ func (s *Server) seedOrchestrationTools() {
 	s.unbindGoalMetDefault()
 	s.reseedGoalsPrompt()             // goals 提示词加入「抽操作约束」步 → 旧库追加一版新默认(一次性)
 	s.reseedMainAgentPrompt()         // mainagent 提示词加入「目标达成后 add_intent 反问是否建目标」(一次性)
-	s.reseedPlannerPrompt()           // planner 提示词:重写「0 意图」正当理由 + 加量化验收核对(一次性)
-	s.reseedWorkerPrompt()            // worker 提示词:加否定结论证据门槛(一次性)
+	s.reseedPlannerPrompt()           // planner 提示词:重写「0 意图」正当理由 + 加量化验收核对 + CVSS 原语深挖导向(一次性)
+	s.reseedWorkerPrompt()            // worker 提示词:加 CVSS v3.1 实证定级红线与原语分流规则(一次性)
+	s.reseedPentestAndReporterPrompts() // pentest/reporter 提示词:同步 CVSS v3.1 + CWE 定级与报告展示规范(一次性)
 	s.seedReporterAgent()             // 预置「报告撰写」agent + 工具绑定 + finding 触发器(一次性)
 	s.upgradeReporterTriggerMessage() // 老库补迁移:让 reporter 回传 evidence_version(一次性)
 	s.migrateReporterWorkflow()       // 修复旧库残留的 reproduction 工具/提示词绑定
@@ -622,7 +612,7 @@ func (s *Server) migrateReporterWorkflow() {
 // reaches an old DB otherwise. Preserves each tool's agent binding + enabled flag.
 // Bump the flag whenever these tools' schemas/descriptions change in code.
 func (s *Server) refreshBuiltinToolSchemas() {
-	const flag = "tool_schema_refresh_v8_finding_case_tools"
+	const flag = "tool_schema_refresh_v9_cvss_cwe_finding"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -640,7 +630,7 @@ func (s *Server) refreshBuiltinToolSchemas() {
 	//     SeedTool 首插入only，旧库已 seed 的 schema 否则收不到这个新参数。
 	//   - list_facts：改为分页，新增 limit/before/q 入参；旧库已 seed 的空 schema 否则
 	//     在工具管理页显示「无参数」，模型也拿不到这几个参数说明。
-	refreshBuiltin := map[string]bool{"goal_met": true, "insert_assets": true, "list_facts": true}
+	refreshBuiltin := map[string]bool{"goal_met": true, "insert_assets": true, "list_facts": true, "report_finding": true}
 	for _, sd := range agent.BuiltinToolSeeds() {
 		if !refreshBuiltin[sd.Key] {
 			continue
@@ -738,7 +728,7 @@ func (s *Server) reseedMainAgentPrompt() {
 // 找回。settings flag 守卫 → 只做一次。全新库无需处理(SeedPromptIfEmpty 已 seed 最新默认)。与
 // reseedGoalsPrompt 完全同构。
 func (s *Server) reseedPlannerPrompt() {
-	const flag = "planner_prompt_compact_realistic_v2"
+	const flag = "planner_prompt_compact_realistic_v3_cvss"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -768,7 +758,7 @@ func (s *Server) reseedPlannerPrompt() {
 // SeedPromptIfEmpty 首插入only,旧库已有版本收不到,故用版本管理【追加一个新版本】并切过去,旧版本仍保留在历史里可找回。
 // settings flag 守卫 → 只做一次。全新库无需处理。与 reseedGoalsPrompt 完全同构。
 func (s *Server) reseedWorkerPrompt() {
-	const flag = "worker_prompt_compact_v4"
+	const flag = "worker_prompt_compact_v6_dedicated_tools"
 	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
 		return
 	}
@@ -790,6 +780,29 @@ func (s *Server) reseedWorkerPrompt() {
 		return
 	}
 	log.Printf("[prompts] worker 提示词已追加新默认版本(查上下文段收敛为 list_assets/list_findings,去掉 list_facts/node_detail/asset_neighbors,一次性)")
+}
+
+// reseedPentestAndReporterPrompts appends a new default prompt version for
+// pentest and reporter agents so existing databases pick up the CVSS v3.1 + CWE
+// rating and report-formatting rules.
+func (s *Server) reseedPentestAndReporterPrompts() {
+	const flag = "pentest_reporter_prompt_cvss_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	defer func() { _ = s.m.pg.SetSetting(flag, "true") }()
+	if a, err := s.m.pg.GetAgentByKey("pentest"); err == nil && a != nil {
+		tmpl := agent.BuiltinPromptSeeds()["pentest"]
+		if cur, err := s.m.pg.CurrentPrompt(a.ID); err == nil && cur != tmpl && tmpl != "" {
+			_, _ = s.m.pg.ResetPromptToDefault(a.ID, tmpl)
+		}
+	}
+	if a, err := s.m.pg.GetAgentByKey("reporter"); err == nil && a != nil {
+		tmpl := agent.ReporterDefaultPrompt
+		if cur, err := s.m.pg.CurrentPrompt(a.ID); err == nil && cur != tmpl && tmpl != "" {
+			_, _ = s.m.pg.ResetPromptToDefault(a.ID, tmpl)
+		}
+	}
 }
 
 // reporterToolCallMessage 必须无条件要求先读一次 get_finding_traffic 再写报告。
@@ -861,8 +874,8 @@ func (s *Server) seedReporterAgent() {
 	}
 	// 触发运行策略：parallel + none —— 一漏洞一报告、多个 finding 并发各写各的。
 	// merge 必须为 none：否则(默认 all)一波 finding 会被合并成一次运行，并行就没意义。
-	// maxParallel=5：同时最多 5 个报告会话，避免瞬时太多 LLM 调用。
-	if err := s.m.pg.SetAgentTriggerBehavior("reporter", "parallel", "none", 5); err != nil {
+	// maxParallel=2：同时最多 2 个报告会话，避免瞬时太多 LLM 调用冲击网关。
+	if err := s.m.pg.SetAgentTriggerBehavior("reporter", "parallel", "none", 2); err != nil {
 		log.Printf("[reporter] 设置触发运行策略失败: %v", err)
 	}
 	// 绑定它需要的工具：写报告 + 读证据/执行过程/态势。

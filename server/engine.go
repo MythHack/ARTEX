@@ -72,6 +72,8 @@ const (
 	modelErrorRetries      = 2               // model_error 收场后额外重试的次数
 	modelErrorRetryBackoff = 3 * time.Second // 每次重试前的退避
 	workControlWaitTimeout = 30 * time.Second
+	plannerCoalesceWindow  = 45 * time.Second // 队列充足且仅有普通 done 事件时的规划合并窗口
+	plannerCoalesceBatch   = 3                // 攒够 N 个 done 事件即提前结束合并立即规划
 )
 
 var errWorkControlConflict = errors.New("work control conflict")
@@ -889,9 +891,36 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	drain:
 		for {
 			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
 			case <-t.notify:
 			case <-timer.C:
 				break drain
+			}
+		}
+		// 当本次唤醒仅由 1~2 个普通 worker done 触发（无新 finding、无人工增改目标/提示/取消）、
+		// 且待领取队列仍有充足余量（frontier_open >= 2）时，开启合并窗口（最多 45s 或攒够 3 个事件），
+		// 避免 7~10 个并行 worker 相隔几秒完成时连续触发单事件重规划。一旦期间出现新 finding、
+		// 人工指令、队列降到 <2 或攒够 3 个完成事件，立即结束等待进入规划。
+		if src == "edge" && t.Store != nil && t.canCoalesceTriggers(plannerCoalesceBatch) {
+			if openCnt, err := t.Store.CountOpenIntents(); err == nil && openCnt >= 2 {
+				coalesceTimer := time.NewTimer(plannerCoalesceWindow)
+			coalesce:
+				for t.canCoalesceTriggers(plannerCoalesceBatch) {
+					if oc, err := t.Store.CountOpenIntents(); err != nil || oc < 2 {
+						break
+					}
+					select {
+					case <-ctx.Done():
+						coalesceTimer.Stop()
+						return
+					case <-t.notify:
+					case <-coalesceTimer.C:
+						break coalesce
+					}
+				}
+				coalesceTimer.Stop()
 			}
 		}
 		planner, _ := e.snapshotFor(t)

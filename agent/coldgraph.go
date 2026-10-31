@@ -49,7 +49,7 @@ type coldParams struct {
 	MaxMembers int
 }
 
-func defaultColdParams() coldParams { return coldParams{R: 6, K: 2, MaxMembers: 24} }
+func defaultColdParams() coldParams { return coldParams{R: 6, K: 2, MaxMembers: 16} }
 
 // coldGraph is an in-memory adjacency view over real exploration edges. The
 // derived view layer (kind=digest nodes, rel=covers edges) is filtered out at

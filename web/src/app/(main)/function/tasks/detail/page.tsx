@@ -46,6 +46,7 @@ import { BroadcastTab } from "./_tabs/broadcast-tab";
 import { CoverageGraphTab } from "./_tabs/coverage-graph-tab";
 import { FindingsTab } from "./_tabs/findings-tab";
 import { GraphTab } from "./_tabs/graph-tab";
+import { IdentitiesTab } from "./_tabs/identities-tab";
 import { InterceptTab } from "./_tabs/intercept-tab";
 import { OverviewTab } from "./_tabs/overview-tab";
 import { ReportTab } from "./_tabs/report-tab";
@@ -59,6 +60,7 @@ const TABS = [
   { value: "broadcast", label: "播报板" },
   { value: "findings", label: "发现" },
   { value: "intelligence", label: "任务情报" },
+  { value: "identities", label: "身份管理" },
   { value: "retests", label: "复测" },
   { value: "traffic", label: "流量" },
   { value: "assets", label: "测试资产" },
@@ -463,6 +465,9 @@ function TaskDetailInner() {
         </TabsContent>
         <TabsContent value="findings" className="mt-0">
           <FindingsTab taskId={id} />
+        </TabsContent>
+        <TabsContent value="identities" className="mt-0">
+          <IdentitiesTab taskId={id} />
         </TabsContent>
         <TabsContent value="retests" className="mt-0">
           <RetestsTab key={id} taskId={id} />
