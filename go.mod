@@ -15,6 +15,7 @@ require (
 	golang.org/x/crypto v0.55.0
 	golang.org/x/net v0.58.0
 	golang.org/x/text v0.41.0
+	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.52.0
 )
 
@@ -56,8 +57,11 @@ require (
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/tools v0.49.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 	modernc.org/libc v1.72.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+// norma 为本项目核心 agent 基建，原上游 github.com/Autumn-27/norma 曾发生仓库删除。
+// 将解析重定向到维护者 fork（内容 = 上游 v0.4.4，fork 内 module 声明保持原路径），彻底解耦单点依赖。
+replace github.com/Autumn-27/norma => github.com/chu0119/Norma v0.4.4

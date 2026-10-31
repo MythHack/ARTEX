@@ -787,9 +787,14 @@ CREATE TABLE IF NOT EXISTS agents (
     llm_profile_id    BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL,
     current_prompt_id BIGINT,
     max_turns         INTEGER NOT NULL DEFAULT 0,
-    run_seconds       INTEGER NOT NULL DEFAULT 1200,
+    -- run_seconds 是**单条意图一次 run** 的墙钟上限。0 = 不限。
+    -- 3600(60 分钟)的由来:实测 1200(20 分钟)对一条渗透意图太短——挖一个目标的
+    -- 多个漏洞经常做不完,run 到点即判 exhausted,而 exhausted 是**终态**、不会
+    -- 被自动重新领取,这条线索就断了(已发现的事实/资产/漏洞仍会写回)。
+    run_seconds       INTEGER NOT NULL DEFAULT 3600,
     web_search        BOOLEAN NOT NULL DEFAULT false,
     interactive_shell BOOLEAN NOT NULL DEFAULT false,
+    local_exec        BOOLEAN NOT NULL DEFAULT true,
     wrapup_prompt     TEXT NOT NULL DEFAULT '',
     wrapup_max_turns  INTEGER NOT NULL DEFAULT 0,
     task_timeout_wrapup_prompt    TEXT NOT NULL DEFAULT '',
@@ -805,10 +810,16 @@ CREATE TABLE IF NOT EXISTS agents (
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS trigger_run_mode     TEXT    NOT NULL DEFAULT 'serial';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS trigger_merge_mode   TEXT    NOT NULL DEFAULT 'all';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS trigger_max_parallel INTEGER NOT NULL DEFAULT 5;
+-- local_exec = 该 agent 能否在本机执行命令/写文件(Bash/Write/Edit/交互式 Shell)。
+-- 默认 true(保持既有行为);平台编排类 agent(auto)默认 false,只经工具操作平台、把
+-- 执行动作派成任务,而不是自己在机器上跑(net_context/report_finding 那套仍照常)。
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS local_exec BOOLEAN NOT NULL DEFAULT true;
 -- per-agent LLM 绑定(agent 级默认模型):列自初版即在上方 CREATE 中,此 ALTER 仅为极旧库兜底(幂等)。
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS llm_profile_id BIGINT REFERENCES llm_profiles(id) ON DELETE SET NULL;
--- run_seconds 单次 run 墙钟默认 600→1200:只改列默认(影响将来新插入的行),不动旧库存量行。
-ALTER TABLE agents ALTER COLUMN run_seconds SET DEFAULT 1200;
+-- run_seconds 单次 run 墙钟默认 600→1200→3600:
+-- 1200(20 分钟)对一条渗透意图太短——实测大量意图以 exhausted 收场,而 exhausted
+-- 是终态、不会被自动重新领取。只改列默认(影响将来新插入的行),不动旧库存量行。
+ALTER TABLE agents ALTER COLUMN run_seconds SET DEFAULT 3600;
 CREATE INDEX IF NOT EXISTS idx_agents_llm_profile ON agents(llm_profile_id) WHERE llm_profile_id IS NOT NULL;
 DROP TRIGGER IF EXISTS trg_agents_upd ON agents;
 CREATE TRIGGER trg_agents_upd BEFORE UPDATE ON agents
@@ -1098,7 +1109,7 @@ CREATE TABLE IF NOT EXISTS intercept_rules (
     match_target    TEXT NOT NULL CHECK (match_target IN ('tool_name', 'tool_input')),
     match_type      TEXT NOT NULL CHECK (match_type IN ('string', 'regex')),
     pattern         TEXT NOT NULL,
-    action          TEXT NOT NULL CHECK (action IN ('allow', 'deny', 'ask')),
+    action          TEXT NOT NULL CHECK (action IN ('allow', 'deny', 'ask', 'judge')),
     message         TEXT NOT NULL DEFAULT '',
     timeout_enabled BOOLEAN NOT NULL DEFAULT true,
     timeout_seconds INTEGER NOT NULL DEFAULT 60,
@@ -1109,6 +1120,10 @@ CREATE TABLE IF NOT EXISTS intercept_rules (
 DROP TRIGGER IF EXISTS trg_intercept_rules_upd ON intercept_rules;
 CREATE TRIGGER trg_intercept_rules_upd BEFORE UPDATE ON intercept_rules
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+-- 已发版库的 action CHECK 里没有 'judge'（规则命中后交给模型裁决）。幂等重建约束。
+ALTER TABLE intercept_rules DROP CONSTRAINT IF EXISTS intercept_rules_action_check;
+ALTER TABLE intercept_rules ADD CONSTRAINT intercept_rules_action_check
+    CHECK (action IN ('allow', 'deny', 'ask', 'judge'));
 
 CREATE TABLE IF NOT EXISTS intercept_pending (
     id              BIGSERIAL PRIMARY KEY,
@@ -1167,6 +1182,11 @@ CREATE TABLE IF NOT EXISTS findings (
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS name   TEXT NOT NULL DEFAULT '';
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report TEXT NOT NULL DEFAULT '';
+-- 上报指纹:hash(归一(vulnclass|name|asset_ids))。同一任务内同指纹的重复上报
+-- 不再插新行,而是把证据合并进已有记录(RecordFindingTx);resolved 等终态
+-- 不参与合并(修复后再复现 = 值得新开一条)。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS fingerprint TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_findings_task_fp ON findings(task_id, fingerprint) WHERE task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_findings_task ON findings(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_time ON findings(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, created_at DESC);
@@ -1631,3 +1651,93 @@ CREATE INDEX IF NOT EXISTS idx_task_intelligence_assets ON task_intelligence USI
 
 -- Optional derived credential presentation; raw intelligence remains authoritative.
 ALTER TABLE task_intelligence ADD COLUMN IF NOT EXISTS credential_analysis JSONB;
+-- ============================================================================
+-- 漏洞情报库（vulnintel）：定期同步的公开 CVE/PoC 情报，供 agent 在识别目标
+-- 组件后直接检索已知漏洞与现成利用，而不是每次靠模型现想。
+-- 数据全部来自公开源（NVD / CISA KEV），同步走全局出口代理。
+-- ============================================================================
+
+-- CVE 主表：按 NVD 记录 upsert（cve_id 唯一）。kev 列由 CISA KEV feed 单独回填，
+-- 两路同步互不覆盖对方写的列。
+CREATE TABLE IF NOT EXISTS vuln_cves (
+    id             BIGSERIAL PRIMARY KEY,
+    cve_id         TEXT NOT NULL UNIQUE,
+    -- nvd = NVD 全量/增量记录；来源标记保留给后续 OSV 等第二来源合并。
+    source         TEXT NOT NULL DEFAULT 'nvd',
+    title          TEXT NOT NULL DEFAULT '',
+    description    TEXT NOT NULL DEFAULT '',
+    -- 由 CVSS 分数映射：CRITICAL/HIGH/MEDIUM/LOW/NONE/UNKNOWN（无评分时）。
+    severity       TEXT NOT NULL DEFAULT 'UNKNOWN',
+    cvss_score     DOUBLE PRECISION,
+    cvss_vector    TEXT NOT NULL DEFAULT '',
+    published_at   TIMESTAMPTZ,
+    modified_at    TIMESTAMPTZ,
+    -- NVD configurations 的 criteria 原文数组（cpe:2.3:... 字符串，含版本区间
+    -- 语法 versionEndExcluding 等）。由 LLM 在 search_vulns 结果上做版本语义
+    -- 判断——结构化区间匹配是后续批次的活。
+    cpe_criteria   JSONB,
+    refs           JSONB,
+    -- CISA KEV 在野利用标记与收录日期，kev.go 同步回填。
+    kev            BOOLEAN NOT NULL DEFAULT false,
+    kev_date_added TIMESTAMPTZ,
+    synced_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_vuln_cves_severity ON vuln_cves(severity);
+CREATE INDEX IF NOT EXISTS idx_vuln_cves_published ON vuln_cves(published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vuln_cves_kev ON vuln_cves(kev, published_at DESC) WHERE kev;
+-- 弱点分类（CWE-79 这类编号数组）：NVD weaknesses / GHSA cwes 两源写入。
+-- 用途：get_vuln/search_vulns 把 CWE 交给模型，并联动按 CWE 打标的
+-- 方法论 skill（server 侧 LoadSkillTags 的 cwe 标签）。
+ALTER TABLE vuln_cves ADD COLUMN IF NOT EXISTS cwes TEXT[] NOT NULL DEFAULT '{}';
+
+-- 从 CPE criteria 提取的 (vendor, product) 倒排表：search_vulns 按 product 名
+-- 命中的索引。与 vuln_cves.cve_id 同生共死（upsert CVE 时先删后插）。
+CREATE TABLE IF NOT EXISTS vuln_cpe_products (
+    cve_id  TEXT NOT NULL,
+    vendor  TEXT NOT NULL DEFAULT '',
+    product TEXT NOT NULL,
+    PRIMARY KEY (cve_id, vendor, product)
+);
+CREATE INDEX IF NOT EXISTS idx_vuln_cpe_product ON vuln_cpe_products(product);
+-- 结构化版本区间(NVD cpeMatch 的 versionStart/End 字段,NULL=无该边界):
+-- 同一 (cve, vendor, product) 可能有多条不同区间的 cpeMatch,任一命中即算
+-- 该 CVE 影响该版本。criteria 字符串仍存 vuln_cves.cpe_criteria 供展示,
+-- 这里的四列供 search_vulns 做结构化版本判断。
+ALTER TABLE vuln_cpe_products ADD COLUMN IF NOT EXISTS version_start_incl TEXT;
+ALTER TABLE vuln_cpe_products ADD COLUMN IF NOT EXISTS version_start_excl TEXT;
+ALTER TABLE vuln_cpe_products ADD COLUMN IF NOT EXISTS version_end_incl   TEXT;
+ALTER TABLE vuln_cpe_products ADD COLUMN IF NOT EXISTS version_end_excl   TEXT;
+
+-- PoC/利用聚合（第二批填充；表先落，get_poc 工具后续接入）。
+CREATE TABLE IF NOT EXISTS vuln_pocs (
+    id        BIGSERIAL PRIMARY KEY,
+    cve_id    TEXT NOT NULL,
+    -- github / exploit-db / nuclei …
+    source    TEXT NOT NULL,
+    url       TEXT NOT NULL,
+    title     TEXT NOT NULL DEFAULT '',
+    -- poc / exploit / template / advisory
+    kind      TEXT NOT NULL DEFAULT 'poc',
+    stars     INTEGER NOT NULL DEFAULT 0,
+    synced_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (source, url)
+);
+CREATE INDEX IF NOT EXISTS idx_vuln_pocs_cve ON vuln_pocs(cve_id);
+
+-- 同步水位：每个数据源一行。cursor 存 NVD lastModStartDate（ISO8601），
+-- KEV 无游标语义（全量覆盖），cursor 留空。
+--
+-- page_cursor 存**窗口内的分页进度**（格式 "<窗口起>|<startIndex>"）。NVD 的
+-- 一个 120 天窗口能到十几万条（71 页 × 约 17 秒 + 限速延时），单轮 30 分钟
+-- 的 MaxRuntime 跑不完；而游标只按「窗口」推进，窗口内失败就整窗重跑——游标
+-- 永远卡在同一个窗口，每轮都白跑。实测：游标停在 2026-06-10，最后那个窗口
+-- 反复超时，NVD 的 40 万条目录补了 14 万条就再也补不上。
+CREATE TABLE IF NOT EXISTS vuln_sync_state (
+    source        TEXT PRIMARY KEY,
+    last_sync_at  TIMESTAMPTZ,
+    cursor        TEXT NOT NULL DEFAULT '',
+    total_synced  BIGINT NOT NULL DEFAULT 0,
+    last_error    TEXT NOT NULL DEFAULT '',
+    enabled       BOOLEAN NOT NULL DEFAULT true
+);
+ALTER TABLE vuln_sync_state ADD COLUMN IF NOT EXISTS page_cursor TEXT NOT NULL DEFAULT '';
