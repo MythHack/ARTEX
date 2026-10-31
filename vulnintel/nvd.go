@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -189,7 +190,24 @@ func (c *NvdClient) fetch(ctx context.Context, q url.Values) (*nvdResponse, erro
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("nvd api status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		detail := strings.TrimSpace(string(body))
+		if msgHdr := strings.TrimSpace(resp.Header.Get("message")); msgHdr != "" {
+			if detail != "" {
+				detail = msgHdr + " (" + detail + ")"
+			} else {
+				detail = msgHdr
+			}
+			// NVD returns HTTP 404 with header `message: Invalid apiKey.` when an
+			// expired/unactivated/mistyped key is sent. Drop the bad key for the
+			// rest of this client's run and retry once anonymously under the
+			// anonymous rate limit so sync keeps working instead of failing every page.
+			if resp.StatusCode == http.StatusNotFound && c.APIKey != "" && strings.Contains(strings.ToLower(msgHdr), "invalid apikey") {
+				log.Printf("[vulnintel] NVD API Key 无效（%s），自动降级为匿名同步（5 次/30s）；请在「系统 → 漏洞情报」更新或清空 NVD API Key", msgHdr)
+				c.APIKey = ""
+				return c.fetch(ctx, q)
+			}
+		}
+		return nil, fmt.Errorf("nvd api status %d: %s", resp.StatusCode, detail)
 	}
 	var out nvdResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
