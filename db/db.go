@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -254,6 +255,16 @@ ON CONFLICT (agent_id, var_name) DO UPDATE
 		}
 		_ = d.SetSetting("interactive_shell_default_v1", "true")
 	}
+	// Auto 天生是「平台操作助手」:它该用 spawn_task 把渗透需求派成任务,而不是自己拿
+	// Bash/Write 在机器上跑。给它 Bash 时模型几乎必然自己动手(实测:派任务后 Auto 直接
+	// 写了个 Python 扫描器扫穿 10.10.0.0/16,一个任务都没建)——所以默认关掉它的本地执行。
+	// 一次性 + flag 守卫:用户之后想给它开回来,重启不会再被强制关掉。
+	if v, _, _ := d.GetSetting("local_exec_default_v1"); v != "true" {
+		if _, err := d.Exec(`UPDATE agents SET local_exec=false WHERE key='auto'`); err != nil {
+			return fmt.Errorf("seed local_exec defaults: %w", err)
+		}
+		_ = d.SetSetting("local_exec_default_v1", "true")
+	}
 	// Seed the built-in browser (Playwright) MCP once — DISABLED by default (用户
 	// 需要时自行启用), no proxy by default. The traffic-capture toggle injects/strips
 	// the recording proxy + CA at runtime (server.Manager.syncBrowserMCPProxy).
@@ -280,6 +291,30 @@ ON CONFLICT (name) DO NOTHING`,
 	}
 	if err := d.seedDefaultInterceptRulesV3(); err != nil {
 		return fmt.Errorf("seed intercept rules v3: %w", err)
+	}
+	if err := d.seedDefaultInterceptRulesV4(); err != nil {
+		return fmt.Errorf("seed intercept rules v4: %w", err)
+	}
+	if err := d.seedDefaultInterceptRulesV5(); err != nil {
+		return fmt.Errorf("seed intercept rules v5: %w", err)
+	}
+	if err := d.migrateListenerRuleTimeout(); err != nil {
+		return fmt.Errorf("migrate listener rule timeout: %w", err)
+	}
+	if err := d.migrateBuiltinRulePatterns(); err != nil {
+		return fmt.Errorf("migrate builtin rule patterns: %w", err)
+	}
+	if err := d.migrateBuiltinRuleActions(); err != nil {
+		return fmt.Errorf("migrate builtin rule actions: %w", err)
+	}
+	if err := d.migrateJudgeTimeoutSeconds(); err != nil {
+		return fmt.Errorf("migrate judge timeout: %w", err)
+	}
+	if err := d.migrateAgentRunSeconds(); err != nil {
+		return fmt.Errorf("migrate agent run seconds: %w", err)
+	}
+	if err := d.migrateContextWindowK(); err != nil {
+		return fmt.Errorf("migrate context window k: %w", err)
 	}
 	if err := d.seedDefaultAssetInterceptRules(); err != nil {
 		return fmt.Errorf("seed asset intercept rules: %w", err)
@@ -325,6 +360,10 @@ ON CONFLICT DO NOTHING`, r.kind, r.pattern, r.note); err != nil {
 // that MCP is enabled/configured.
 var builtinSkillVisibility = map[string][]string{
 	"api-recon": {"auto", "pentest", "worker"},
+	// vuln-hunting：主动漏洞挖掘方法论（七个维度：对象换位/流程拆解/状态机/
+	// 数据边界/资源假设/错误路径/组合）。绑给 planner（它决定派不派「挖未知
+	// 漏洞」类意图）与 worker（它执行这条意图时需要方法论）。
+	"vuln-hunting": {"planner", "worker"},
 }
 
 // seedBuiltinSkillVisibility binds the shipped built-in skills to their default
@@ -344,276 +383,344 @@ ON CONFLICT (agent_id, skill_name) DO NOTHING`, key, skillName); err != nil {
 	return nil
 }
 
-// seedDefaultInterceptRules inserts built-in safety intercept rules once on
-// first startup. The seed is gated by a settings flag so user edits (disable,
-// delete, re-order) are never overwritten on subsequent restarts.
-func (d *DB) seedDefaultInterceptRules() error {
-	if v, _, _ := d.GetSetting("intercept_default_rules_v1"); v == "done" {
+// seedBuiltinInterceptRulesBatch 插入一批内置拦截规则。
+//
+// 规则内容统一来自 builtinInterceptRules（db/intercept_builtin_rules.go）——那是
+// 内置规则的单一事实源，分类（明令禁止 / 交 Agent 研判 / 人工确认）也在那里
+// 声明并附带理由。这里只负责「插不插」。
+//
+// 分批是因为历史沿革：内置规则是逐批加上去的，每批有自己的 settings flag
+// （intercept_default_rules_v1…v4），已部署实例靠 flag 决定「这批还要不要插」。
+// 全新安装时四批依次执行，等价于一次性插全。
+//
+// flag 已置 done 的实例直接跳过——用户后来的禁用/删除/改动作都不会被复活。
+func (d *DB) seedBuiltinInterceptRulesBatch(batch, flag string) error {
+	if v, _, _ := d.GetSetting(flag); v == "done" {
 		return nil
 	}
-	type rule struct {
-		name     string
-		target   string // tool_name | tool_input
-		typ      string // string | regex
-		pattern  string
-		action   string
-		message  string
-		priority int
-	}
-	rules := []rule{
-		// ── 系统破坏性命令 (priority 100) ──────────────────────────────────
-		{
-			name:     "[内置] 递归强制删除 rm -rf",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `(?i)\brm\b.{0,80}(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*|--recursive|--no-preserve-root)`,
-			action:   "deny",
-			message:  "禁止执行递归强制删除（rm -rf / rm --recursive），可能永久损坏系统或靶机环境",
-			priority: 100,
-		},
-		{
-			name:     "[内置] 删除系统关键目录",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `\brm\b[^"'\n]{0,60}["'\s](/|/etc|/bin|/usr|/boot|/var|/lib|/sys|/proc|/dev|/sbin|/root)`,
-			action:   "deny",
-			message:  "禁止删除系统关键路径",
-			priority: 100,
-		},
-		{
-			name:     "[内置] 磁盘格式化 mkfs",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `\bmkfs\b`,
-			action:   "deny",
-			message:  "禁止格式化磁盘（mkfs）",
-			priority: 100,
-		},
-		{
-			name:     "[内置] 覆写磁盘设备 dd",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `\bdd\b[^|\n]{0,100}\bof=\s*/dev/[a-zA-Z]`,
-			action:   "deny",
-			message:  "禁止使用 dd 覆写磁盘设备",
-			priority: 100,
-		},
-		{
-			name:     "[内置] Fork 炸弹",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `:\(\)\s*\{[^}]*:\|:`,
-			action:   "deny",
-			message:  "禁止执行 Fork 炸弹",
-			priority: 100,
-		},
-		{
-			name:     "[内置] 关机 / 重启",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `\b(?:shutdown|reboot|halt|poweroff|init\s+[06])\b`,
-			action:   "deny",
-			message:  "禁止执行关机或重启命令",
-			priority: 100,
-		},
-		{
-			name:     "[内置] 杀死全部进程",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `\bkill\s+-9\s+-1\b|\bkillall\s+-9\b`,
-			action:   "deny",
-			message:  "禁止 kill -9 -1 或 killall -9（杀死所有进程）",
-			priority: 100,
-		},
-		{
-			name:     "[内置] 磁盘擦除 shred / wipe",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `\b(?:shred|wipe)\b[^|\n]{0,80}/dev/[a-zA-Z]`,
-			action:   "deny",
-			message:  "禁止对磁盘设备执行 shred/wipe 擦除",
-			priority: 100,
-		},
-		{
-			name:     "[内置] 清空防火墙规则",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `\biptables\s+(?:-F|--flush)\b|\bnft\s+flush\s+ruleset\b`,
-			action:   "deny",
-			message:  "禁止清空防火墙规则（iptables -F / nft flush）",
-			priority: 100,
-		},
-		// ── 数据库破坏性操作 (priority 90) ─────────────────────────────────
-		{
-			name:     "[内置] SQL DROP DATABASE / TABLE / SCHEMA",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `(?i)\bDROP\s+(?:DATABASE|TABLE|SCHEMA|INDEX|VIEW|TABLESPACE|USER|ROLE)\b`,
-			action:   "deny",
-			message:  "禁止执行 DROP 操作，可能不可逆地销毁数据库对象",
-			priority: 90,
-		},
-		{
-			name:     "[内置] SQL TRUNCATE",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `(?i)\bTRUNCATE\s+(?:TABLE\s+)?\w`,
-			action:   "deny",
-			message:  "禁止执行 TRUNCATE，可能清空数据表所有数据",
-			priority: 90,
-		},
-		{
-			name:     "[内置] MongoDB drop / dropDatabase",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `(?i)\.(?:dropDatabase|dropCollection|drop)\s*\(`,
-			action:   "deny",
-			message:  "禁止执行 MongoDB drop 操作",
-			priority: 90,
-		},
-		{
-			name:     "[内置] Redis FLUSHALL / FLUSHDB",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `(?i)\b(?:FLUSHALL|FLUSHDB)\b`,
-			action:   "deny",
-			message:  "禁止执行 Redis FLUSHALL / FLUSHDB，可能清空全部缓存数据",
-			priority: 90,
-		},
-		// ── HTTP 破坏性请求 (priority 80) ──────────────────────────────────
-		// Agent 发送 DELETE 请求的三种常见方式：
-		//   1. curl -X DELETE / --request DELETE（Bash 工具直接执行或写入脚本）
-		//   2. Python HTTP 客户端 .delete() 方法
-		//   3. JS/通用脚本里的 method: 'DELETE' / method="DELETE"
-		{
-			name:     "[内置] curl / wget 发送 DELETE 请求",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `(?i)\bcurl\b[^|\n&;"]{0,300}(?:-X\s*DELETE|--request\s+DELETE|-XDELETE)|\bwget\b[^|\n&;"]{0,300}--method[=\s]+DELETE`,
-			action:   "deny",
-			message:  "禁止通过 curl/wget 发送 HTTP DELETE 请求，可能删除目标系统数据",
-			priority: 80,
-		},
-		{
-			name:     "[内置] Python HTTP 客户端 DELETE（requests/httpx/aiohttp）",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `(?i)\b(?:requests|httpx|aiohttp|urllib\.request)\.delete\s*\(|session\.delete\s*\(|client\.delete\s*\(`,
-			action:   "deny",
-			message:  "禁止使用 Python HTTP 客户端发送 DELETE 请求",
-			priority: 80,
-		},
-		{
-			name:     "[内置] 脚本中声明 HTTP DELETE 方法（JS/通用）",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `(?i)axios\.delete\s*\(|method\s*[:=]\s*['"]DELETE['"]`,
-			action:   "deny",
-			message:  "禁止在脚本中声明并发送 HTTP DELETE 请求",
-			priority: 80,
-		},
-		{
-			name:     "[内置] 批量清空 / 清除接口路径",
-			target:   "tool_input",
-			typ:      "regex",
-			pattern:  `(?i)/(?:clear|wipe|flush|purge|truncate|drop|destroy|factory[-_]reset|reset[-_]all)(?:[/?#"'\s]|$)`,
-			action:   "deny",
-			message:  "禁止调用批量清空或销毁类接口（/clear /wipe /flush /purge 等）",
-			priority: 80,
-		},
-	}
-	for _, r := range rules {
+	for _, r := range builtinInterceptRules {
+		if r.seedBatch != batch {
+			continue
+		}
 		if _, err := d.Exec(`
 INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
-VALUES ($1, true, $2, $3, $4, $5, $6, $7, false, 60, 'deny')
+VALUES ($1, true, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 ON CONFLICT DO NOTHING`,
 			r.name, r.priority, r.target, r.typ, r.pattern, r.action, r.message,
+			r.timeoutEnabled, r.timeoutSeconds, r.timeoutAction,
 		); err != nil {
 			return fmt.Errorf("rule %q: %w", r.name, err)
 		}
 	}
-	return d.SetSetting("intercept_default_rules_v1", "done")
+	return d.SetSetting(flag, "done")
+}
+
+// seedDefaultInterceptRules inserts built-in safety intercept rules once on
+// first startup. The seed is gated by a settings flag so user edits (disable,
+// delete, re-order) are never overwritten on subsequent restarts.
+func (d *DB) seedDefaultInterceptRules() error {
+	return d.seedBuiltinInterceptRulesBatch("v1", "intercept_default_rules_v1")
 }
 
 // seedDefaultInterceptRulesV2 migrates the two safety patterns that used to be
 // hard-coded in guard.go (destructive shell + data-exfil pipe) into ordinary
 // intercept rules. Gated by its own flag so it also lands on DBs that already ran
 // v1. Unlike the old guard.go floor, these are plain [内置] rules — the user can
-// disable or delete them. The exfil rule ships DISABLED by default (its
-// curl/wget/nc pipe pattern mis-fires on legitimate CTF/pentest reverse-shell and
-// data-transfer pipes); enable it manually when exfil gating is actually wanted.
+// disable or delete them.
 func (d *DB) seedDefaultInterceptRulesV2() error {
-	if v, _, _ := d.GetSetting("intercept_default_rules_v2"); v == "done" {
-		return nil
-	}
-	rules := []struct {
-		name     string
-		pattern  string
-		action   string
-		message  string
-		enabled  bool
-		priority int
-	}{
-		{
-			name:     "[内置] 破坏性系统命令",
-			pattern:  `(?i)\b(rm\s+-rf\s+/|mkfs|dd\s+if=|:\(\)\s*\{|shutdown|reboot|>\s*/dev/sd)`,
-			action:   "deny",
-			message:  "破坏性命令被拒绝（rm -rf / / mkfs / dd / fork bomb / 关机重启 / 覆写磁盘设备）",
-			enabled:  true,
-			priority: 100,
-		},
-		{
-			name:     "[内置] 数据外泄管道",
-			pattern:  `(?i)(curl|wget|nc|ncat)\b[^|]*\b(\|\s*(curl|wget|nc))`,
-			action:   "deny",
-			message:  "疑似数据外泄管道被拒绝（命令输出经 curl/wget/nc 外传）",
-			enabled:  false,
-			priority: 80,
-		},
-	}
-	for _, r := range rules {
-		if _, err := d.Exec(`
-INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
-VALUES ($1, $2, $3, 'tool_input', 'regex', $4, $5, $6, false, 60, 'deny')
-ON CONFLICT DO NOTHING`,
-			r.name, r.enabled, r.priority, r.pattern, r.action, r.message,
-		); err != nil {
-			return fmt.Errorf("rule %q: %w", r.name, err)
-		}
-	}
-	return d.SetSetting("intercept_default_rules_v2", "done")
+	return d.seedBuiltinInterceptRulesBatch("v2", "intercept_default_rules_v2")
 }
 
 // seedDefaultInterceptRulesV3 adds the delete-endpoint path rule. The v1 HTTP rules
-// only catch the DELETE *method* (curl -X DELETE, requests.delete(, method:'DELETE'),
-// and v1's path rule covers only /clear /wipe /flush /purge /truncate /drop /destroy
-// /factory-reset /reset-all — so a plain `curl 'http://t/api/user/delete?id=1'` (a
-// delete endpoint reached with GET/POST, which is how most web apps expose deletion)
-// slipped through every built-in rule. Own flag so it also lands on DBs that already
-// ran v1/v2, where editing the v1 seed would have no effect.
+// only catch the DELETE *method*, so a plain `curl 'http://t/api/user/delete?id=1'`
+// (a delete endpoint reached with GET/POST, which is how most web apps expose
+// deletion) would otherwise slip through every built-in rule.
 //
-// The pattern deliberately requires a separator after the verb so /delivery,
-// /details, /delta and /delegate do not match, while /deleteAll, /delete_user and
-// /delete-user do. destroy is re-covered here because v1's rule does not allow a
-// suffix (/destroyAll was missed).
+// deleteEndpointPathPattern 是「删除类接口路径」规则的正则。
 //
-// Exported as a package const only so the seeded regex is unit-testable without a DB.
-const deleteEndpointPathPattern = `(?i)/(?:(?:delete|remove|unlink|erase|destroy)[-\w]*|del)(?:[/?#"'\s]|$)`
+// 从内置规则表派生（而不是另抄一份）——规则的 pattern 只有一处定义，
+// 避免「改了表里的、忘了改常量里的」这种漂移。保留这个名字是为了让
+// 单元测试能在没有数据库的情况下直接断言这条正则。
+var deleteEndpointPathPattern = builtinRulePattern("[内置] 删除类接口路径")
 
 func (d *DB) seedDefaultInterceptRulesV3() error {
-	if v, _, _ := d.GetSetting("intercept_default_rules_v3"); v == "done" {
+	return d.seedBuiltinInterceptRulesBatch("v3", "intercept_default_rules_v3")
+}
+
+// seedDefaultInterceptRulesV4 re-seeds the callback-listener approval boundary
+// (v0.3.87: the listener tools got a real implementation, so the ask rule is
+// back and the intercept gate needs the tool names again).
+//
+// ⚠️ 升级路径缺陷的修复（2026-10-30 Kali 实测）：v4 的 flag 在 v0.3.86 已置
+// "done"——当时规则被删。直接走 batch 会在 flag 早退处返回，新规则永远落不到
+// 已有实例。所以这里在 flag 之外**按规则名补种**：规则行不存在就插入（存在
+// 则不动——用户对它的任何编辑保持有效）。
+func (d *DB) seedDefaultInterceptRulesV4() error {
+	if err := d.seedBuiltinInterceptRulesBatch("v4", "intercept_default_rules_v4_listener"); err != nil {
+		return err
+	}
+	// 按名补种：flag 早退也可能吞掉新规则（v0.3.86 全新装→v0.3.87 升级的实例）。
+	for _, r := range builtinInterceptRules {
+		if r.name != "[内置] 启停回连接收器" {
+			continue
+		}
+		var exists bool
+		if err := d.QueryRow(`SELECT EXISTS(SELECT 1 FROM intercept_rules WHERE name=$1)`, r.name).Scan(&exists); err != nil {
+			return fmt.Errorf("probe listener rule: %w", err)
+		}
+		if exists {
+			continue // 已有（可能是 v0.3.85 种的或用户编辑过的）——不动
+		}
+		if _, err := d.Exec(`
+INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
+VALUES ($1, true, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT DO NOTHING`,
+			r.name, r.priority, r.target, r.typ, r.pattern, r.action, r.message,
+			r.timeoutEnabled, r.timeoutSeconds, r.timeoutAction,
+		); err != nil {
+			return fmt.Errorf("reseed listener rule: %w", err)
+		}
+	}
+	// No persisted list means Interceptor uses its code defaults (which already
+	// include the listener tools). Existing installations need a one-time append.
+	if raw, ok, err := d.GetSetting("intercept_enabled_tools"); err != nil {
+		return err
+	} else if ok {
+		if merged, changed := mergeEnabledInterceptTools(raw, "listener_start", "listener_stop"); changed {
+			if err := d.SetSetting("intercept_enabled_tools", merged); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// mergeEnabledInterceptTools appends newly introduced tools to a persisted
+// intercept-enabled list without reordering or removing the user's choices. A
+// malformed setting is left untouched instead of silently replacing user data.
+func mergeEnabledInterceptTools(raw string, additions ...string) (string, bool) {
+	var tools []string
+	if err := json.Unmarshal([]byte(raw), &tools); err != nil {
+		return raw, false
+	}
+	seen := make(map[string]struct{}, len(tools)+len(additions))
+	for _, name := range tools {
+		seen[name] = struct{}{}
+	}
+	changed := false
+	for _, name := range additions {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		tools = append(tools, name)
+		seen[name] = struct{}{}
+		changed = true
+	}
+	if !changed {
+		return raw, false
+	}
+	encoded, err := json.Marshal(tools)
+	if err != nil {
+		return raw, false
+	}
+	return string(encoded), true
+}
+
+// migrateBuiltinRulePatterns 把两条实测误报的内置规则换成收窄后的正则。
+//
+// 误报（全部来自生产环境的拦截历史，都是合法的渗透探测命令）：
+//   rm -f /tmp_out.$$                     → 命中「删除系统关键目录」（裸 / 分支）
+//   rm -f /usr/share/nmap/scripts/_t.nse  → 同上
+//   for p in /api/.../reboot ...          → 命中「关机 / 重启」（路径里的 reboot）
+//
+// 规则是 first-insert only 的 seed，改代码对已部署实例无效，所以用一次性迁移
+// 同步 pattern。**只改 pattern，不改 action/enabled/priority**——用户自己把
+// 规则改成 judge 或停用的实例，行为保持。
+func (d *DB) migrateBuiltinRulePatterns() error {
+	const flag = "intercept_builtin_rule_patterns_v2"
+	if v, _, _ := d.GetSetting(flag); v == "done" {
 		return nil
 	}
-	const name = "[内置] 删除类接口路径"
+	updates := []struct{ name, pattern string }{
+		{
+			"[内置] 删除系统关键目录",
+			`\brm\b[^"'\n]{0,60}["'\s](/(?:etc|bin|usr|boot|var|lib|sys|proc|dev|sbin|root)(?:["'\s]|$|/(?:["'\s]|$)))`,
+		},
+		{
+			"[内置] 关机 / 重启",
+			`(?:^|[;&|]\s*|\b(?:sudo|doas)\s+)(?:shutdown|reboot|halt|poweroff)\b|\binit\s+[06]\b`,
+		},
+	}
+	for _, u := range updates {
+		if _, err := d.Exec(`UPDATE intercept_rules SET pattern=$2 WHERE name=$1`, u.name, u.pattern); err != nil {
+			return fmt.Errorf("rule %q: %w", u.name, err)
+		}
+	}
+	// 新增「清空系统关键目录」这条（rm -rf /var/lib/* 整棵清空）。
+	// 旧的「删除系统关键目录」收窄后不再覆盖这个形态，需要单独一条。
+	const clearName = "[内置] 清空系统关键目录"
 	if _, err := d.Exec(`
 INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
-SELECT $1, true, 80, 'tool_input', 'regex', $2, 'deny', $3, false, 60, 'deny'
+SELECT $1, true, 100, 'tool_input', 'regex', $2, 'deny', $3, false, 60, 'allow'
 WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
-		name,
-		deleteEndpointPathPattern,
-		"禁止调用删除类接口（/delete /remove /unlink /erase 等），不论使用哪种 HTTP 方法——多数应用的删除接口用 GET/POST 就能触发，同样会真实删除目标数据",
+		clearName,
+		`\brm\b[^"'\n]{0,120}["'\s][^"'\n]{0,80}/(?:etc|bin|usr|boot|var|lib|sys|proc|dev|sbin|root)/\*`,
+		"禁止清空系统关键目录下的内容",
 	); err != nil {
-		return fmt.Errorf("rule %q: %w", name, err)
+		return fmt.Errorf("rule %q: %w", clearName, err)
 	}
-	return d.SetSetting("intercept_default_rules_v3", "done")
+	return d.SetSetting(flag, "done")
+}
+
+// migrateContextWindowK 把 LLM 配置的上下文窗口从「未设置(按 200K 算)」改成
+// 显式的 1000K(1M)。
+//
+// 起因：本平台常用的 minimax-m3.1-flash-free 原生上下文是 1M(模型自报
+// 1000000)，而 profile 的 context_window_k 留空时代码按 200K(Claude 默认)
+// 算压缩阈值。于是压缩在远未到上限时就触发——压缩本身要额外调一次 LLM
+// (还要 32768 预算)，白白吃掉预算、拖慢流程。
+//
+// 只改仍为 0(未设置)的行:用户自己填过窗口大小的实例保持不变。
+func (d *DB) migrateContextWindowK() error {
+	const flag = "llm_profiles_context_window_1000k_v1"
+	if v, _, _ := d.GetSetting(flag); v == "done" {
+		return nil
+	}
+	if _, err := d.Exec(`UPDATE llm_profiles SET context_window_k=1000 WHERE COALESCE(context_window_k,0)=0`); err != nil {
+		return fmt.Errorf("context window k: %w", err)
+	}
+	return d.SetSetting(flag, "done")
+}
+
+// migrateAgentRunSeconds 把各 agent 的单次 run 墙钟预算从 3600s 调回 1200s。
+//
+// 背景：2026-10-20 的迁移（agents_run_seconds_3600_v1）把 1200s 提到 3600s，
+// 当时的判断是「给太紧」——实测生产环境里 89 个意图 exhausted vs 8 个 done。
+//
+// 那个归因是错的。exhausted 不是失败信号，是「这一小步没做完」的信号：上游
+// (ARTEX-upstream) 的种子默认就是 1200s，靠「短 run → exhausted → 规划者看
+// trace 判进度 → 续派或换打法」形成小步快跑的闭环，从来不需要长 run。
+//
+// 拉长到 3600s 反而把这个闭环拆了：run 拖到 1 小时，撞的几乎都是硬上限，
+// 规划者看到的一律是「运行超时」→ 续派同一条链 → 2026-10-21 实测 26 个意图
+// 里 4 个跑满 3600s 后 exhausted，合计 4.1 小时机时且零事实产出。
+//
+// 另一个当时的干扰因素已被单独修掉：上下文窗口从 200K 提到 1M。压缩过早
+// 触发会烧掉一整轮 LLM 预算，间接让意图显得「做不完」——那是上下文的问题，
+// 不是墙钟的问题。两个一起调，等于把两个变量混在一起归因到一个。
+//
+// 只改仍是 3600 的行：用户自己调过的实例保持不变。
+func (d *DB) migrateAgentRunSeconds() error {
+	const flag = "agents_run_seconds_1200_v2"
+	if v, _, _ := d.GetSetting(flag); v == "done" {
+		return nil
+	}
+	if err := d.applyAgentRunSeconds(3600, 1200); err != nil {
+		return err
+	}
+	return d.SetSetting(flag, "done")
+}
+
+// applyAgentRunSeconds 把 run_seconds=from 的行改成 to。
+//
+// 单独抽出来是为了能直接测「迁移方向」这个不变量：之前那个 1200→3600 的迁移
+// 就是走弯路的根源，而它是【一次性迁移】——跑过就没了，事后无从验证方向对错。
+// 保持它是可测的纯逻辑（而不是藏在一次性 flag 后面），才能用单测锁住。
+func (d *DB) applyAgentRunSeconds(from, to int) error {
+	if _, err := d.Exec(`UPDATE agents SET run_seconds=$2 WHERE run_seconds=$1`, from, to); err != nil {
+		return fmt.Errorf("agent run seconds %d->%d: %w", from, to, err)
+	}
+	return nil
+}
+
+// migrateJudgeTimeoutSeconds 把模型裁决的墙钟上限从 90s 提到 180s。
+//
+// 起因：思考型模型(MiniMax-M3.1 等强制 adaptive thinking 的)的裁决耗时随
+// 命令长度而变——实测短命令 4~26 秒，长命令(几百到上千字符的 shell 脚本)
+// 明显更久；而且正文为空时会升预算重试(32768 → 65536)，重试要挤在同一个
+// 超时窗口内。90s 会把「模型其实能裁决」误判成超时失败(实测生产环境里
+// 已有 24 条这种超时记录)。
+//
+// 只改仍是默认值 90 的实例：用户自己调过的值保持不变。
+func (d *DB) migrateJudgeTimeoutSeconds() error {
+	const flag = "intercept_judge_timeout_180_v1"
+	if v, _, _ := d.GetSetting(flag); v == "done" {
+		return nil
+	}
+	if _, err := d.Exec(`
+UPDATE settings SET value='180', updated_at=now()
+WHERE key='llm_judge_timeout_seconds' AND value IN ('90','90.0',' 90 ')`); err != nil {
+		return fmt.Errorf("judge timeout: %w", err)
+	}
+	return d.SetSetting(flag, "done")
+}
+
+// seedDefaultInterceptRulesV5 brings goal_met into the intercept system
+// (v0.3.88 体检 S3)：新增 judge 规则 + 把 goal_met 合进已保存的 enabled 工具集
+// （未保存的实例走代码默认 defaultEnabledTools，那里也已加入）。
+func (d *DB) seedDefaultInterceptRulesV5() error {
+	if err := d.seedBuiltinInterceptRulesBatch("v5", "intercept_default_rules_v5_goalmet"); err != nil {
+		return err
+	}
+	// 按名补种：flag 早退也可能吞掉新规则（V4 教训：v0.3.86 全新装→0.3.87 升级
+	// 的实例 listener 规则缺失——flag 在规则入目录前已置 done）。
+	for _, r := range builtinInterceptRules {
+		if r.seedBatch != "v5" {
+			continue
+		}
+		var exists bool
+		if err := d.QueryRow(`SELECT EXISTS(SELECT 1 FROM intercept_rules WHERE name=$1)`, r.name).Scan(&exists); err != nil {
+			return fmt.Errorf("probe v5 rule %q: %w", r.name, err)
+		}
+		if exists {
+			continue // 用户编辑过或已插入——不动
+		}
+		if _, err := d.Exec(`
+INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
+VALUES ($1, true, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT DO NOTHING`,
+			r.name, r.priority, r.target, r.typ, r.pattern, r.action, r.message,
+			r.timeoutEnabled, r.timeoutSeconds, r.timeoutAction,
+		); err != nil {
+			return fmt.Errorf("reseed v5 rule %q: %w", r.name, err)
+		}
+	}
+	// 已保存过 enabled 工具集的实例补 goal_met（V4 同款一次性 append）。
+	if raw, ok, err := d.GetSetting("intercept_enabled_tools"); err != nil {
+		return err
+	} else if ok {
+		if merged, changed := mergeEnabledInterceptTools(raw, "goal_met"); changed {
+			if err := d.SetSetting("intercept_enabled_tools", merged); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// migrateListenerRuleTimeout 把「启停回连接收器」这条 ask 规则的超时策略从
+// deny 改成 allow、时长从 300s 改成 180s。
+//
+// 起因：ask 会【同步阻塞】worker 等人批。操作员不在电脑前时 deny 等于把整条
+// 渗透链卡死在这条命令上。放行只影响这一条命令，事后仍可在「拦截审批」页看到
+// 记录并追认。
+//
+// seed 是 first-insert only（ON CONFLICT DO NOTHING），改 seed 对已部署实例
+// 无效，所以这里用一次性迁移补上。只改 timeout 字段，不碰 action——用户自己
+// 把规则改成 judge 的不受影响。
+func (d *DB) migrateListenerRuleTimeout() error {
+	const flag = "intercept_listener_rule_timeout_allow_v1"
+	if v, _, _ := d.GetSetting(flag); v == "done" {
+		return nil
+	}
+	if _, err := d.Exec(`
+UPDATE intercept_rules
+   SET timeout_enabled = true,
+       timeout_seconds = 180,
+       timeout_action = 'allow'
+ WHERE name = '[内置] 启停回连接收器'
+   AND timeout_action <> 'allow'`); err != nil {
+		return err
+	}
+	return d.SetSetting(flag, "done")
 }

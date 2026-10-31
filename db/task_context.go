@@ -566,6 +566,40 @@ WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, reason, id, s.expID)
 	return err
 }
 
+// Intent 终态原因码。写进 blocked_reason，用来回答「这个意图为什么停了」。
+//
+// 之前只有 llm_quota_exhausted 一个码，而且只有那条路径会写——exhausted
+// (撞步数上限/超时) 与 blocked (执行出错) 的原因**完全没落库**，于是
+// 「一堆子任务异常中断」在界面上看不到任何解释。exhausted 的 72 条与
+// blocked 的 40 条都只能看到一个空状态。
+const (
+	// IntentStopMaxTurns 撞步数上限：方向可能对，只是没做完（规划者据此换角度重试）。
+	IntentStopMaxTurns = "max_turns"
+	// IntentStopTimeout 运行超时。
+	IntentStopTimeout = "timeout"
+	// IntentStopError 执行出错（模型/网络/工具报错）。
+	IntentStopError = "error"
+	// IntentStopTaskTimeout 任务级超时收尾时被取消。
+	IntentStopTaskTimeout = "task_timeout"
+	// IntentStopTaskDone 任务已完成，本意图被取消（结果已无意义）。
+	IntentStopTaskDone = "task_done"
+	// IntentStopKilled 被规划者终止。
+	IntentStopKilled = "killed"
+)
+
+// SetIntentStopReason records WHY an intent stopped. Unlike SetIntentBlockedReason
+// it does not force the state to 'blocked' — it only writes blocked_reason, so
+// exhausted / stopped / blocked can all carry an explanation.
+//
+// reason should be a stable code (one of the IntentStop* constants) or a short
+// human-readable sentence; the UI shows it verbatim.
+func (s *ExplorationStore) SetIntentStopReason(id int64, reason string) error {
+	_, err := s.db.Exec(`UPDATE exploration_nodes
+SET blocked_reason=NULLIF($1,'')
+WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, reason, id, s.expID)
+	return err
+}
+
 func (s *ExplorationStore) ReopenIntentsByBlockedReason(reason string) (int64, error) {
 	res, err := s.db.Exec(`UPDATE exploration_nodes
 SET state='open', blocked_reason=NULL, completed_at=NULL

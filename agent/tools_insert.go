@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Autumn-27/artex/db"
 	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Autumn-27/artex/db"
 )
 
 // assetInterceptCandidates 提取一条待插入资产输入项的 域名/IP/URL 候选串，用于资产拦截匹配。
@@ -535,6 +535,29 @@ func (t *ToolSet) listUntestedAssets() actool.CoreTool {
 	)
 }
 
+// dslHint turns a DSL error into an actionable correction. The DSL error text
+// alone leaves the agent guessing the same wrong syntax again (observed: 42
+// failed list_assets calls, most of them the same "ip doesn't support >="
+// mistake, because nothing told it that CIDR lookups go through cidr=...).
+func dslHint(errMsg string) string {
+	switch {
+	case strings.Contains(errMsg, "不支持运算符"):
+		return "提示：字符串字段(ip/domain/url 等)只支持 = == !=（模糊/精确/排除），不支持 > >= < <=；" +
+			"要按数值比就用数字字段(port/status_code)；要按网段查用 cidr=10.10.0.0/16。"
+	case strings.Contains(errMsg, "DSL 语法错误"):
+		return "提示：表达式形如 字段=值，用 AND/OR 组合、括号分组；字段与运算符之间不要有空格；" +
+			"值里有空格或特殊字符时用引号包起来。"
+	case strings.Contains(errMsg, "未知字段"):
+		return "提示：可用字段：domain、root_domain、ip、cidr、url、page_title、icp、service_name、" +
+			"app_name、method、service_type、record_type、technology、port、status_code、company_id、task_id。"
+	case strings.Contains(errMsg, "需要整数值"):
+		return "提示：port/status_code/company_id 是整数，写成 port==443（用 == 或 =，不要加引号）。"
+	case strings.Contains(errMsg, "cidr"):
+		return "提示：cidr 要写成网段，如 10.10.0.0/16。"
+	}
+	return "提示：DSL 形如 字段=值；多个条件用 AND/OR 连接。字段清单见本工具描述。"
+}
+
 // listAssets lets an agent query the asset table.
 func (t *ToolSet) listAssets() actool.CoreTool {
 	return readTool(
@@ -542,8 +565,11 @@ func (t *ToolSet) listAssets() actool.CoreTool {
 		"查询资产库：DSL 表达式搜索，或按 id/ids 直取；支持分页。只返回【本任务及直接关联任务】测试范围内的资产。\n"+
 			"DSL：field=value 模糊(ILIKE) | field==value 精确 | field!=value 排除 | 数字字段支持 > >= < <= | 裸词=全文模糊；AND/OR 组合(AND 优先级高)，可用括号分组。资产类型用独立 type 参数，不写进 DSL。\n"+
 			"未传 id/ids 时 dsl 必须非空（不允许无条件全量查询）。\n"+
-			"可用字段：domain(根/子/服务域名)、root_domain、ip、url、page_title、icp、service_name、app_name、method(如 GET/POST)、service_type(http|other)、record_type(如 A/CNAME)、technology(数组，=模糊 ==精确)、port/status_code/company_id(整数)。\n"+
-			"示例：status_code>=400 AND technology=shiro ；(port==80 OR port==443) AND technology=nginx",
+			"可用字段：domain(根/子/服务域名)、root_domain、ip、cidr(网段，如 10.10.0.0/16)、url、page_title、icp、service_name、app_name、method(如 GET/POST)、service_type(http|other)、record_type(如 A/CNAME)、technology(数组，=模糊 ==精确)、port/status_code/company_id(整数)。\n"+
+			"**查某个网段用 cidr=10.10.0.0/16，不要用 ip>=10.0.0.0**（ip 是字符串字段，不支持大小比较）。\n"+
+			"**查空值用 field==\"\"**（精确匹配，同时覆盖空串与 NULL）；= 是模糊匹配、查不到空值。"+
+			"想找「已登记但还没测」的资产，用 list_untested_assets（它按类型分页给，比自己拼 DSL 省事）。\n"+
+			"示例：cidr=10.10.0.0/16 ；status_code>=400 AND technology=shiro ；(port==80 OR port==443) AND technology=nginx ；service_name==\"\"",
 		obj(map[string]any{
 			"dsl":    str(`DSL 查询表达式（语法/字段见工具描述）。未传 id/ids 时必须非空。`),
 			"type":   str("资产类型过滤：root_domain|ip|subdomain|app|service|endpoint（独立字段，可与 dsl 叠加；单独 type 不足以查询，仍需 dsl）"),
@@ -582,7 +608,10 @@ func (t *ToolSet) listAssets() actool.CoreTool {
 				return actool.Errorf("未传 id/ids 时 dsl 不能为空：不允许无条件查询全部资产，请提供查询条件"), nil
 			}
 			if err != nil {
-				return actool.Errorf("DSL 错误: " + err.Error()), nil
+				// DSL 错误必须**可执行**：只回一句「DSL 错误: 字符串字段 ip 不支持运算符 >=」
+				// 的话，agent 只会再猜一次同样的写法（实测 42 次这类错误）。补上
+				// 「正确写法」提示，agent 才能自己纠正。
+				return actool.Errorf("DSL 错误: " + err.Error() + "\n" + dslHint(err.Error())), nil
 			}
 			return jsonResult(map[string]any{
 				"count":  len(assets),
@@ -664,6 +693,19 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		t.searchAllWorkerTraces(), t.getWorkerTrace(),
 		// node_detail：worker 拿到 intent_id/节点 id 后可查该节点完整详情（配合上面的回看）。
 		t.nodeDetail(),
+		// search_vulns / get_vuln：worker 识别出目标组件与版本后直接查已知漏洞与
+		// 影响区间——公开情报优先于模型现想 payload。
+		t.searchVulns(), t.getVuln(), t.getPoc(), t.scanWithNuclei(), t.netContext(),
+		// listener_*：回连接收器（红队 C2 前置）——start/stop 走 ask 审批，sessions 只读。
+		t.listenerStart(), t.listenerStop(), t.listenerSessions(),
+		// auth_request：用资产上已登记的凭据组装带认证的请求（横向/越权验证的前提）。
+		t.authRequest(),
+		// diff_responses：对比两个响应的结构性差异（越权/可枚举/状态机三类的共同基础）。
+		t.diffResponses(),
+		// api_contract：读目标暴露的 API 契约文件，拿到比爬虫更准的接口清单。
+		t.apiContractTool(),
+		// search_recent_critical：按【时间】查最近披露的高危漏洞（不需先知道组件名/CVE 号）。
+		t.searchRecentCritical(),
 		// 以下工具仍【不给】worker，只留给 planner/main（读上下文、跨 work 复盘是规划职责，
 		// worker 只做单条意图的执行与写回）：list_facts / list_companies / list_worker_traces。
 	}
@@ -674,6 +716,9 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 	return []actool.CoreTool{
 		t.graphOverview(), t.listFindings(), t.listFacts(), t.nodeDetail(),
 		t.expandDigest(), // cold-digest §6.1
+		// list_worker_traces：work 索引（intent_id+summary+state），先发现再看
+		// get_worker_trace——planner/main 的跨 work 复盘入口（worker 不给，见下）。
+		t.listWorkerTraces(),
 		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.addHint(), t.addIntent(),
 		// steer_work：人可对某条正在运行的意图(work)实时注入纠偏指令（不打断、不丢进展）。
 		t.steerWorkTool(),
@@ -687,6 +732,18 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
+		// search_vulns / get_vuln：人在环路上也可直接查公开已知漏洞情报。
+		t.searchVulns(), t.getVuln(), t.getPoc(), t.scanWithNuclei(), t.netContext(),
+		// listener_*：回连接收器（红队 C2 前置）——start/stop 走 ask 审批，sessions 只读。
+		t.listenerStart(), t.listenerStop(), t.listenerSessions(),
+		// auth_request：用资产上已登记的凭据组装带认证的请求（横向/越权验证的前提）。
+		t.authRequest(),
+		// diff_responses：对比两个响应的结构性差异（越权/可枚举/状态机三类的共同基础）。
+		t.diffResponses(),
+		// api_contract：读目标暴露的 API 契约文件，拿到比爬虫更准的接口清单。
+		t.apiContractTool(),
+		// search_recent_critical：按【时间】查最近披露的高危漏洞（不需先知道组件名/CVE 号）。
+		t.searchRecentCritical(),
 	}
 }
 

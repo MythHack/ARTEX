@@ -97,6 +97,29 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 			return hook.Result{}
 		}
 		dec = d
+	} else if dec.Action == "judge" {
+		// 规则显式要求「Agent 研判」：不再取固定动作，交给模型裁决；裁决结果仍按
+		// allow/deny/ask 走原有分支。保留触发它的 rule_id，审计里能看出是哪条规则
+		// 把这次调用交给了模型。
+		//
+		// 规则自己的 timeout 声明要一起传下去：规则作者显式写了「我超时时怎么办」，
+		// 那就以规则为准（否则规则上的 timeout_enabled/seconds/action 仍是死字段，
+		// 界面显示的与实际生效的不一致）。规则没写就听全局的。
+		ruleID := dec.RuleID
+		rt := intercept.RuleTimeout{}
+		if dec.TimeoutEnabled {
+			rt = intercept.RuleTimeout{
+				Enabled: true,
+				Seconds: dec.TimeoutSeconds,
+				Action:  dec.TimeoutAction,
+			}
+		}
+		d, judged := g.interceptor.JudgeRuleWithTimeout(ctx, ev.ToolName, ev.Input, rt)
+		if !judged {
+			return hook.Result{}
+		}
+		d.RuleID = ruleID
+		dec = d
 	}
 	switch dec.Action {
 	case "deny":

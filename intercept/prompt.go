@@ -100,7 +100,8 @@ A6 落脚后的无害侦察:whoami/id/uname/hostname/ls/cat/ps/netstat/ifconfig 
 1. 检查本次调用全部直接效果,是否命中 D1–D6 且作用于目标真实业务资产?→ 是则 DENY。
 2. 是否属于 A1–A6 的正常渗透动作?→ 是则 ALLOW。
 3. 存在不可逆写/删/改,当前参数中的作用对象或影响面无法判明?→ ASK。
-4. 仍无法归类 → 默认 ALLOW(授权测试中,不因臆测而拦截合法操作)。
+4. 参数为空、乱码或连动作类别都解析不出来?→ ASK（信息不足以走默认 ALLOW——「判不了」和「信息不足」都归 ASK，只有能归类时才用第 5 条）。
+5. 仍无法归类 → 默认 ALLOW(授权测试中,不因臆测而拦截合法操作)。
 
 # 对照样例
 ALLOW  execute_command cat /etc/shadow                         只读,恒可逆。
@@ -115,6 +116,7 @@ DENY   mysql -e "UPDATE accounts SET balance=0"                无条件改写�
 DENY   passwd admin / UPDATE users SET pass=... WHERE 全表      篡改真实账号口令(D1)。
 DENY   systemctl stop nginx                                    中断在服务的进程(D5)。
 DENY   hping3 --flood -p 80 tgt                                参数明示 flood(D6)。
+DENY   while true; do curl -X POST /login; done                脚本循环打同一登录端点,次数远超单点验证(D6)。
 ASK    mysql -e "DROP TABLE users_bak_0921"                    像备份表,无法确定是否生产数据。
 ASK    删除 /data/uploads 下一个归属不明的文件                    作用对象无法判明。
 ASK    删除某文件，当前参数无法确认其归属                         不推测此前是否创建过，不能仅凭路径断言生产破坏。
@@ -159,6 +161,11 @@ func stripCodeFence(text string) string {
 // ParseVerdict requires a complete verdict and explanation for every action.
 // Never extract a decision keyword from prose, arguments, or a broken JSON
 // reply. Invalid/incomplete responses follow the configured model-failure path.
+//
+// 格式容错（normalizeComment）：模型偶尔会用半角冒号/分号、换行或多余空格。
+// 这些是**排版偏差**，不是「裁决无效」——原先一律判为无法解析、直接走失败
+// 策略，开着思考的模型尤其容易多几个换行，于是每次裁决都掉进兜底。
+// 这里只做排版归一（标点与空白），**不改写语义**：三段缺一段仍然判无效。
 func ParseVerdict(text string) Verdict {
 	d := json.NewDecoder(strings.NewReader(stripCodeFence(text)))
 	if tok, err := d.Token(); err != nil || tok != json.Delim('{') {
@@ -171,35 +178,126 @@ func ParseVerdict(text string) Verdict {
 			return Verdict{}
 		}
 		key, ok := tok.(string)
-		if _, duplicate := fields[key]; !ok || duplicate || (key != "decision" && key != "comment") {
+		if !ok {
 			return Verdict{}
 		}
 		var value *string
 		if d.Decode(&value) != nil || value == nil {
 			return Verdict{}
 		}
+		// 允许模型多给字段（实测有回复带 reason/explanation 等）。只要
+		// decision 与 comment 都在，就按它们裁决；**不能**因为多了字段就
+		// 整条判无效——那等于让模型的额外解释变成裁决失败的唯一原因。
+		if _, dup := fields[key]; dup {
+			return Verdict{} // 同名重复：无法确定用哪个
+		}
 		fields[key] = *value
 	}
 	if tok, err := d.Token(); err != nil || tok != json.Delim('}') {
 		return Verdict{}
 	}
-	if _, err := d.Token(); err != io.EOF || len(fields) != 2 {
+	if _, err := d.Token(); err != io.EOF {
 		return Verdict{}
 	}
-	action, reason := fields["decision"], strings.TrimSpace(fields["comment"])
+	action, reason := fields["decision"], normalizeComment(fields["comment"])
+	if action == "" || reason == "" {
+		return Verdict{}
+	}
 	if action != "allow" && action != "ask" && action != "deny" {
 		return Verdict{}
 	}
-	if len(reason) > 2400 || !strings.HasPrefix(reason, "实际操作：") {
+	if len(reason) > 2400 {
 		return Verdict{}
 	}
+	// 有标签时严格按标签解析：任一段为空 = 裁决说明不完整 = 无效。
+	// 不在这里兜底 —— 兜底只用于「压根没有标签」的情况。
 	operation, rest, ok := strings.Cut(strings.TrimPrefix(reason, "实际操作："), "；成功后的后果：")
 	if !ok || strings.TrimSpace(operation) == "" {
-		return Verdict{}
+		if strings.Contains(reason, "实际操作：") {
+			return Verdict{} // 带了标签但内容缺失 → 无效
+		}
+		return splitThreeSegments(action, reason)
 	}
 	consequence, rule, ok := strings.Cut(rest, "；命中规则：")
 	if !ok || strings.TrimSpace(consequence) == "" || strings.TrimSpace(rule) == "" {
+		if strings.Contains(reason, "成功后的后果：") || strings.Contains(reason, "命中规则：") {
+			return Verdict{}
+		}
+		return splitThreeSegments(action, reason)
+	}
+	return Verdict{Action: action, Reason: reason}
+}
+
+// splitThreeSegments is the fallback for a comment that has the three parts but
+// lost the labels ("读取文件；返回内容；命中规则 A5"). It only SPLITS on the
+// full-width semicolon — it never rewrites the content, and a comment with
+// fewer than three non-empty parts stays invalid.
+func splitThreeSegments(action, reason string) Verdict {
+	parts := strings.Split(reason, "；")
+	if len(parts) < 3 {
+		return Verdict{}
+	}
+	for _, p := range parts[:2] {
+		if strings.TrimSpace(p) == "" {
+			return Verdict{}
+		}
+	}
+	if strings.TrimSpace(strings.Join(parts[2:], "；")) == "" {
 		return Verdict{}
 	}
 	return Verdict{Action: action, Reason: reason}
+}
+
+// normalizeComment 把 comment 归一到协议要求的形态：半角冒号/分号换成全角、
+// 换行与连续空白压成单个空格。**只动排版，不动内容**——三段缺一段仍然无效。
+//
+// 分隔符有三种可能：全角「；」、半角「;」、以及换行（模型常把三段写成三行）。
+// 所以先把「换行/多空格」压成空格，再把两个分隔关键字**之前**的任意标点
+// （; ； , ， 、）统一换成「；」。
+func normalizeComment(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	// 折叠空白（含换行）为单个空格。
+	s = strings.Join(strings.Fields(s), " ")
+
+	// 关键字的冒号：半角 → 全角。
+	for _, k := range []string{"实际操作", "成功后的后果", "命中规则"} {
+		s = strings.ReplaceAll(s, k+":", k+"：")
+	}
+	// 分隔符：两个分隔关键字之前的标点统一成「；」。
+	// 用「查找关键字 → 回看它前面最近的标点」的方式，避免误伤句内标点。
+	s = normalizeSeparatorBefore(s, "成功后的后果", "；")
+	s = normalizeSeparatorBefore(s, "命中规则", "；")
+	return s
+}
+
+// normalizeSeparatorBefore 把 sep 之前（忽略空格）的那一个分隔标点换成 want。
+// 找不到标点时补一个 want（模型用换行分段时，压缩成空格后就丢了分隔符）。
+func normalizeSeparatorBefore(s, keyword, want string) string {
+	i := strings.Index(s, keyword)
+	if i < 0 {
+		return s
+	}
+	head := s[:i]
+	// 往前找最近的非空白字符。注意按 rune 处理：中文标点是多字节 UTF-8，
+	// 按 byte 比较会拿到尾字节而匹配不上。
+	runes := []rune(head)
+	k := len(runes) - 1
+	for k >= 0 && (runes[k] == ' ' || runes[k] == '\t') {
+		k--
+	}
+	if k >= 0 {
+		switch runes[k] {
+		case ';', '；', ',', '，', '、', '|':
+			runes[k] = []rune(want)[0]
+		default:
+			// 没有标点（换行分段被压成空格后就是这样）→ 补一个分隔符。
+			runes = append([]rune(strings.TrimRight(string(runes), " \t")), []rune(want)...)
+		}
+	} else {
+		runes = append([]rune(strings.TrimRight(string(runes), " \t")), []rune(want)...)
+	}
+	return string(runes) + s[i:]
 }

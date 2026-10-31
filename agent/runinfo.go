@@ -20,7 +20,20 @@ type RunInfo struct {
 	ExplorationID int64  // exploration id; 0 when unknown
 	IntentID      int64  // worker's intent node; 0 for planner/mainagent/chat
 	SessionID     string // chat conversation id; empty for task runs
+	// Kind names the agent role. RunInfo's id triple cannot tell planner from
+	// mainagent (both have TaskID+ExplorationID and no IntentID), and the tool
+	// log needs the distinction: "planner called no tools for 20 minutes" and
+	// "mainagent called no tools for 20 minutes" are different failures.
+	Kind string // "planner" | "worker" | "main" | "chat"; empty = unknown
 }
+
+// Agent role labels carried in RunInfo.Kind.
+const (
+	KindPlanner = "planner"
+	KindWorker  = "worker"
+	KindMain    = "main"
+	KindChat    = "chat"
+)
 
 // explorationID reads a store's exploration id, tolerating a nil store (planner and
 // worker runs can be driven without one in tests).

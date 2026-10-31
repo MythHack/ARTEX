@@ -10,14 +10,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/hosttools"
+	"github.com/Autumn-27/artex/intercept"
 )
 
 // Worker is an LLM work agent (docs §4.4): it claims ONE intent, completes it
@@ -151,7 +152,7 @@ func (w *Worker) SetRunTimeout(run time.Duration) {
 // settleWrapUpPrompt is injected by the SDK settlement phase when a worker hits its
 // turn/time budget: stop probing, write back what was found, then end with a
 // plain-text one-liner (which becomes this run's displayed result).
-const settleWrapUpPrompt = "你即将因预算耗尽被终止。不要再运行任何命令/探测。请依次：(1) 把你上面已识别但还没写回的内容逐条写回——新资产用 insert_assets、探索结论/事实用 record_fact、确认漏洞用 report_finding；(2) **最后单独用一句话纯文本**总结你做了什么、得到哪些关键结论（这句会作为本次运行的结果展示，务必输出）。"
+const settleWrapUpPrompt = "你即将因预算耗尽被终止。不要再运行任何命令/探测。请依次：(1) 把你上面已识别但还没写回的内容逐条写回——新资产用 insert_assets、探索结论/事实用 record_fact、确认漏洞用 report_finding。**只写回已确认的；未验证的猜测一律不写**（收尾时刻赶进度最易污染图谱，planner 会把 inferred 当态势）；(2) **最后单独用一句话纯文本**总结你做了什么、得到哪些关键结论（这句会作为本次运行的结果展示，务必输出）。"
 
 func NewWorker(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int, extra ...actool.CoreTool) *Worker {
 	return &Worker{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, extraTools: extra}
@@ -229,20 +230,29 @@ func proxyEnv(proxyAddr, caCert string) []string {
 // (段 [B]/[C]), so editing the DB body can never drop them.
 const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系统的"执行者"(work agent)。你领到【一条意图】(一句话探索方向)，唯一职责：**完成这一条意图、把发现写回知识图谱、然后停止返回。**
 
+**作业程序（先想后打，五步）**：
+1. **复述假设**：读意图 + 锚定资产 + 既有事实，用一句话明确"本意图 = 验证【假设 H】：……"（意图带 hypothesis 字段时以它为准；没带就自己归纳一句）。
+2. **列向量再动手**：想 2-3 条探测向量，每条标注"成功/失败的判别信号"（看到什么算有、看到什么算没有），再开始执行——防止盲试。
+3. **边发现边写回**：每得到一个可判读结果立即写回（写回规则见下）。
+4. **结论前对抗自检**（见边界第 4 条）。
+5. **收尾明确作答**：结束时必须回答——假设 H【成立 / 不成立 / 证据不足】，依据哪条 fact。
+
 **边界（红线）**：
 1. **只做你领到的这一条意图**。**探本意图时若瞥见本意图之外值得深挖的线索**（报错泄露的路径、可能与其它资产联动的点、疑似另一条利用链的入口），**在 fact 的 summary 里点一句交给规划者**。
-2. 初次受阻（payload 被过滤 / 404 / 注入无回显）不代表已探透——把本意图的所有绕过手段走完再输出结论；
-3. 只在授权范围内操作。系统提示顶部若附【操作约束】，那是最高优先级红线：每条命令/探测执行前先自检，违反即不做（哪怕它落在你领到的意图里）。
+2. 初次受阻（payload 被过滤 / 404 / 注入无回显）不代表已探透——把**最小绕过清单**走完再下否定结论：编码类（URL/双编码/Unicode）、大小写与同义替换、参数位置（query/body/header/cookie）、HTTP 方法、Content-Type、分段/污染。否定结论的 evidence 里**逐条写明试过哪几类**——"所有绕过手段走完"不是口号，是这张可核对的清单。
+3. **意图本身有问题就早停**：开跑前发现意图自相矛盾、与锚定资产不符、或缺失必要前置时，立即 record_fact 一条（confidence=observed，summary 写"意图 #N 不可执行：……原因"）并结束——不要自行改目标继续探，更不要硬着头皮绕到步数耗尽。
+4. 只在授权范围内操作。系统提示顶部若附【操作约束】，那是最高优先级红线：每条命令/探测执行前先自检，违反即不做（哪怕它落在你领到的意图里）。
+5. **报漏洞前先做一次对抗式自检**：当你觉得"打通了/拿到成果了"，先切换成怀疑者——用与首次**不同的路径或独立命令**再触发一次（换方法、换参数、换入口、换编码），确认这不是误报、不是一次性假象、不是把"版本命中/参数可疑"当成了已利用。自检没过就老实记成 inferred 事实，别硬认成 finding。**证伪和证实同等有价值。**
 
 **探测阶段优先调用已配置的专用扫描/探测工具，避免重复用 Bash 手写同类脚本（只有当专用工具无法满足探测需求时才手写 Python）。**
 
 **边发现边写回**（写进图才算数，脑子/文字里的不算；每得一个结果立刻写，别攒到最后被步数耗尽丢掉）。三种写回，别串图：
 - **新资产/资源 → insert_assets（资产图）**：子域 / service / endpoint / 指纹 / 凭据 等一切资产【本身】。**这里只登记资产；探索结论/判断不写这里，用 record_fact。**
 - **探索结论/事实 → record_fact（探索图，传 intent_id）**：都用它。**多个观察汇总成【一条】事实**（summary 一句总结 + detail写对总结的拓展，依靠真实的执行过程），不要一个属性一条、一意图通常只一条，拆碎会让图谱无限膨胀——**默认就写一条，能并进 detail 的都并进去**；仅当确有【彼此完全独立、无法归并】的结论时才用 facts 数组分条，这是极少数例外，不是常规。**只写增量**：只记这次【新得到】的，别把已有事实换措辞重记（只印证已有、无新增就不必记）。**只写真实看到的**：给 evidence（一行：命令+最能证明的一两行输出，简洁，细节在 detail）、标 confidence（observed=直接看到 / inferred=据现象推断）。
-- **确认漏洞 → report_finding（探索图，含 PoC、cwe_id、cvss_vector，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据且产生实质安全危害才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认。**严禁把未闭环的能力原语当漏洞上报**：①盲上传成功但无读回链/不解析执行；②回调或状态接口返回 success 但未实证订单/业务状态真实翻转；③用已知参数加密再解密回原参数的自引用闭环；④短信/邮件等无回显接口仅返回成功但未经人工确认收到；⑤纯存在性枚举 Oracle 无数据产出——以上一律只准用 record_fact 记录交规划者继续深挖。**同源去重**：若 finding_list 中已有同根因漏洞（如同源站 catch-all 或同套多租户系统的 /metrics、相同接口缺陷），新域名/新宿主命中时严禁重复调 report_finding 刷数量，只记 record_fact。**CVSS v3.1 实证定级红线**（C/I/A 只按已实证结果填）：C:H 仅限已拿到可用凭据/密钥、百条以上真实业务敏感数据/PII 或完整源码；/metrics、Actuator、路由/配置暴露、单笔样本回显一律封顶 C:L（medium）；I:H 仅限已实证篡改核心业务状态或 RCE。
+- **确认漏洞 → report_finding（探索图，含 PoC、cwe_id、cvss_vector，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）、已通过边界第 5 条的对抗式自检、且产生实质安全危害才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。**严禁把未闭环的能力原语当漏洞上报**：①盲上传成功但无读回链/不解析执行；②回调或状态接口返回 success 但未实证订单/业务状态真实翻转；③用已知参数加密再解密回原参数的自引用闭环；④短信/邮件等无回显接口仅返回成功但未经人工确认收到；⑤纯存在性枚举 Oracle 无数据产出——触发不了或未闭环一律只准用 record_fact 记录交规划者继续深挖。**同源去重**：若 finding_list 中已有同根因漏洞（如同源站 catch-all 或同套多租户系统的 /metrics、相同接口缺陷），新域名/新宿主命中时严禁重复调 report_finding 刷数量，只记 record_fact。**CVSS v3.1 实证定级红线**（C/I/A 只按已实证结果填）：C:H 仅限已拿到可用凭据/密钥、百条以上真实业务敏感数据/PII 或完整源码；/metrics、Actuator、路由/配置暴露、单笔样本回显一律封顶 C:L（medium）；I:H 仅限已实证篡改核心业务状态或 RCE。
 
 
-完成本意图后用一句话总结你做了什么、写回了哪些事实。`
+完成本意图后用一句话总结你做了什么、写回了哪些事实，并回答第 5 步的假设判定。`
 
 // workerTrafficBlock is 段 [B]: the traffic-tool note, code-injected only when
 // traffic capture (recording) is on — i.e. the traffic_* tools actually exist.
@@ -292,7 +302,14 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
+	out := body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
+	// 宿主工具清单：真正动手的是 worker，所以清单必须进 worker 的 system prompt。
+	// 之前只有 planner 的唤醒提示里有（用于「派意图选手段」），worker 看不到——
+	// 于是新装的一批工具（dalfox/feroxbuster/chisel…）一次都没被用起来。
+	if t := hosttools.SummaryText(); t != "" {
+		out += "\n\n【本机可用工具】\n" + t
+	}
+	return out
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
@@ -316,7 +333,59 @@ func intentAssetIDs(intent *db.Node) []int64 {
 }
 
 func renderIntentTask(intent *db.Node) string {
-	return fmt.Sprintf("\n\n【你领到的意图（本次唯一任务：只做这一条、只产生事实、做完即停）】：\n%s\n意图 id: %d（写回 record_fact / report_finding 时传它）", string(intent.Payload), intent.ID)
+	// hypothesis/success_criteria 结构化渲染（v0.3.95 B3）：planner 写了就带出，
+	// worker 的「复述假设→判成没成」作业程序直接以此为锚。
+	extra := ""
+	var p struct {
+		Hypothesis      string `json:"hypothesis"`
+		SuccessCriteria string `json:"success_criteria"`
+	}
+	if err := json.Unmarshal(intent.Payload, &p); err == nil {
+		if h := strings.TrimSpace(p.Hypothesis); h != "" {
+			extra += fmt.Sprintf("\n本方向假设（H）：%s", h)
+		}
+		if sc := strings.TrimSpace(p.SuccessCriteria); sc != "" {
+			extra += fmt.Sprintf("\n成功判据（怎么算成了/没成）：%s", sc)
+		}
+	}
+	return fmt.Sprintf("\n\n【你领到的意图（本次唯一任务：只做这一条、只产生事实、做完即停）】：\n%s%s\n意图 id: %d（写回 record_fact / report_finding 时传它）", string(intent.Payload), extra, intent.ID)
+}
+
+// resumeBrief 续跑摘要（v0.3.95 B9）：上次状态 + 收场原因 + 图上已挂产出。
+// 数据全部来自探索图（intent 节点自身 + FactsYielded 血缘），不依赖引擎传值。
+func resumeBrief(ts *db.ExplorationStore, intent *db.Node) string {
+	if ts == nil || intent == nil {
+		return "继续执行。"
+	}
+	var b strings.Builder
+	state := intent.State
+	if state == "" {
+		state = "-"
+	}
+	fmt.Fprintf(&b, "\n【续跑上下文】本意图（#%d）上次已跑过，当前状态 %s", intent.ID, state)
+	if intent.BlockedReason != "" {
+		fmt.Fprintf(&b, "，收场原因：%s", intent.BlockedReason)
+	}
+	b.WriteString("。图上已挂产出：")
+	n := 0
+	if fids, err := ts.FactsYielded(intent.ID); err == nil {
+		for _, fid := range fids {
+			if y, err := ts.GetNode(fid); err == nil && y != nil {
+				var p map[string]any
+				_ = json.Unmarshal(y.Payload, &p)
+				sum, _ := p["summary"].(string)
+				fmt.Fprintf(&b, "\n- [fact #%d] %s", y.ID, firstLine(sum, 80))
+				n++
+			}
+			if n >= 5 {
+				break
+			}
+		}
+	}
+	if n == 0 {
+		b.WriteString("\n- 无（上次零写回——先复盘上次卡在哪一步，别重复同样的路径）")
+	}
+	return b.String()
 }
 
 // renderWorkerGraphOverview folds the global situational snapshot into the worker's
@@ -443,7 +512,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// worker 刻意不给 MultiEdit/Glob/Grep：文件精改用 Edit、检索走 Bash(grep/find)，
 	// 收敛工具面、减少低价值调用。其余 SDK 默认工具(Read/Write/Edit/LS/Bash/Sleep)照常。
 	base = append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
-	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID})
+	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID, Kind: KindWorker})
 	tools, def, cleanup := AugmentTools(ctx, "worker", base)
 	defer cleanup()
 
@@ -463,10 +532,12 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}
-	// 意图块 → 意图锚定资产块 → 启动指令，依次追加到 system 尾部（与 constraintBlock 同一套追加法）。
+	// 意图块 → 意图锚定资产块 → 相关既有事实 → 启动指令，依次追加到 system 尾部
+	//（与 constraintBlock 同一套追加法）。
 	sysBody += renderIntentTask(intent)
+	ids := intentAssetIDs(intent)
 	if as != nil {
-		if ids := intentAssetIDs(intent); len(ids) > 0 {
+		if len(ids) > 0 {
 			if assets, err := as.GetByIDs(ids); err == nil && len(assets) > 0 {
 				if b, err := json.Marshal(assets); err == nil {
 					sysBody += "\n\n本意图 asset_ids 对应的目标资产：\n" + string(b)
@@ -482,6 +553,11 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 				}
 			}
 		}
+	}
+	// 记忆：目标资产上已登记的事实摘要。worker 拿到它能避免重复探测同一资产，
+	// 也能站在已有结论上继续推进（此前它只看得到资产本身，看不到别人测出了什么）。
+	if b := priorFactsBlock(ts, ids, 8); b != "" {
+		sysBody += b
 	}
 	sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
 	system, boundary := deferredSystem(sysBody, def)
@@ -535,8 +611,19 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		NonStreaming:  w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:     w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
 	}
+	var baseHooks harness.HookRunner
+	if hooks != nil {
+		logged := wrapToolLog(hooks, KindWorker, fmt.Sprintf("%s · #%d", name, intent.ID))
+		baseHooks = wrapIdleStop(logged, tsx.Writes, func(reason string) {
+			logIdleStop(name, taskID, intent.ID, reason)
+		})
+	} else {
+		baseHooks = wrapIdleStop(toolLogSink(KindWorker), tsx.Writes, func(reason string) {
+			logIdleStop(name, taskID, intent.ID, reason)
+		})
+	}
 	opts.Hooks = workerWriteCheckHook{
-		inner:  hooks,
+		inner:  baseHooks,
 		writes: tsx.Writes,
 		nudged: new(bool),
 	}
@@ -577,7 +664,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		alreadyRecorded = requestID != "" && hasWorkerChatMessage(s.Messages(), requestID)
 		if len(s.Messages()) > 0 && message == "" {
 			seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
-			input = "继续执行。"
+			// 续跑摘要（v0.3.95 B9）：上次跑到哪、为什么停、图上已有什么——不注入
+			// 的话模型要自己翻历史重建方向感；零写回的续跑被强制先反思。
+			input = resumeBrief(ts, intent) + "\n继续执行，先确认上面的结论仍有效，再接着做。"
 		} else if len(s.Messages()) > 0 {
 			seedUnlockFromHistory(s.Messages(), def.UnlockSkill)
 		}
@@ -701,3 +790,53 @@ func withTaskIdentity(ctx context.Context, intent *db.Node) context.Context {
 type taskIdentityKey struct{}
 
 var taskIdentityIDKey = taskIdentityKey{}
+// priorFactsBlock 汇总本意图目标资产上已登记的事实（最近 limit 条），作为工作记忆
+// 注入 worker 上下文。只取 fact（探索结论）；intent 是别人的派单、finding 有专用
+// 查询工具，都不在这里重复。
+//
+// 目的：worker 此前只拿到资产本身，看不到"这块资产上已经测出了什么"，容易重复探测
+// 同一个端点、也无法在前人结论上继续推进。
+func priorFactsBlock(ts *db.ExplorationStore, assetIDs []int64, limit int) string {
+	if ts == nil || len(assetIDs) == 0 || limit <= 0 {
+		return ""
+	}
+	type item struct {
+		id      int64
+		summary string
+	}
+	seen := map[int64]bool{}
+	var items []item
+	for _, aid := range assetIDs {
+		refs, err := ts.AssetRefs(aid)
+		if err != nil {
+			continue
+		}
+		for _, r := range refs {
+			if r.Kind != db.KindFact || seen[r.ID] {
+				continue
+			}
+			summary := strings.TrimSpace(r.Summary)
+			if summary == "" {
+				continue
+			}
+			seen[r.ID] = true
+			items = append(items, item{id: r.ID, summary: summary})
+			if len(items) >= limit {
+				break
+			}
+		}
+		if len(items) >= limit {
+			break
+		}
+	}
+	if len(items) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n\n【这些目标资产上已登记的事实（最近 " + strconv.Itoa(len(items)) +
+		" 条；供你避免重复探测，并在此基础上继续推进。需要细节用 node_detail 按 id 查）】：\n")
+	for _, it := range items {
+		b.WriteString("- #" + strconv.FormatInt(it.id, 10) + " " + firstLine(it.summary, 200) + "\n")
+	}
+	return b.String()
+}

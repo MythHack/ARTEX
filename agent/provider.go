@@ -50,6 +50,20 @@ type Config struct {
 	//   "enabled" = 开启. 与 ReasoningEffort 完全解耦——有些接口没有 thinking 字段、
 	//   只靠强度参数就能激活思考,故两者可各自单独设置.
 	ThinkingType string
+	// SuppressThinking 强制【不发】thinking.type 字段（覆盖 ThinkingType）。
+	//
+	// 为什么需要它：thinking 参数是在**provider 配置层**注入的（见 NewProvider），
+	// 不在 llm.CompletionRequest 里——所以「收到 2013 就摘掉 thinking 重试」不能
+	// 靠改请求，只能重建一个不带 thinking 的 provider。
+	//
+	// 2013 的含义：模型是**强制 adaptive thinking** 的（MiniMax-M3.1 等），
+	// 显式关思考会被上游直接拒绝：
+	//   400 "requires adaptive thinking; thinking.type=\"disabled\" ... is not allowed (2013)"
+	// 摘掉该字段后模型按自己的默认走（即开思考），请求就能成功。
+	//
+	// 这个开关只用于**一次性降级重试**——不改变 profile 的持久配置（那属于
+	// 用户的选择），只是让这一次调用换个方式发。
+	SuppressThinking bool
 	// ReasoningEffort 独立控制思考「强度」字段:
 	//   "" = 不发送(默认); "low"/"medium"/"high"/"xhigh"/"max" = 对应强度.
 	//   OpenAI 映射为顶层 reasoning_effort;Anthropic 映射为 output_config.effort.
@@ -103,7 +117,15 @@ type RetryConfig struct {
 // threshold math (window − summary reserve − buffer) would go non-positive and
 // compaction would fire every turn; above the cap it would never fire.
 const (
-	defaultWindowK = 200  // unset → assume a 200K window (Claude default)
+	// defaultWindowK = 1000（1M）：本平台常用的模型是 minimax-m3.1-flash-free，
+	// 其原生上下文是 1M（模型自报 1000000）。之前按 200K（Claude 默认）算，
+	// 于是压缩在远未到上限时就触发——而压缩本身是个要额外调 LLM 的重活，
+	// 白白吃掉预算、拖慢流程。设成 1M 后阈值从 ~174K 提到 ~930K。
+	//
+	// 上限 maxWindowK 已经是 1000（用户明确要求用满百万上下文），
+	// 阈值数学在 1M 下是安全的：effectiveWindow = 1M − 20K = 980K，
+	// buffer 50K，自动压缩阈值 930K。
+	defaultWindowK = 1000
 	minWindowK     = 32   // floor so effectiveWindow stays comfortably positive
 	maxWindowK     = 1000 // cap at 1M tokens (user request)
 )
@@ -283,7 +305,11 @@ func (c Config) newProvider(client *http.Client, limiter *RequestLimiter) (llm.P
 	}
 	// 思考开关与强度两个字段各自透传(空 = 该字段不发送)。二者解耦:
 	// 可只发 thinking.type、只发 effort、都发、或都不发。
-	lc.ThinkingType = c.ThinkingType
+	//
+	// SuppressThinking 时不发 thinking.type（降级重试用，见该字段注释）。
+	if !c.SuppressThinking {
+		lc.ThinkingType = c.ThinkingType
+	}
 	lc.ReasoningEffort = c.ReasoningEffort
 	// 输出上限的字段名选择(空 = 用 max_tokens)。上限的「值」不在这里:它每轮随
 	// agentcore.Options.MaxTokens 走,provider 只决定把它塞进哪个键。

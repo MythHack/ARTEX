@@ -583,7 +583,9 @@ func TestSetFindingStatusWithNotifyOnlyEmitsOnRealChange(t *testing.T) {
 		t.Fatalf("快照里的状态流转不对: %s → %s", snap.FromStatus, snap.ToStatus)
 	}
 	// 快照要带上渲染所需字段，否则状态变更消息会是空壳。
-	if snap.VulnClass != "SQL注入" || snap.Severity != "high" || snap.Name != "状态变更用例" {
+	// vulnclass 断言的是归一后的标准类别:写入层 NormalizeVulnClass 把
+	// 「SQL注入」折叠到「注入」,快照随落库值走(0.3.18 起的契约)。
+	if snap.VulnClass != "注入" || snap.Severity != "high" || snap.Name != "状态变更用例" {
 		t.Fatalf("快照缺少渲染字段: %+v", snap)
 	}
 	var status string

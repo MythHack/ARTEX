@@ -119,7 +119,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	// visible skills/MCP and lets the DB tools table filter/override. DefaultTools
 	// have no tools-table rows, so they always pass through.
 	base := actool.DefaultTools()
-	ctx = WithRunInfo(ctx, RunInfo{SessionID: sessionID})
+	ctx = WithRunInfo(ctx, RunInfo{SessionID: sessionID, Kind: KindChat})
 	tools, def, cleanup := AugmentTools(ctx, agentKey, base)
 	defer cleanup()
 
@@ -161,7 +161,10 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		MaxTokens:    c.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
 	}
 	if c.guard != nil {
-		opts.Hooks = c.guard.Hooks()
+		// 日志层套在拦截链外侧（先记后转发），纯旁路。
+		opts.Hooks = wrapToolLog(c.guard.Hooks(), KindChat, "")
+	} else {
+		opts.Hooks = toolLogSink(KindChat)
 	}
 	if c.tx != nil { // persist raw human↔AI conversation; one accumulating file per thread
 		opts.Transcript = c.tx

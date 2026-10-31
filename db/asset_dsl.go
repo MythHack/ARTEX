@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"unicode"
@@ -65,7 +66,7 @@ func isKnownField(f string) bool {
 	_, s := knownStringFields[f]
 	_, a := knownArrayFields[f]
 	_, n := knownNumericFields[f]
-	return s || a || n || f == "company_id" || f == "task_id"
+	return s || a || n || f == "company_id" || f == "task_id" || f == "cidr"
 }
 
 // ── tokeniser ────────────────────────────────────────────────────────────────
@@ -331,6 +332,27 @@ func (b *whereBuilder) buildLeaf(e Expr) (string, error) {
 		return "company_id = " + b.next(n), nil
 	}
 
+	// cidr —— 按网段查资产（渗透里最高频的查询：「这个网段里有哪些主机」）。
+	// assets.ip 是自由文本（agent 可能写进主机名），所以走 try_inet() 安全转换；
+	// 转换不出 inet 的行（主机名）自然被排除，不会让一条脏数据把整个查询打挂。
+	//
+	// 之前 DSL 只有 ip 的精确/模糊匹配，agent 想查网段只能写 `ip >= 10.0.0.0`，
+	// 而 ip 是字符串字段不支持比较运算符 —— 实测 24 次「字符串字段 ip 不支持
+	// 运算符 >=」，还有 11 次 DSL 语法错误，全是这一个能力缺失逼出来的。
+	if f == "cidr" {
+		if _, _, err := net.ParseCIDR(e.Value); err != nil {
+			return "", fmt.Errorf("cidr 需要网段格式(如 10.10.0.0/16): %s", e.Value)
+		}
+		switch e.Op {
+		case "=", "==":
+			return "try_inet(ip) >>= " + b.next(e.Value), nil
+		case "!=":
+			return "(try_inet(ip) IS NULL OR NOT (try_inet(ip) >>= " + b.next(e.Value) + "))", nil
+		default:
+			return "", fmt.Errorf("cidr 只支持 = 与 !=（网段包含）")
+		}
+	}
+
 	// numeric fields
 	if col, ok := knownNumericFields[f]; ok {
 		n, err := strconv.Atoi(e.Value)
@@ -368,6 +390,13 @@ func (b *whereBuilder) buildLeaf(e Expr) (string, error) {
 		case "=":
 			return col + " ILIKE " + b.next("%"+e.Value+"%"), nil
 		case "==":
+			// 空值精确匹配要同时覆盖 NULL 与空串：资产库里大量"没有 service_name
+			// 的 HTTP 服务"存的是 NULL 而不是 ''（实测 2180 个 http 服务里 2073 个
+			// service_name 为 NULL），`= ''` 匹配不到它们，agent 就看不见这批
+			// 「端口开着、服务类型已知、但还没深挖」的面。
+			if e.Value == "" {
+				return "(" + col + " IS NULL OR " + col + " = '')", nil
+			}
 			return col + " = " + b.next(e.Value), nil
 		case "!=":
 			return col + " NOT ILIKE " + b.next("%"+e.Value+"%"), nil

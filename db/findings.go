@@ -153,7 +153,7 @@ func (d *DB) ListFindings(limit int) ([]*DBFinding, error) {
 // filter on that column". Sort is "severity" (severity desc, then time) or
 // anything else (time only). TimeDirection defaults to newest first.
 type FindingFilter struct {
-	Severity      string // high | medium | low
+	Severity      string // high | medium | medium | low
 	Status        string // pending | false_positive | ignored | resolved
 	VulnClass     string
 	TaskID        string // 任务 id(字符串形式;空/非法 = 不按任务筛选)
@@ -162,6 +162,9 @@ type FindingFilter struct {
 	TimeDirection string // "asc" | "desc"; applies to time, not the severity ranking
 	From          string // RFC3339 timestamp, inclusive
 	To            string // RFC3339 timestamp, inclusive
+	// ExcludeStatuses 排除的状态集合（报告交付用：误报/重复/忽略/风险接受
+	// 不该原样进客户 Word——v0.3.93 A7）。与 Status 互斥使用；空 = 不排除。
+	ExcludeStatuses []string
 	// AssetScope 是资产树的节点 key(a:<id> / c:<id> / r:<domain> / __none__),
 	// 选中一个节点等于选中它的整棵子树。空 = 不按资产筛选。
 	AssetScope string
@@ -211,6 +214,21 @@ func (f FindingFilter) where() (string, []any) {
 		if parsed, err := time.Parse(time.RFC3339, to); err == nil {
 			args = append(args, parsed)
 			conds = append(conds, fmt.Sprintf("f.created_at <= $%d", len(args)))
+		}
+	}
+	// 交付分拣（v0.3.93 A7）：排除集合里的状态不进结果。合法值已在 ValidFindingStatus
+	// 白名单内，直接参数化拼接，不做字符串内联。
+	if len(f.ExcludeStatuses) > 0 {
+		ph := make([]string, 0, len(f.ExcludeStatuses))
+		for _, st := range f.ExcludeStatuses {
+			if !ValidFindingStatus(st) {
+				continue
+			}
+			args = append(args, st)
+			ph = append(ph, fmt.Sprintf("$%d", len(args)))
+		}
+		if len(ph) > 0 {
+			conds = append(conds, fmt.Sprintf("f.status NOT IN (%s)", strings.Join(ph, ",")))
 		}
 	}
 	// task_id 是 bigint 列,按整数比较(不能走上面的文本 add);空/非法值忽略。

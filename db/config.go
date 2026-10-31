@@ -450,6 +450,7 @@ type Agent struct {
 	RunSecs          int    `json:"run_seconds"`       // worker 单次运行墙钟上限(秒);0=不限制
 	WebSearch        bool   `json:"web_search"`        // 是否启用网络搜索(受系统全局开关门控)
 	InteractiveShell bool   `json:"interactive_shell"` // 是否启用交互式 shell(持久 PTY 会话工具族)
+	LocalExec        bool   `json:"local_exec"`        // 是否可在本机执行命令/写文件(Bash/Write/Edit)；false=只能经工具操作平台
 	WrapupPrompt     string `json:"wrapup_prompt"`     // 收尾提示词(超时/步数耗尽时的 settlement 提示);空=用代码内置默认
 	WrapupMaxTurns   int    `json:"wrapup_max_turns"`  // 收尾阶段自身的轮数预算;0=用代码内置默认(按 agent)
 	// 任务级超时收尾词(与 per-run 两套;仅 worker/planner 用);空/0=用代码内置默认。
@@ -464,12 +465,12 @@ type Agent struct {
 	TriggerMaxParallel int    `json:"trigger_max_parallel"`
 }
 
-const agentCols = `id,key,name,COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,600),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),llm_profile_id`
+const agentCols = `id,key,name,COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,600),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(local_exec,true),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),llm_profile_id`
 
 func scanAgent(sc interface{ Scan(...any) error }) (*Agent, error) {
 	var a Agent
 	var prof sql.NullInt64 // llm_profile_id 可空:未绑定时为 NULL
-	err := sc.Scan(&a.ID, &a.Key, &a.Name, &a.Description, &a.Role, &a.Builtin, &a.Enabled, &a.MaxTurns, &a.RunSecs, &a.WebSearch, &a.InteractiveShell, &a.WrapupPrompt, &a.WrapupMaxTurns, &a.TaskTimeoutWrapupPrompt, &a.TaskTimeoutWrapupMaxTurns, &a.TriggerRunMode, &a.TriggerMergeMode, &a.TriggerMaxParallel, &prof)
+	err := sc.Scan(&a.ID, &a.Key, &a.Name, &a.Description, &a.Role, &a.Builtin, &a.Enabled, &a.MaxTurns, &a.RunSecs, &a.WebSearch, &a.InteractiveShell, &a.LocalExec, &a.WrapupPrompt, &a.WrapupMaxTurns, &a.TaskTimeoutWrapupPrompt, &a.TaskTimeoutWrapupMaxTurns, &a.TriggerRunMode, &a.TriggerMergeMode, &a.TriggerMaxParallel, &prof)
 	if err == nil && prof.Valid {
 		v := prof.Int64
 		a.LLMProfileID = &v
@@ -649,6 +650,15 @@ func (d *DB) SetAgentInteractiveShell(key string, on bool) error {
 	return err
 }
 
+// SetAgentLocalExec toggles whether an agent may execute commands / write files on
+// this host (Bash / Write / Edit / interactive PTY tool family). Off = the agent
+// can still read and use platform tools (spawn_task 等), but must dispatch real
+// work to a task instead of doing it in-process. Enforced in server ToolResolve.
+func (d *DB) SetAgentLocalExec(key string, on bool) error {
+	_, err := d.Exec(`UPDATE agents SET local_exec=$1 WHERE key=$2`, on, key)
+	return err
+}
+
 // SetAgentWrapupPrompt stores an agent's wrap-up (settlement) prompt. Empty string
 // means "use the code built-in default" — resolved at runtime by resolveWrapup.
 func (d *DB) SetAgentWrapupPrompt(key, prompt string) error {
@@ -740,6 +750,7 @@ func (d *DB) CurrentPrompt(agentID int64) (string, error) {
 // version ONLY when it has none yet (current_prompt_id IS NULL). Mirrors
 // SeedTool's first-insert-only philosophy: a user's edited prompt is never
 // clobbered on restart. Idempotent — a no-op once any version exists.
+// SeedPromptIfEmpty 只在 agent 还没有当前提示词时写入内置默认。
 func (d *DB) SeedPromptIfEmpty(agentID int64, tmpl string) error {
 	var cur sql.NullInt64
 	if err := d.QueryRow(`SELECT current_prompt_id FROM agents WHERE id=$1`, agentID).Scan(&cur); err != nil {
@@ -750,6 +761,43 @@ func (d *DB) SeedPromptIfEmpty(agentID int64, tmpl string) error {
 	}
 	_, err := d.SavePrompt(agentID, tmpl, "内置默认", "system")
 	return err
+}
+
+// SeedPromptVersioned 播种/升级内置提示词，并返回是否发生了升级。
+//
+// 与 SeedPromptIfEmpty 的区别：后者只填空白，导致**代码里的提示词改进永远到不了
+// 已部署的实例**。这里按 updated_by 判断归属：
+//   - 当前版本 updated_by='system'（代码播种，含"恢复默认"）→ 内容与代码默认不一致时
+//     追加一个新版本，让改进随升级下发；旧版本留在 history 里，可回溯。
+//   - 其它任何来源（'ui' 等）= 用户自己编辑过 → **绝不覆盖**。
+//
+// 依赖 updated_by 而不是内容比对，是因为内容比对无法区分"旧内置默认"与"用户手改"。
+func (d *DB) SeedPromptVersioned(agentID int64, tmpl string) (bool, error) {
+	var cur sql.NullInt64
+	if err := d.QueryRow(`SELECT current_prompt_id FROM agents WHERE id=$1`, agentID).Scan(&cur); err != nil {
+		return false, err
+	}
+	if !cur.Valid {
+		_, err := d.SavePrompt(agentID, tmpl, "内置默认", "system")
+		return true, err
+	}
+	var text string
+	var by sql.NullString
+	if err := d.QueryRow(`SELECT template_text, updated_by FROM agent_prompts WHERE id=$1`, cur.Int64).
+		Scan(&text, &by); err != nil {
+		return false, err
+	}
+	// 用户编辑过的一律不动。
+	if !by.Valid || by.String != "system" {
+		return false, nil
+	}
+	if text == tmpl {
+		return false, nil
+	}
+	if _, err := d.SavePrompt(agentID, tmpl, "内置默认（随版本更新）", "system"); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ResetPromptToDefault appends the code-default template as a new version and

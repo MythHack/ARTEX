@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
-	"github.com/Autumn-27/artex/db"
 	acperm "github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/hosttools"
 )
 
 // compactIntents distills intents to {id, summary, state, asset_ids, parents,
@@ -43,6 +45,12 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 		var p map[string]any
 		_ = json.Unmarshal(n.Payload, &p)
 		m := map[string]any{"id": n.ID, "summary": clipOverviewRunes(p["summary"], overviewIntentSummaryMax), "state": n.State}
+		// stop_reason（B1）：终态意图「为什么停」。planner 提示词要求用它区分
+		// 「接续 vs 换方向」（exhausted=手段穷尽可接续 / blocked=传输故障可重试 /
+		// stopped=被 kill），此前该字段在 DB 列里但态势从不携带。
+		if n.BlockedReason != "" {
+			m["stop_reason"] = n.BlockedReason
+		}
 		if n.Inherited {
 			m["source_task_id"] = n.SourceTaskID
 			m["inherited"] = true
@@ -93,6 +101,10 @@ type ToolSet struct {
 	GoalMet   bool
 	Reason    string
 	writes    WriteCounts
+	// lastMissingAssets holds the asset ids referenced by the most recent
+	// record_fact call that do NOT exist in the asset table. The tool result
+	// reports them back so the model stops reusing a fabricated id.
+	lastMissingAssets []int64
 	// killWork, if set, terminates a running work by intent id (engine callback,
 	// wired by the planner). nil = the kill_work tool reports unavailable.
 	killWork func(intentID int64) error
@@ -130,7 +142,15 @@ type ToolSet struct {
 	// the planner having to spot it folded into the graph overview. Wired for the main
 	// agent + cross-task orchestration; nil elsewhere → falls back to the bare notify.
 	notifyHint func(texts []string)
+	// attributions, if set, returns Guard failure-attribution counts (ok/blocked/error,
+	// guard/guard.go Attributions) for graph_overview 的 guard_attributions 块——planner
+	// 由此看到「这个任务被 WAF/拦截打回了 N 次」并换打法（v0.3.88 体检 N5，Observer
+	// 半成品的最后一公里）。Wired for planner/mainagent（engine per-task Guard）；nil = 块省略。
+	attributions func() map[string]int
 }
+
+// SetAttributions wires the Guard failure-attribution reader (see ToolSet.attributions).
+func (t *ToolSet) SetAttributions(fn func() map[string]int) { t.attributions = fn }
 
 // SetNotifyGoal wires the goal-add trigger callback (see ToolSet.notifyGoal). Set only
 // by the main-agent chat, so runtime-added goals are announced to the planner by name.
@@ -288,6 +308,79 @@ func pidList(raw []json.RawMessage) []int64 {
 		}
 	}
 	return out
+}
+
+// maxIntentSummaryRunes 是意图 summary 的长度上限（rune 数）。
+//
+// 为什么要限：线上实测 205 条意图的 summary 平均 737 字、最长 2267 字——
+// 远超「一句话描述方向」的设计意图。超长带来两个具体问题：
+//
+//  1. **planner 的判断会失真**。planner 靠 summary 判断「这个方向是不是快
+//     挖到了」——summary 越长、细节越多，planner 越容易觉得「信息这么丰富，
+//     肯定快到了，再给一次机会」。而实测线上 exhausted(99) 远多于 done(18)，
+//     接续链还出现了三代（#635→#578→#660）。长 summary → 更容易续派 → 意图更长
+//     → summary 更长，这是个正反馈。
+//  2. **写回被挤掉**。summary 越长，worker 花在组织语言上的 token 越多，
+//     而 detail 字段才是放细节的地方。
+//
+// 400 字的由来：中文一句完整的技术描述大约 100-200 字，400 字足够写清
+// 「目标 + 做什么 + 为什么值得做 + 上次到哪了」——还能带上一次接续的上下文。
+// 超过这个长度的信息量，多出来的基本是重复叙述。
+//
+// 超限的处理是**截断并保留头部**（目标+做什么在开头），而不是拒绝——拒绝会让
+// planner 白跑一轮拿不到任何意图，代价更大。截断后末尾追加标记，让 planner
+// 知道这里被截过。
+const maxIntentSummaryRunes = 400
+
+// clampIntentSummary 把过长的 summary 截到上限，头部保留（目标+做什么在
+// 开头），末尾追加截断标记。
+func clampIntentSummary(s string) string {
+	s = strings.TrimSpace(s)
+	if utf8.RuneCountInString(s) <= maxIntentSummaryRunes {
+		return s
+	}
+	head := string([]rune(s)[:maxIntentSummaryRunes])
+	return head + "…（summary 超长已截断，细节请写进 fact 的 detail）"
+}
+
+// maxContinuationDepth 是同一条方向上允许的最大接续代数。
+//
+// 3 的由来：接续不是坏事——一条方向被预算掐断、但确实有明确的下一步时，
+// 接一次是对的（实测线上 205 条意图里 26 条是接续）。问题在于**没有闸**：
+// 线上出现过三代接续（#635 → #578 → #660），每一代都从零重建上下文、重复读
+// 同一批文件、重复扫同一批资产。
+//
+// 3 意味着：一条方向最多被接续 3 次（首探 + 3 次接续 = 4 代）。到这个数还
+// 没拿到结果，说明问题不在「时间不够」而在「这条路本身不通」或「打法不对」，
+// 该换方向了，不该继续接。
+//
+// 刻意不取 2：接续两次是常见且合理的（被重启打断 + 被预算掐断），卡太紧会
+// 误杀正当的深挖。
+const maxContinuationDepth = 3
+
+// continuationDepthOf 读一个意图节点上记录的接续代数。
+//
+// 老的意图（功能上线前创建的）payload 里没有这个字段，返回 1（当作首探）——
+// 它们本来就没有结构化的接续关系，不该被代数限制误伤。
+func continuationDepthOf(n *db.Node) int {
+	if n == nil {
+		return 1
+	}
+	var p map[string]any
+	if err := json.Unmarshal(n.Payload, &p); err != nil {
+		return 1
+	}
+	switch v := p["continuation_depth"].(type) {
+	case float64:
+		if v >= 1 {
+			return int(v)
+		}
+	case int:
+		if v >= 1 {
+			return v
+		}
+	}
+	return 1
 }
 
 func obj(props map[string]any, required ...string) map[string]any {
@@ -531,6 +624,22 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		recentDone = recentDone[:recentDoneCap]
 	}
 	out["recent_done_intents"] = compactIntents(recentDone, parentsOf, yieldsOf)
+	// 收官态势(边际收益):最近 N 轮规划后,全任务有没有新的 fact/finding 产出。
+	// 连续 ≥3 轮零新产出且 frontier 空 → 提示用 goal_met 收官(预算保护:
+	// 这时候继续派大概率烧 token 无产出)。程序算好放在这里,planner 不用自己数。
+	if t.ts != nil && t.taskID > 0 {
+		out["stall"] = t.stallOverview()
+	}
+	// Guard 归因(ok/blocked/error 计数):blocked 高=目标在防(WAF/拦截规则),继续
+	// 同款打法是烧 token;error 高=工具/环境在坏。nil(未接线,如测试构造)=块省略。
+	if t.attributions != nil {
+		if att := t.attributions(); len(att) > 0 {
+			out["guard_attributions"] = att
+		}
+	}
+	// 宿主工具体检:本机 PATH 可直接经 Bash 调用的工具(可用/缺失+安装提示),
+	// 派意图选手段以家底为准——二进制部署形态下系统里有什么就能用什么。
+	out["tools"] = hosttools.Summary()
 	// cold-digest §6.1: 折叠冷区的 digest body，按最新成员时间降序取前 N；被截的更旧 digest
 	// 只给裸 id（仍可 expand_digest 展开），避免冷区唯一出口被无限拉长。
 	const coldDigestsCap = 10
@@ -1052,11 +1161,14 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 
 // intentItem 是 add_intent 批量/单条的一条探索方向。
 type intentItem struct {
-	Summary    string            `json:"summary"`
-	AssetIDs   []json.RawMessage `json:"asset_ids"`
-	ParentIDs  []json.RawMessage `json:"parent_ids"`
-	Priority   int               `json:"priority"`
-	IdentityID int64             `json:"identity_id"` // optional: bind this intent to a configured task identity; 0 = anonymous
+	Summary         string            `json:"summary"`
+	AssetIDs        []json.RawMessage `json:"asset_ids"`
+	ParentIDs       []json.RawMessage `json:"parent_ids"`
+	Priority        int               `json:"priority"`
+	IdentityID      int64             `json:"identity_id"` // optional: bind this intent to a configured task identity; 0 = anonymous
+	Continues       []json.RawMessage `json:"continues"`
+	Hypothesis      string            `json:"hypothesis"`
+	SuccessCriteria string            `json:"success_criteria"`
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1064,7 +1176,8 @@ type intentItem struct {
 // 节点（不能挂在别的意图/目标/提示上）。顶层全新方向留空 parent_ids，兜底连 origin fact。
 // 这样"每个意图都连到 fact 节点、且是发现驱动而非凭空规划"从创建路径上被强制。
 func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
-	if strings.TrimSpace(it.Summary) == "" {
+	summary := clampIntentSummary(it.Summary)
+	if strings.TrimSpace(summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
 	}
 	// 先校验锚点（建节点前，避免坏锚点留下孤儿意图）。
@@ -1082,6 +1195,35 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if priority == 0 {
 		priority = 5
 	}
+	// 接续校验 + 代数计算。
+	//
+	// 约束：continues 只能指向**已存在的意图**节点（接续的是一条探索方向，
+	// 不是一条事实）。代数 = 1 + 上游接续链上的最大代数。
+	//
+	// 为什么要有代数上限：接续链一旦没有闸就会无限拉长。线上实测到三代接续
+	// ——#635 → #578 → #660，摘要在说「接续两次被后端重启打断的 #635/#578 继续
+	// 攻 ZStack 管理 API 凭据这条皇冠链（#635 上一轮已跑到 56 轮/28 分钟）」。
+	// 每一代都从零重建上下文、重复读同一批文件、重复扫同一批资产，而接续的那
+	// 条链可能压根不值得继续。
+	continues := pidList(it.Continues)
+	depth := 1
+	for _, cid := range continues {
+		cn, err := t.ts.GetNodeWithSources(cid)
+		if err != nil || cn == nil {
+			return 0, fmt.Errorf("continues %d 不存在：continues 只能填已存在的【意图】节点 id", cid)
+		}
+		if cn.Kind != db.KindIntent {
+			return 0, fmt.Errorf("continues %d 是 %q 节点，不能作为接续来源：continues 只能填【意图】id（接续的是一条探索方向）", cid, cn.Kind)
+		}
+		if d := continuationDepthOf(cn); d+1 > depth {
+			depth = d + 1
+		}
+	}
+	if depth > maxContinuationDepth {
+		return 0, fmt.Errorf("接续代数已达上限（%d 代）：这条方向已经被接续了 %d 次，继续接下去大概率是在重复劳动。"+
+			"请改为：①换一种本质不同的打法（换入口/换方法/换目标面）；②或直接放弃这个方向，转向尚未覆盖的方向",
+			maxContinuationDepth, depth)
+	}
 	anchors := pidList(it.AssetIDs)
 	// 资产拦截：意图绑定的资产若命中系统资产拦截规则，则禁止下发该意图。
 	if t.as != nil && len(anchors) > 0 {
@@ -1098,12 +1240,27 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 			return 0, fmt.Errorf("%s", b.String())
 		}
 	}
-	payload := map[string]any{"summary": it.Summary}
+	payload := map[string]any{"summary": summary}
+	if h := strings.TrimSpace(it.Hypothesis); h != "" {
+		payload["hypothesis"] = h
+	}
+	if sc := strings.TrimSpace(it.SuccessCriteria); sc != "" {
+		payload["success_criteria"] = sc
+	}
 	if len(anchors) > 0 {
 		payload["asset_ids"] = anchors
 	}
 	if it.IdentityID > 0 {
 		payload["identity_id"] = it.IdentityID
+	}
+	if len(continues) > 0 {
+		payload["continues"] = continues
+		payload["continuation_depth"] = depth
+	}
+	// 派发去重：同任务里已有高度相似的 open/running 意图就不再重复下发。
+	if existID, existSum, similar, err := t.ts.FindSimilarOpenIntent(summary); err == nil && similar {
+		return 0, fmt.Errorf("已存在高度相似的未完成意图 #%d「%s」，未重复下发；若确实要做不同的事，请在 summary 里写清区别",
+			existID, firstLine(existSum, 60))
 	}
 	id, err := t.ts.AddIntent(payload, priority, anchors, "planner")
 	if err != nil {
@@ -1129,12 +1286,15 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 	return t.writeExpTool("add_intent", "生成【探索方向】写入 frontier，并连入探索链路。意图是开放的探索方向，不是固定类型——用 summary 一句话自由描述要探索/验证/利用什么。\n"+
 		"★优先批量：一轮筛出的多个新方向放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。",
 		obj(map[string]any{
-			"intents":    map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority/identity_id）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"summary":    str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
-			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
-			"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
-			"priority":   intp("优先级 0-10，默认5"),
-			"identity_id": intp("可选：绑定本任务已配置的测试身份 id（task_identities.id）。0=匿名（默认）。配置了身份也不能不做匿名测试——匿名意图与带身份意图应并行派发。"),
+			"intents":          map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority/identity_id/continues/hypothesis/success_criteria）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
+			"summary":          str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
+			"asset_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
+			"parent_ids":       map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
+			"continues":        map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "【仅当本方向是接续某条旧方向时填】上游【意图】节点 id（0/1/多个）——即本方向要接着哪条被掐断/被收口的意图继续做。**只在 summary 里明说「接续/继续 #NNN」时才填**，且必须与 summary 里提到的意图 id 一致。接续代数有上限（最多接 3 次），超了会被拒绝——到那时请换一种本质不同的打法或转向别的方向，别再接。顶层全新方向留空。"},
+			"priority":         intp("优先级 0-10，默认5。直接逼近目标的利用链步=8-10；新入口面首次探明=6-7；补覆盖/复核=3-4；纯情报=1-2。同轮多意图按价值区分，别全默认 5。"),
+			"identity_id":      intp("可选：绑定本任务已配置的测试身份 id（task_identities.id）。0=匿名（默认）。配置了身份也不能不做匿名测试——匿名意图与带身份意图应并行派发。"),
+			"hypothesis":       str("【建议填】本方向的假设：依据哪条 fact 的什么推测（引用 fact id）。worker 会以它为验证目标，你下轮判「有没有产出」也有对照锚。"),
+			"success_criteria": str("【建议填】怎么算成了/没成：期望拿到的 fact/finding 形态（如「拿到 admin cookie 的请求响应」/「证实参数 X 不可注入的输出」）。"),
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -1248,24 +1408,40 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 			_ = json.Unmarshal(in, &a)
 			t.GoalMet = true
 			t.Reason = a.Reason
-			return actool.Text("acknowledged: goal marked met"), nil
+			// 可审计：goal_met 是「整体声称达成」，没有走 prove_goal 的逐条证据链。
+			// 把仍未 met 的目标打上未验证标记，报告与界面才能区分「被证明」和「被声称」，
+			// 而不是让一次偷懒的收官看起来和验证过的达成一样。
+			// t.ts 为 nil 时（无任务上下文的 ToolSet，如工具目录构造期）跳过：那条路径
+			// 本来就调不到这里，但 nil 解引用会直接把进程带走，不值得赌。
+			unproven := 0
+			if t.ts != nil {
+				if goals, err := t.ts.ListByKind(db.KindGoal, 1000); err == nil {
+					for _, g := range goals {
+						if g.State != "met" {
+							unproven++
+							_ = t.ts.MarkGoalUnverified(g.ID, a.Reason)
+						}
+					}
+				}
+			}
+			return actool.Text(fmt.Sprintf("acknowledged: task marked complete（%d 个目标未经逐条证据证明，已留痕）", unproven)), nil
 		})
 }
 
 // --- worker write tools ---
 
 func (t *ToolSet) addFinding() actool.CoreTool {
-	return writeTool("report_finding", "记录已实证的真实漏洞（必须有可验证的实际安全危害；未闭环的前置原语/纯监控或配置暴露新域名请用 record_fact）。建议同时提供 cwe_id 与 cvss_vector，系统将按 FIRST CVSS v3.1 标准公式自动复核并校准 severity。任务上下文传当前 intent_id。", obj(map[string]any{
-		"vulnclass":   str("漏洞类别"),
+	return writeTool("report_finding", "记录已实证的真实漏洞（必须有可验证的实际安全危害；未闭环的前置原语/纯监控或配置暴露新域名请用 record_fact）。建议同时提供 cwe_id 与 cvss_vector，系统将按 FIRST CVSS v3.1 标准公式自动复核并校准 severity。任务上下文传当前 intent_id。返回的 finding_id 是独立漏洞记录 ID，finding_node_id 是探索节点 ID（第一行保留该节点编号）。", obj(map[string]any{
+		"vulnclass":   str("漏洞类别,【必须】从标准类别里选:" + db.VulnClassPromptText() + "。具体 CVE/漏洞编号写进 name,类别选「已知漏洞」;实在不属于任何一类才用「其他」"),
 		"name":        str("漏洞名称"),
 		"cwe_id":      str("可选但强烈建议：CWE 编号（如 CWE-200 / CWE-306 / CWE-639 / CWE-798），用于标准弱点归类与同源去重"),
 		"cvss_vector": str("可选但强烈建议：CVSS v3.1 向量（如 CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N）。C/I/A 必须仅按【本次已实证的结果】填写（严禁按未验证的后续利用链拔高）：C:H 仅限已拿到可用凭据/密钥/成规模核心业务数据/源码；/metrics、Actuator、路由配置、单笔样本或存在性 Oracle 最高 C:L（5.3 medium）；I:H 仅限已实证篡改真实业务状态或 RCE，假回调未改单/盲上传无读回链最高 I:L 或记 fact"),
-		"severity":    str("critical|high|medium|low（若传了 cvss_vector，系统将按 CVSS v3.1 实算分数自动校准 severity：9.0-10.0=critical, 7.0-8.9=high, 4.0-6.9=medium, 0.1-3.9=low）"),
+		"severity":    str("critical|high|medium|low（开启 CVSS 定级校准时，系统将按 CVSS v3.1 实算分数自动校准 severity：9.0-10.0=critical, 7.0-8.9=high, 4.0-6.9=medium, 0.1-3.9=low）"),
 		"summary":     str("发现摘要（须明确说明已验证的实际危害边界）"),
 		"intent_id":   idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id"},
 		"evidence":         str("证据/PoC 文本"),
 		"evidence_hint_id": idp("可选：本任务中对应此漏洞的提示节点 ID，自动携带其结构化 traffic_refs；不能引用继承提示或其他漏洞的提示"),
-		"traffic_refs": map[string]any{"type": "array", "description": "可选；HTTP/HTTPS 漏洞先检索并逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID。TCP 等非 HTTP 漏洞、未采集或找不到确切记录时省略或传 []，不阻止上报；可在 evidence 说明原因并提供其他可验证证据。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。",
+		"traffic_refs": map[string]any{"type": "array", "description": "可选；HTTP/HTTPS 漏洞先检索并逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID。TCP 等非 HTTP 漏洞、未采集或找不到确切记录时省略或传 []，不阻止上报；可在 evidence 说明原因并提供其他可验证证据。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。若某个 ID 不存在，漏洞仍会正常入库，该 ID 会在返回值的 skipped_traffic_refs 里列出，可用 traffic_get 核实后用 bind_finding_traffic 补绑。",
 			"items": obj(map[string]any{"traffic_id": str("traffic_search 返回的真实流量 ID"), "role": map[string]any{"type": "string", "enum": []string{"baseline", "proof", "verification", "supporting"}}, "note": str("该流量如何支持漏洞结论")}, "traffic_id")},
 	}, "vulnclass", "severity", "summary"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 		var a struct {
@@ -1359,6 +1535,28 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 				result.EvidenceNote = "漏洞已保存。Agent 自动绑定流量已关闭，可在页面人工关联流量。"
 			}
 		}
+		if recorded.Duplicate {
+			// 指纹命中:证据已合并进已有记录。硬闸语义必须讲清,否则模型会把
+			// "重复"理解成失败而换个说法再报一遍。
+			result.EvidenceNote = "★ 该漏洞此前已上报(finding_id=" + strconv.FormatInt(recorded.FindingID, 10) +
+				"),本次证据已【合并】进原记录——这不是失败,无需再次 report_finding,更不要换标题/类别重报。" +
+				"继续探索其它方向即可;若原记录的 severity 有变化,已在本次合并中更新。"
+			if len(recorded.Traffic.Bindings) == 0 {
+				result.EvidenceStatus = "merged"
+			}
+		}
+		// 部分引用没挂上（流量 ID 不存在/正文不可读）：漏洞已入库，但要让模型
+		// 知道哪几条证据没生效，否则它会以为证据齐全、报告里就少了这段。
+		// 放在重复分支之后：两条提示都要留（先说合并，再补未生效的引用）。
+		if len(recorded.SkippedRefs) > 0 {
+			ids := make([]string, 0, len(recorded.SkippedRefs))
+			for _, r := range recorded.SkippedRefs {
+				ids = append(ids, r.TrafficID)
+			}
+			result.EvidenceStatus = "partially_bound"
+			result.EvidenceNote += " ⚠ 以下流量引用未生效（ID 不存在或正文不可读）：" + strings.Join(ids, ", ") +
+				"。已生效的引用已正常绑定；若这些 ID 确实存在，请用 traffic_get 核实真实 ID 后用 bind_finding_traffic 补绑。"
+		}
 		raw, _ := json.Marshal(result)
 		return actool.Text(fmt.Sprintf("finding recorded: %d\n%s", recorded.NodeID, raw)), nil
 	})
@@ -1411,7 +1609,9 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 		}
 	}
 	// a fact is its OWN node kind (distinct from a vuln finding).
-	id, err := t.ts.AddNode(db.KindFact, payload, 5, "confirmed", t.worker, pidList(it.AssetIDs))
+	assetIDs := pidList(it.AssetIDs)
+	missing := t.missingAssetIDs(assetIDs)
+	id, err := t.ts.AddNode(db.KindFact, payload, 5, "confirmed", t.worker, assetIDs)
 	if err != nil {
 		return 0, err
 	}
@@ -1419,7 +1619,39 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 		_ = t.ts.Link(intent, db.RelYields, id) // chain: intent -> fact
 	}
 	t.writes.Facts++
+	// 事实已经写下去了，但锚点里指向不存在资产的边被丢弃了。把这件事告诉模型，
+	// 它下次就知道该 asset id 根本不存在——否则它会一直用同一个假 id，
+	// 而 planner 看到的资产链路里会少掉本该关联的资产。
+	if len(missing) > 0 {
+		t.lastMissingAssets = append(t.lastMissingAssets, missing...)
+	}
 	return id, nil
+}
+
+// missingAssetIDs returns the subset of ids that do NOT exist in the asset
+// table. Used to tell the model "this asset id is not real" instead of silently
+// dropping the anchor.
+func (t *ToolSet) missingAssetIDs(ids []int64) []int64 {
+	if len(ids) == 0 || t.as == nil {
+		return nil
+	}
+	found, err := t.as.GetByIDs(ids)
+	if err != nil {
+		return nil
+	}
+	have := make(map[int64]bool, len(found))
+	for _, a := range found {
+		if a != nil {
+			have[a.ID] = true
+		}
+	}
+	var missing []int64
+	for _, id := range ids {
+		if !have[id] {
+			missing = append(missing, id)
+		}
+	}
+	return missing
 }
 
 func (t *ToolSet) recordFact() actool.CoreTool {
@@ -1454,6 +1686,7 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 
 			ids := make([]int64, len(items))
 			errs := map[string]string{}
+			t.lastMissingAssets = nil
 			for i, it := range items {
 				id, err := t.recordOneFact(it, defaultIntent)
 				if err != nil {
@@ -1477,19 +1710,35 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 					}
 				}
 			}
+			missing := t.lastMissingAssets
 
 			if !batch { // 单条：保持原返回
 				if e, bad := errs["0"]; bad {
 					return actool.Errorf(e), nil
 				}
-				return actool.Text(fmt.Sprintf("fact recorded: %d", ids[0])), nil
+				return actool.Text(factRecordText(ids[0], missing)), nil
 			}
 			out := map[string]any{"ids": ids}
 			if len(errs) > 0 {
 				out["errors"] = errs
 			}
+			if len(missing) > 0 {
+				out["skipped_asset_ids"] = missing
+				out["note"] = fmt.Sprintf("以下 asset id 不存在，锚点已跳过（事实本身已写入）：%v", missing)
+			}
 			return jsonResult(out)
 		})
+}
+
+// factRecordText renders the record_fact single-item result. Missing asset ids
+// are reported explicitly: silently dropping the anchor would leave the model
+// convinced it linked the fact to an asset, and it would keep reusing the same
+// fabricated id on every later write-back.
+func factRecordText(id int64, missing []int64) string {
+	if len(missing) == 0 {
+		return fmt.Sprintf("fact recorded: %d", id)
+	}
+	return fmt.Sprintf("fact recorded: %d（注意：asset id %v 不存在，锚点已跳过；事实本身已保存。请用 list_assets 查真实 id）", id, missing)
 }
 
 type hintItem struct {
@@ -1539,7 +1788,7 @@ func (t *ToolSet) addOneGoal(it goalItem) (int64, error) {
 		return 0, fmt.Errorf("text 不能为空")
 	}
 	payload := map[string]any{"text": text}
-	if vc := strings.TrimSpace(it.VulnClass); vc != "" {
+	if vc := db.NormalizeVulnClass(it.VulnClass); vc != "" {
 		payload["vulnclass"] = vc
 	}
 	origin := t.worker
@@ -1562,11 +1811,11 @@ func (t *ToolSet) setGoals() actool.CoreTool {
 	return writeTool("set_goals",
 		"给【本任务】新增探索目标(goal)。目标=最终可交付/可核验的结果,不是攻击步骤或侦察动作。\n"+
 			"★优先批量:多个目标放进 goals 数组一次提交,返回 ids 与之等长同序(失败项 id=0,详情见 errors)。单条则省略 goals 直接给顶层 text。\n"+
-			"vulnclass 可选:对应漏洞类(如 SQLi/IDOR),业务逻辑类目标留空。目标是否达成由系统判定标记 met,本工具只负责新增。",
+			"vulnclass 可选:对应漏洞类,标准类别:"+db.VulnClassPromptText()+";业务逻辑类目标留空。目标是否达成由系统判定标记 met,本工具只负责新增。",
 		obj(map[string]any{
 			"goals":     map[string]any{"type": "array", "description": "【优先用这个】要新增的目标数组,按顺序处理。每个元素:text(必填,一个独立可验证的最终目标)+ vulnclass(可选)。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
 			"text":      str("[单条] 一个独立可验证的最终目标"),
-			"vulnclass": str("[单条] 对应漏洞类(若明确),如 SQLi/IDOR;业务逻辑目标可留空"),
+			"vulnclass": str("[单条] 对应漏洞类(若明确),标准类别:" + db.VulnClassPromptText() + ";业务逻辑目标可留空"),
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.ts == nil {
@@ -2057,17 +2306,17 @@ func (t *ToolSet) searchAllWorkerTraces() actool.CoreTool {
 		})
 }
 
-// listWorkerTraces gives a worker (which has no graph_overview and can't see the
-// intent graph) a lightweight index of the works in this task — intent_id +
-// one-line summary + state — so it can DISCOVER which works to inspect via
-// get_worker_trace. Without this a worker only knows intent_ids that come back
-// from search_all_worker_traces hits. Excludes still-open intents (not yet run →
-// no process to inspect).
+// listWorkerTraces gives planner/mainagent a lightweight index of the works in
+// this task — intent_id + one-line summary + state — so they can DISCOVER which
+// works to inspect via get_worker_trace during cross-work review. Registered in
+// MainAgentTools only: workers get their per-intent context from the engine and
+// must not wander the graph (tools_insert.go WorkerTools 注释)。Excludes
+// still-open intents (not yet run → no process to inspect).
 func (t *ToolSet) listWorkerTraces() actool.CoreTool {
 	return t.readExpTool("list_worker_traces",
 		"【通常不推荐使用，因为系统中已经给了大部分信息了】列出本任务里【已跑过的 work（意图）】索引：intent_id + 一句话方向(summary) + 状态。"+
-			"你(worker)看不到探索图，用它来发现有哪些 work 值得翻看——再用 get_worker_trace(intent_id) 看其步骤、get_worker_trace(intent_id, step_ids=[...]) 取详情。"+
-			"只列已执行的(running/done/exhausted/blocked/stopped)，不含还没跑的 open。注意：你的任务边界仍是你领到的那条意图，看别的 work 只为复用观察/避免重复劳动。",
+			"你(mainagent/planner 视角)通常已能从 graph_overview 看到全局；需要逐 work 复盘执行过程时，用它先发现有哪些 work 值得翻看——再用 get_worker_trace(intent_id) 看其步骤、get_worker_trace(intent_id, step_ids=[...]) 取详情。"+
+			"只列已执行的(running/done/exhausted/blocked/stopped)，不含还没跑的 open。",
 		obj(map[string]any{
 			"q":     str("按 summary 关键字过滤（可选）"),
 			"limit": intp("返回上限，默认 50（可选）"),
@@ -2137,5 +2386,42 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
+		// search_vulns / get_vuln：识别出目标组件后查公开已知漏洞（NVD+KEV），
+		// 规划阶段把「有现成利用的方向」排进 todolist。
+		t.searchVulns(), t.getVuln(), t.getPoc(), t.scanWithNuclei(), t.netContext(),
+		// listener_*：回连接收器（红队 C2 前置）——start/stop 走 ask 审批，sessions 只读。
+		t.listenerStart(), t.listenerStop(), t.listenerSessions(),
+		// auth_request：用资产上已登记的凭据组装带认证的请求（横向/越权验证的前提）。
+		t.authRequest(),
+		// diff_responses：对比两个响应的结构性差异（越权/可枚举/状态机三类的共同基础）。
+		t.diffResponses(),
+		// api_contract：读目标暴露的 API 契约文件，拿到比爬虫更准的接口清单。
+		t.apiContractTool(),
+		// search_recent_critical：按【时间】查最近披露的高危漏洞（不需先知道组件名/CVE 号）。
+		t.searchRecentCritical(),
 	}
+}
+
+// stallOverview 计算本任务的"边际收益"态势:最近的产出轮是第几轮、
+// 距今几轮无新 fact/finding(零产出即停)。读 activity 的 round/result
+// 流水在 SQL 一把算,per-turn 开销受探索图 EXPLAIN的可控范围。
+// 返回 nil 也有意义:任务还年轻,没到能谈收官的规模。
+func (t *ToolSet) stallOverview() map[string]any {
+	rounds, recentNew, openCnt, err := t.ts.StallOverview()
+	if err != nil {
+		return nil
+	}
+	out := map[string]any{"planner_rounds": rounds}
+	if rounds < 5 {
+		// 前几轮还在打底,谈边际收益太早
+		return out
+	}
+	out["new_facts_findings_6h"] = recentNew
+	out["open_intents_now"] = openCnt
+	// 提示位:零新产出 + 无 open → 建议收官
+	if recentNew == 0 && openCnt == 0 {
+		out["hint"] = "最近 6 小时无新 fact/finding 且无 open 意图——边际收益可能已耗尽。若目标确已尽力," +
+			"用 goal_met 收官(reason 写明边际收益耗尽的诚实小结);仍有未测方向就继续派意图。"
+	}
+	return out
 }

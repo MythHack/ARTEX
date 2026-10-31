@@ -116,9 +116,10 @@ func (t *ToolSet) resolveDigest(id int64) (*db.Node, *db.ExplorationStore, int64
 
 // expandDigest returns a digest's covered members as a compact list (§6.1). It is
 // a distinct tool from node_detail because it returns a LIST of members, not one
-// node's full detail.
+// node's full detail. 纯读工具必须走 readExpTool——writeExpTool 会丢
+// ReadOnly/Concurrent 标记，调度层把它当写工具串行化并按写权限拦截。
 func (t *ToolSet) expandDigest() actool.CoreTool {
-	return t.writeExpTool("expand_digest",
+	return t.readExpTool("expand_digest",
 		"展开一个 cold digest：返回它折叠的成员紧凑列表（id/summary/state/confidence），与概览 recent_facts/recent_done_intents 同形状。要某条完整细节/证据用 node_detail(member_id)。",
 		map[string]any{
 			"type": "object",

@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -104,6 +106,9 @@ type FindingTraffic struct {
 	Version       int64                   `json:"version"`
 	ReportVersion int64                   `json:"report_version"`
 	Bindings      []FindingTrafficBinding `json:"bindings"`
+	// SkippedRefs 是本次请求里无法解析的流量引用。绑定是尽力而为:有效的
+	// 照常挂上,无效的记在这里,已有的绑定不受影响。
+	SkippedRefs []TrafficRef `json:"skipped_traffic_refs,omitempty"`
 }
 
 type PreparedTrafficEvidence struct {
@@ -335,6 +340,28 @@ type RecordedFinding struct {
 	FindingID int64           `json:"finding_id,string"`
 	NodeID    int64           `json:"finding_node_id,string"`
 	Traffic   *FindingTraffic `json:"traffic"`
+	// Duplicate=true 表示本次上报命中了同任务内已有的同指纹漏洞,证据已合并
+	// 进原记录(而不是新建);调用方应据此提示模型停止重复上报。
+	Duplicate bool `json:"-"`
+	// SkippedRefs 是本次提交里无法解析(流量 ID 不存在/正文不可读)的引用。
+	// 漏洞本身照常入库——猜错一个 ID 不该丢掉已确认的漏洞——但调用方要把
+	// 这些 ID 原样回给模型,让它知道哪些证据没挂上。
+	SkippedRefs []TrafficRef `json:"skipped_traffic_refs,omitempty"`
+}
+
+// FindingFingerprint 归一化 (vulnclass, name, sorted asset_ids) 为上报指纹。
+// 归一:小写、压缩空白;资产按 id 排序消除上报顺序差异。
+func FindingFingerprint(in RecordFindingInput) string {
+	norm := func(s string) string { return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(s))), " ") }
+	ids := append([]int64{}, in.AssetIDs...)
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	parts := make([]string, len(ids))
+	for i, v := range ids {
+		parts[i] = strconv.FormatInt(v, 10)
+	}
+	raw := norm(in.VulnClass) + "|" + norm(in.Name) + "|" + strings.Join(parts, ",")
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:16]) // 128-bit 足够;避免长索引键
 }
 
 // ctx 由调用方传入本次事务所用的上下文（而非在内部取 context.Background）：
@@ -361,6 +388,54 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 			return nil, errors.New("intent_id 必须是本任务的意图（关联任务意图只读）")
 		}
 	}
+	// ── 同任务内指纹去重:同一 (vulnclass,name,assets) 视为同一漏洞的重复上报,
+	// 证据合并进已有记录而不是再插一行——"报了 A 又把 A 重新报一遍"在写入层被
+	// 硬性拦住,不依赖模型自觉。
+	// 仅对【带资产锚定】的上报启用:无资产锚定时无法区分"同一目标"与"两个
+	// 不同入口的同名漏洞",合并会误伤(如不同端口各一个 SQLi 都叫 SQL injection);
+	// 宁漏勿误,worker 正常上报都会带 asset_ids。
+	// resolved/fixed/false_positive/ignored 已是终态或人工结论,不参与合并
+	// (修复后再复现 = 值得新开一条;误报后再证实 = 翻案)。
+	// vulnclass 归一(变体写法→标准类别):写入即归一,聚合视图与指纹去重
+	// 都基于标准值——SQLi 与 SQL注入 从此是同一类别、同一指纹。
+	in.VulnClass = NormalizeVulnClass(in.VulnClass)
+	fp := FindingFingerprint(in)
+	if in.TaskID > 0 && fp != "" && len(in.AssetIDs) > 0 {
+		var (
+			dupeID     int64
+			dupeNode   int64
+			dupeStatus string
+		)
+		err := tx.QueryRow(`SELECT id, COALESCE(node_id,0), status FROM findings
+			WHERE task_id=$1 AND fingerprint=$2
+			  AND status IN ('pending','in_progress','confirmed')
+			ORDER BY id LIMIT 1 FOR UPDATE`, in.TaskID, fp).Scan(&dupeID, &dupeNode, &dupeStatus)
+		if err == nil {
+			stamp := time.Now().UTC().Format("2006-01-02 15:04")
+			appendix := fmt.Sprintf("\n\n--- 二次确认(worker=%s, %s UTC) ---\n%s", in.Worker, stamp, in.Evidence)
+			if _, err := tx.Exec(`UPDATE findings SET evidence = evidence || $2, severity = $3 WHERE id=$1`,
+				dupeID, appendix, in.Severity); err != nil {
+				return nil, err
+			}
+			// 血缘:这个 intent 也(再次)产出了该漏洞节点,planner 链路完整。
+			if in.IntentID > 0 && dupeNode > 0 {
+				if _, err := tx.Exec(`INSERT INTO exploration_edges(exploration_id,src_id,rel,dst_id)
+					SELECT $1,$2,$3,$4 WHERE NOT EXISTS(
+						SELECT 1 FROM exploration_edges WHERE exploration_id=$1 AND src_id=$2 AND rel=$3 AND dst_id=$4)`,
+					in.ExplorationID, in.IntentID, RelYields, dupeNode); err != nil {
+					return nil, err
+				}
+			}
+			out := &RecordedFinding{FindingID: dupeID, NodeID: dupeNode, Duplicate: true}
+			// 重复上报同样要把本次带来的流量挂到原记录上:二次确认往往带着
+			// 更新后的复现包(不同响应码/新载荷),只并文字证据会把它丢掉。
+			if err := AddFindingTrafficTx(tx, dupeID, prepared); err != nil {
+				return nil, err
+			}
+			out.Traffic, err = FindingTrafficTx(tx, dupeID)
+			return out, err
+		}
+	}
 	payload, _ := json.Marshal(map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}})
 	out := &RecordedFinding{}
 	if err := tx.QueryRow(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
@@ -382,8 +457,8 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 		assets = []int64{}
 	}
 	raw, _ := json.Marshal(assets)
-	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids)
-VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw)).Scan(&out.FindingID); err != nil {
+	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids,fingerprint)
+VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw), fp).Scan(&out.FindingID); err != nil {
 		return nil, err
 	}
 	// 在**同一事务**里登记一条推送事件：提交即保证「漏洞落库」与「推送任务存在」
