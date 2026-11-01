@@ -360,6 +360,7 @@ docs/           设计文档 / 部署手册 / 评估报告 / 能力对照
 
 | 文档 | 内容 |
 |---|---|
+| [当前架构与能力状态](docs/architecture.md) | 整体架构图、现有能力、实际接线、配置条件和 CI/运行验证状态；每日维护 |
 | [docs/01-双图架构.md](docs/01-双图架构.md) | 资产图/探索图、锚点、schema 迁移设计、不变量清单 |
 | [docs/02-引擎与调度闭环.md](docs/02-引擎与调度闭环.md) | planner/worker 编排与生命周期 |
 | [docs/03-LLM接入层.md](docs/03-LLM接入层.md) | 通道选路、轮询池、熔断、录制计量 |
@@ -421,3 +422,4 @@ docs/           设计文档 / 部署手册 / 评估报告 / 能力对照
 - [norma](https://github.com/Autumn-27/norma) — agent harness SDK（本平台多 Agent 引擎）
 - [Cairn](https://github.com/oritera/Cairn) — 黑板架构参考
 - [SecLists](https://github.com/danielmiessler/SecLists) / [nuclei-templates](https://github.com/projectdiscovery/nuclei-templates) — 语料与模板
+
