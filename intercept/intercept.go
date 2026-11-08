@@ -372,6 +372,7 @@ const (
 	// ask 审批（规则未声明 timeout 时）的全局兜底上限。规则级 TimeoutEnabled
 	// 之外的最后一道墙：审批人离场不能让 worker 无限挂死（v0.3.88 体检 S2）。
 	settingAskDefaultTimeoutSecs = "intercept_ask_default_timeout_seconds"
+	settingJudgeConfidence       = "llm_judge_confidence_threshold"
 )
 
 // defaultAskTimeoutSecs：6 小时。语义与 judge 侧 180s 不同——这里是「规则
@@ -407,6 +408,7 @@ const (
 	defaultJudgeFailAction       = "ask"
 	defaultJudgeAskTimeoutSecs   = 180
 	defaultJudgeAskTimeoutAction = "allow"
+	defaultJudgeConfidence       = 0.55
 	// DefaultIncompleteScriptAction keeps incomplete snapshots with the judge.
 	DefaultIncompleteScriptAction = "model"
 
@@ -417,16 +419,17 @@ const (
 // JudgeConfig is the resolved LLM-fallback-judge configuration. Prompt is always
 // non-empty (falls back to DefaultJudgePrompt).
 type JudgeConfig struct {
-	Enabled                bool   `json:"enabled"`
-	ProfileID              int64  `json:"profile_id"` // 0 = follow active/default
-	Prompt                 string `json:"prompt"`
-	TimeoutSeconds         int    `json:"timeout_seconds"` // per attempt
-	RetryCount             int    `json:"retry_count"`     // additional attempts; 0 = disabled
-	RetryIntervalMS        int    `json:"retry_interval_ms"`
-	FailAction             string `json:"fail_action"` // allow|ask|deny
-	AskTimeoutSeconds      int    `json:"ask_timeout_seconds"`
-	AskTimeoutAction       string `json:"ask_timeout_action"`       // allow|deny
-	IncompleteScriptAction string `json:"incomplete_script_action"` // ask|model
+	Enabled                bool    `json:"enabled"`
+	ProfileID              int64   `json:"profile_id"` // 0 = follow active/default
+	Prompt                 string  `json:"prompt"`
+	TimeoutSeconds         int     `json:"timeout_seconds"` // per attempt
+	RetryCount             int     `json:"retry_count"`     // additional attempts; 0 = disabled
+	RetryIntervalMS        int     `json:"retry_interval_ms"`
+	FailAction             string  `json:"fail_action"` // allow|ask|deny
+	AskTimeoutSeconds      int     `json:"ask_timeout_seconds"`
+	AskTimeoutAction       string  `json:"ask_timeout_action"`       // allow|deny
+	IncompleteScriptAction string  `json:"incomplete_script_action"` // ask|model
+	ConfidenceThreshold    float64 `json:"confidence_threshold"`     // Jev only; below this becomes ask
 }
 
 // judgeConfig reads the judge configuration from settings, applying defaults for
@@ -456,6 +459,7 @@ func (i *Interceptor) judgeConfig() JudgeConfig {
 		AskTimeoutSeconds:      i.getSettingInt(settingJudgeAskTimeoutSecs, defaultJudgeAskTimeoutSecs),
 		AskTimeoutAction:       i.getSettingChoice(settingJudgeAskTimeoutAction, defaultJudgeAskTimeoutAction, "allow", "deny"),
 		IncompleteScriptAction: i.getSettingChoice(settingJudgeIncompleteScript, DefaultIncompleteScriptAction, "ask", "model"),
+		ConfidenceThreshold:    i.getSettingFloat(settingJudgeConfidence, defaultJudgeConfidence),
 	}
 	// Prompt: stored value if non-empty, else the built-in template.
 	if v, ok, _ := i.db.GetSetting(settingJudgePrompt); ok && strings.TrimSpace(v) != "" {
@@ -469,6 +473,9 @@ func (i *Interceptor) judgeConfig() JudgeConfig {
 	if c.AskTimeoutSeconds <= 0 {
 		c.AskTimeoutSeconds = defaultJudgeAskTimeoutSecs
 	}
+	if c.ConfidenceThreshold < 0 || c.ConfidenceThreshold > 1 {
+		c.ConfidenceThreshold = defaultJudgeConfidence
+	}
 	return c
 }
 
@@ -478,6 +485,18 @@ func (i *Interceptor) judgeConfig() JudgeConfig {
 // 长命令明显更久，且正文为空时要升预算重试——超时给短了会把「模型其实
 // 能裁决」误判成超时失败。
 func DefaultJudgeTimeoutSeconds() int { return defaultJudgeTimeoutSecs }
+
+func (i *Interceptor) getSettingFloat(key string, def float64) float64 {
+	v, ok, err := i.db.GetSetting(key)
+	if err != nil || !ok {
+		return def
+	}
+	n, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil {
+		return def
+	}
+	return n
+}
 
 func (i *Interceptor) getSettingInt(key string, def int) int {
 	v, ok, err := i.db.GetSetting(key)
@@ -515,6 +534,9 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 	if err := c.ValidateRetry(); err != nil {
 		return err
 	}
+	if c.ConfidenceThreshold < 0 || c.ConfidenceThreshold > 1 {
+		return fmt.Errorf("confidence_threshold 必须在 0 到 1 之间")
+	}
 	if err := i.db.SetBool(settingJudgeEnabled, c.Enabled); err != nil {
 		return err
 	}
@@ -549,6 +571,9 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 		return err
 	}
 	if err := i.db.SetSetting(settingJudgeIncompleteScript, c.IncompleteScriptAction); err != nil {
+		return err
+	}
+	if err := i.db.SetSetting(settingJudgeConfidence, strconv.FormatFloat(c.ConfidenceThreshold, 'f', 4, 64)); err != nil {
 		return err
 	}
 	return nil

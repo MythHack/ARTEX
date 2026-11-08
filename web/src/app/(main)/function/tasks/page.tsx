@@ -24,6 +24,8 @@ import {
   ChevronRightIcon,
   EyeIcon,
   FolderInputIcon,
+  GlobeIcon,
+  GlobeOffIcon,
   GripVerticalIcon,
   Loader2Icon,
   PaperclipIcon,
@@ -643,6 +645,30 @@ export default function TasksPage() {
     [load],
   );
 
+  const toggleTaskGlobalAssets = React.useCallback(
+    async (task: Task) => {
+      const enabled = task.share_global_assets === true;
+      try {
+        const updated = await api.updateTask(task.id, {
+          share_global_assets: !enabled,
+        });
+        setTasks((current) =>
+          current.map((entry) =>
+            entry.id === task.id
+              ? { ...entry, share_global_assets: updated.share_global_assets }
+              : entry,
+          ),
+        );
+        toast.success(`任务 #${task.id} 已${enabled ? "关闭" : "开启"}共享全局资产`);
+        lastRef.current = "";
+        load();
+      } catch (error) {
+        toast.error(`设置失败：${(error as Error).message}`);
+      }
+    },
+    [load],
+  );
+
   const queueTaskArchive = React.useCallback(
     async (task: Task) => {
       try {
@@ -1052,6 +1078,7 @@ export default function TasksPage() {
                       onRename={renameTask}
                       onRemark={updateTaskRemark}
                       onTogglePinned={toggleTaskPinned}
+                      onToggleGlobalAssets={toggleTaskGlobalAssets}
                       onArchive={queueTaskArchive}
                       selected={selectedIds.has(task.id)}
                       onSelectedChange={toggleSelected}
@@ -1228,6 +1255,7 @@ const TaskRow = React.memo(function TaskRow({
   onRename,
   onRemark,
   onTogglePinned,
+  onToggleGlobalAssets,
   onArchive,
   selected,
   onSelectedChange,
@@ -1239,6 +1267,7 @@ const TaskRow = React.memo(function TaskRow({
   onRename: (task: Task, name: string) => Promise<void>;
   onRemark: (task: Task, remark: string) => Promise<void>;
   onTogglePinned: (task: Task) => Promise<void>;
+  onToggleGlobalAssets: (task: Task) => Promise<void>;
   onArchive: (task: Task) => Promise<void>;
   selected: boolean;
   onSelectedChange: (id: string, checked: boolean) => void;
@@ -1376,11 +1405,24 @@ const TaskRow = React.memo(function TaskRow({
       </TableCell>
       <TableCell className="sticky right-0 z-10 bg-card text-right shadow-[-1px_0_0_0_hsl(var(--border))] group-hover:bg-muted/50">
         <div className="flex items-center justify-end gap-0.5">
-          <Button size="icon" variant="ghost" asChild aria-label="查看任务详情" title="查看任务详情">
-            <Link href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}`}>
-              <EyeIcon />
-            </Link>
-          </Button>
+          <TaskGlobalAssetsAction task={task} onToggle={onToggleGlobalAssets} />
+          <TaskActionTooltip
+            label="查看任务详情"
+            description="查看任务进度、探索记录、测试资产和发现的漏洞。"
+          >
+            <Button
+              size="icon"
+              variant="ghost"
+              asChild
+              aria-label="查看任务详情"
+            >
+              <Link
+                href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}`}
+              >
+                <EyeIcon />
+              </Link>
+            </Button>
+          </TaskActionTooltip>
           <TaskControlButton task={task} onControl={onControl} />
           <TaskPinAction task={task} onTogglePinned={onTogglePinned} />
           <TaskArchiveAction task={task} onArchive={onArchive} />
@@ -1391,7 +1433,47 @@ const TaskRow = React.memo(function TaskRow({
   );
 });
 
-function TaskNameEditor({ task, onRename }: { task: Task; onRename: (task: Task, name: string) => Promise<void> }) {
+function TaskActionTooltip({
+  label,
+  description,
+  children,
+  disabled = false,
+}: {
+  label: string;
+  description: string;
+  children: React.ReactElement;
+  disabled?: boolean;
+}) {
+  return (
+    <Tooltip delayDuration={200}>
+      <TooltipTrigger asChild>
+        {disabled ? (
+          <span className="inline-flex" aria-label={label}>
+            {children}
+          </span>
+        ) : (
+          children
+        )}
+      </TooltipTrigger>
+      <TooltipContent
+        side="top"
+        sideOffset={6}
+        className="block max-w-64 space-y-1 text-left leading-relaxed"
+      >
+        <p className="font-medium">{label}</p>
+        <p>{description}</p>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+function TaskNameEditor({
+  task,
+  onRename,
+}: {
+  task: Task;
+  onRename: (task: Task, name: string) => Promise<void>;
+}) {
   const [editing, setEditing] = React.useState(false);
   const [name, setName] = React.useState(task.name ?? "");
   const [saving, setSaving] = React.useState(false);
@@ -1467,20 +1549,24 @@ function TaskNameEditor({ task, onRename }: { task: Task; onRename: (task: Task,
       >
         {task.name?.trim() ? task.name : <span className="text-muted-foreground">未命名</span>}
       </Link>
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon-xs"
-        className="shrink-0 opacity-100 transition-opacity [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-focus-within:opacity-100 [@media(hover:hover)]:group-hover:opacity-100"
-        aria-label={`重命名任务 #${task.id}`}
-        title="重命名"
-        onClick={() => {
-          setName(task.name ?? "");
-          setEditing(true);
-        }}
+      <TaskActionTooltip
+        label="重命名任务"
+        description="修改任务名称，便于识别和查找。"
       >
-        <PencilIcon />
-      </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          className="shrink-0 opacity-100 transition-opacity [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-focus-within:opacity-100 [@media(hover:hover)]:group-hover:opacity-100"
+          aria-label={`重命名任务 #${task.id}`}
+          onClick={() => {
+            setName(task.name ?? "");
+            setEditing(true);
+          }}
+        >
+          <PencilIcon />
+        </Button>
+      </TaskActionTooltip>
     </div>
   );
 }
@@ -1496,24 +1582,93 @@ function TaskPinAction({ task, onTogglePinned }: { task: Task; onTogglePinned: (
   const pinned = taskIsPinned(task);
 
   return (
-    <Button
-      type="button"
-      variant="ghost"
-      size="icon"
+    <TaskActionTooltip
+      label={pinned ? "取消置顶" : "置顶任务"}
+      description={
+        pinned
+          ? "取消此任务的置顶，恢复正常排序。"
+          : "将此任务固定在列表顶部，便于快速查看。"
+      }
       disabled={pinning}
-      aria-label={pinned ? `取消置顶任务 #${task.id}` : `置顶任务 #${task.id}`}
-      title={pinned ? "取消置顶" : "置顶"}
-      onClick={async () => {
-        setPinning(true);
-        try {
-          await onTogglePinned(task);
-        } finally {
-          setPinning(false);
-        }
-      }}
     >
-      {taskPinIcon(pinning, pinned)}
-    </Button>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        disabled={pinning}
+        aria-label={
+          pinned ? `取消置顶任务 #${task.id}` : `置顶任务 #${task.id}`
+        }
+        onClick={async () => {
+          setPinning(true);
+          try {
+            await onTogglePinned(task);
+          } finally {
+            setPinning(false);
+          }
+        }}
+      >
+        {taskPinIcon(pinning, pinned)}
+      </Button>
+    </TaskActionTooltip>
+  );
+}
+
+function taskGlobalAssetsIcon(saving: boolean, enabled: boolean) {
+  if (saving) return <Loader2Icon className="animate-spin" />;
+  if (enabled) return <GlobeIcon />;
+  return <GlobeOffIcon />;
+}
+
+function TaskGlobalAssetsAction({
+  task,
+  onToggle,
+}: {
+  task: Task;
+  onToggle: (task: Task) => Promise<void>;
+}) {
+  const [saving, setSaving] = React.useState(false);
+  const enabled = task.share_global_assets === true;
+  const label = `共享全局资产：${enabled ? "已开启，点击关闭" : "未开启，点击开启"}`;
+  return (
+    <Tooltip delayDuration={200}>
+      <TooltipTrigger asChild>
+        <Button
+          size="icon"
+          variant="ghost"
+          aria-label={label}
+          aria-pressed={enabled}
+          aria-busy={saving}
+          className={enabled ? "text-foreground" : "text-muted-foreground"}
+          disabled={saving}
+          onClick={async () => {
+            setSaving(true);
+            try {
+              await onToggle(task);
+            } finally {
+              setSaving(false);
+            }
+          }}
+        >
+          {taskGlobalAssetsIcon(saving, enabled)}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent
+        side="top"
+        sideOffset={6}
+        className="block max-w-64 space-y-1 text-left leading-relaxed"
+      >
+        <p className="font-medium">
+          共享全局资产 · {enabled ? "已开启" : "已关闭"}
+        </p>
+        <p>
+          开启后可查询全局资产库；关闭后仅使用本任务已关联的资产及直接关联任务的资产。
+        </p>
+        <p className="opacity-75">
+          {enabled ? "点击关闭共享" : "点击开启共享"}
+        </p>
+      </TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -1536,25 +1691,34 @@ function TaskControlButton({
   const [pending, setPending] = React.useState(false);
   const action = taskControlAction(task.status);
   const label = action === "resume" ? "继续任务" : "暂停任务";
+  let description = "暂停当前任务的执行，之后可继续。";
+  if (action === "resume")
+    description = "继续已暂停的任务；等待中的任务将重新进入调度。";
+  if (!action) description = "当前任务状态不支持暂停或继续。";
   return (
-    <Button
-      size="icon"
-      variant="ghost"
-      aria-label={label}
-      title={action ? label : "该状态不可暂停或继续"}
+    <TaskActionTooltip
+      label={label}
+      description={description}
       disabled={!action || pending}
-      onClick={async () => {
-        if (!action) return;
-        setPending(true);
-        try {
-          await onControl(task.id, action);
-        } finally {
-          setPending(false);
-        }
-      }}
     >
-      {taskControlIcon(pending, action)}
-    </Button>
+      <Button
+        size="icon"
+        variant="ghost"
+        aria-label={label}
+        disabled={!action || pending}
+        onClick={async () => {
+          if (!action) return;
+          setPending(true);
+          try {
+            await onControl(task.id, action);
+          } finally {
+            setPending(false);
+          }
+        }}
+      >
+        {taskControlIcon(pending, action)}
+      </Button>
+    </TaskActionTooltip>
   );
 }
 
@@ -1621,15 +1785,28 @@ function TaskArchiveAction({ task, onArchive }: { task: Task; onArchive: (task: 
   );
   if (reason) {
     return (
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span className="inline-flex">{trigger}</span>
-        </TooltipTrigger>
-        <TooltipContent>{reason}</TooltipContent>
-      </Tooltip>
+      <TaskActionTooltip label="暂不可归档" description={reason} disabled>
+        {trigger}
+      </TaskActionTooltip>
     );
   }
-  return <ArchiveConfirmDialog count={1} trigger={trigger} onConfirm={() => onArchive(task)} />;
+  return (
+    <Tooltip delayDuration={200}>
+      <ArchiveConfirmDialog
+        count={1}
+        trigger={<TooltipTrigger asChild>{trigger}</TooltipTrigger>}
+        onConfirm={() => onArchive(task)}
+      />
+      <TooltipContent
+        side="top"
+        sideOffset={6}
+        className="block max-w-64 space-y-1 text-left leading-relaxed"
+      >
+        <p className="font-medium">归档任务</p>
+        <p>将任务及相关记录压缩保存，之后可从“已归档”中还原。点击后需确认。</p>
+      </TooltipContent>
+    </Tooltip>
+  );
 }
 
 const ARCHIVE_PROCESSING_STATES = new Set<TaskArchiveState>([
@@ -2050,37 +2227,51 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-0.5">
                         {ARCHIVE_FAILED_STATES.has(archive.state) && (
-                          <Button
-                            size="icon"
-                            variant="ghost"
-                            onClick={() => void retry(archive)}
-                            aria-label="重试归档操作"
-                            title="重试"
-                          >
-                            <Undo2Icon />
-                          </Button>
+                          <TaskActionTooltip label="重试归档操作" description="重新执行上次失败的归档、还原或删除操作。">
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              onClick={() => void retry(archive)}
+                              aria-label="重试归档操作"
+                            >
+                              <Undo2Icon />
+                            </Button>
+                          </TaskActionTooltip>
                         )}
                         {canRestore && (
-                          <Button
-                            size="icon"
-                            variant="ghost"
-                            onClick={() => void restoreMany([archive])}
-                            aria-label="还原任务"
-                            title="还原任务"
-                          >
-                            <Undo2Icon />
-                          </Button>
+                          <TaskActionTooltip label="还原任务" description="将归档中的任务及相关记录恢复到当前任务列表。">
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              onClick={() => void restoreMany([archive])}
+                              aria-label="还原任务"
+                            >
+                              <Undo2Icon />
+                            </Button>
+                          </TaskActionTooltip>
                         )}
                         {canDelete && (
-                          <ArchiveDeleteDialog
-                            archives={[archive]}
-                            onConfirm={() => deleteMany([archive])}
-                            trigger={
-                              <Button size="icon" variant="ghost" aria-label="永久删除归档" title="永久删除">
-                                <Trash2Icon />
-                              </Button>
-                            }
-                          />
+                          <Tooltip delayDuration={200}>
+                            <ArchiveDeleteDialog
+                              archives={[archive]}
+                              onConfirm={() => deleteMany([archive])}
+                              trigger={
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    size="icon"
+                                    variant="ghost"
+                                    aria-label="永久删除归档"
+                                  >
+                                    <Trash2Icon />
+                                  </Button>
+                                </TooltipTrigger>
+                              }
+                            />
+                            <TooltipContent side="top" sideOffset={6} className="block max-w-64 space-y-1 text-left leading-relaxed">
+                              <p className="font-medium">永久删除归档</p>
+                              <p>删除此归档及其保存的数据，删除后无法还原。点击后需确认。</p>
+                            </TooltipContent>
+                          </Tooltip>
                         )}
                       </div>
                     </TableCell>
@@ -2261,11 +2452,13 @@ function DeleteTaskDialog({
 
   return (
     <AlertDialog open={open} onOpenChange={handleOpenChange}>
-      <AlertDialogTrigger asChild>
-        <Button size="icon" variant="outline" aria-label="删除任务">
-          <Trash2Icon className="text-destructive" />
-        </Button>
-      </AlertDialogTrigger>
+      <TaskActionTooltip label="删除任务" description="删除任务及执行记录；可在确认窗口选择是否同时清理关联数据。">
+        <AlertDialogTrigger asChild>
+          <Button size="icon" variant="outline" aria-label="删除任务">
+            <Trash2Icon className="text-destructive" />
+          </Button>
+        </AlertDialogTrigger>
+      </TaskActionTooltip>
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>确认删除任务 #{task.id}？</AlertDialogTitle>
@@ -2783,19 +2976,24 @@ function DraggableCategoryTask({ task, disabled, moving }: { task: Task; disable
         {moving ? (
           <Spinner />
         ) : (
-          <Button
-            type="button"
-            size="icon-xs"
-            variant="ghost"
-            className="cursor-grab touch-none active:cursor-grabbing"
+          <TaskActionTooltip
+            label="移动任务分类"
+            description="按住并拖动此图标，将任务移动到目标分类。"
             disabled={disabled}
-            {...listeners}
-            {...attributes}
-            aria-label={`拖动任务 #${task.id}`}
-            title="拖动任务"
           >
-            <GripVerticalIcon />
-          </Button>
+            <Button
+              type="button"
+              size="icon-xs"
+              variant="ghost"
+              className="touch-none cursor-grab active:cursor-grabbing"
+              disabled={disabled}
+              {...listeners}
+              {...attributes}
+              aria-label={`拖动任务 #${task.id}`}
+            >
+              <GripVerticalIcon />
+            </Button>
+          </TaskActionTooltip>
         )}
       </ItemMedia>
       <ItemContent className="min-w-0">
@@ -3181,6 +3379,7 @@ function CreateTaskSheet({
   const [timeoutMin, setTimeoutMin] = React.useState(""); // 任务级超时(分钟);空/0 = 不限时
   const [heartbeatMin, setHeartbeatMin] = React.useState("10"); // planner 心跳(分钟);默认10,下限10(与后端一致)
   const [seedFirstIntent, setSeedFirstIntent] = React.useState(false); // 创建时下发种子意图,worker 免等首轮 planner 直接开跑;默认关闭,走标准先规划再执行
+  const [shareGlobalAssets, setShareGlobalAssets] = React.useState(false);
   const [coverageEnabled, setCoverageEnabled] = React.useState(true); // 资产覆盖度功能;默认开。关闭=不计算/展示覆盖度、不累积范围、隐藏范围类工具(company 关联不受影响)
   const [workerCount, setWorkerCount] = React.useState(""); // 本任务 Worker 数;空/0=用全局默认
   const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // 任务级资产拦截规则(仅本任务生效,不进全局表)
@@ -3273,6 +3472,7 @@ function CreateTaskSheet({
         seedFirstIntent,
         planHeartbeatSeconds: heartbeatSec,
         coverageEnabled,
+        shareGlobalAssets,
         workerCount: workerCountNum,
         schedule: scheduleEnabled ? { ...schedule, task_ids: [] } : undefined,
         interceptRules: interceptRules
@@ -3293,6 +3493,7 @@ function CreateTaskSheet({
       setHeartbeatMin("10");
       setSeedFirstIntent(false);
       setCoverageEnabled(true);
+      setShareGlobalAssets(false);
       setWorkerCount("");
       setInterceptRules([]);
       setScheduleEnabled(false);
@@ -3551,6 +3752,19 @@ function CreateTaskSheet({
                 onChange={(e) => setGoal(e.target.value)}
               />
             </div>
+            <Field>
+              <div className="flex items-center gap-2">
+                <Checkbox
+                  id="share-global-assets"
+                  checked={shareGlobalAssets}
+                  onCheckedChange={(checked) => setShareGlobalAssets(checked === true)}
+                />
+                <Label htmlFor="share-global-assets">共享全局资产</Label>
+              </div>
+              <FieldDescription>
+                默认关闭，仅使用本任务及明确关联任务的资产。开启后可查询全局资产库，测试仍须遵守授权范围。
+              </FieldDescription>
+            </Field>
             <Field>
               <FieldLabel htmlFor="source-tasks">关联任务</FieldLabel>
               <SourceTaskPicker

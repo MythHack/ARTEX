@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/norma/permission"
-	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/norma/permission"
+	actool "github.com/Autumn-27/norma/tool"
 )
 
 // jsonResult marshals v to a JSON tool result.
@@ -42,7 +42,6 @@ func (s *Server) hostTools() ([]actool.CoreTool, map[string][]string) {
 	tools = append(tools, s.orchestrationTools()...)
 	tools = append(tools, s.findingRetestTools()...)
 	tools = append(tools, s.platformTools()...) // 平台操作工具(建改 skill/工具/MCP，给 Auto 用)
-	tools = append(tools, s.proxyTools()...)     // 代理池：状态查询 + 坏出口上报
 	custom, err := s.customTools()
 	if err != nil {
 		log.Printf("[custom-tool] 加载失败: %v", err)
@@ -523,13 +522,6 @@ func (s *Server) seedOrchestrationTools() {
 		schema, _ := json.Marshal(t.InputSchema())
 		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, autoAgents)
 	}
-	// 代理池工具默认绑 worker + planner：执行者遇到「目标连不通」时需要能查池状态
-	// 并上报坏出口；规划者读态势时也用得上。
-	proxyAgents, _ := json.Marshal([]string{"worker", "planner"})
-	for _, t := range s.proxyTools() {
-		schema, _ := json.Marshal(t.InputSchema())
-		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, proxyAgents)
-	}
 	s.refreshBuiltinToolSchemas()
 	s.seedAutoDefaultBindings()
 	s.seedPlannerDefaultBindings()
@@ -538,14 +530,14 @@ func (s *Server) seedOrchestrationTools() {
 	s.seedWorkerReadToolsUnbind() // list_facts/list_companies/list_worker_traces 从 worker 默认解绑(一次性)
 	s.seedWorkerReadbackRebind()  // 修复旧迁移误删：把 search_all_worker_traces/get_worker_trace/node_detail 补绑回 worker(一次性)
 	s.seedAutoReportFindingBinding()
-	s.reseedGoalsPrompt()             // goals 提示词加入「抽操作约束」步 → 旧库追加一版新默认(一次性)
-	s.reseedMainAgentPrompt()         // mainagent 提示词加入「目标达成后 add_intent 反问是否建目标」(一次性)
-	s.reseedPlannerPrompt()           // planner 提示词:重写「0 意图」正当理由 + 加量化验收核对 + CVSS 原语深挖导向(一次性)
-	s.reseedWorkerPrompt()            // worker 提示词:加 CVSS v3.1 实证定级红线与原语分流规则(一次性)
+	s.reseedGoalsPrompt()               // goals 提示词加入「抽操作约束」步 → 旧库追加一版新默认(一次性)
+	s.reseedMainAgentPrompt()           // mainagent 提示词加入「目标达成后 add_intent 反问是否建目标」(一次性)
+	s.reseedPlannerPrompt()             // planner 提示词:重写「0 意图」正当理由 + 加量化验收核对 + CVSS 原语深挖导向(一次性)
+	s.reseedWorkerPrompt()              // worker 提示词:加 CVSS v3.1 实证定级红线与原语分流规则(一次性)
 	s.reseedPentestAndReporterPrompts() // pentest/reporter 提示词:同步 CVSS v3.1 + CWE 定级与报告展示规范(一次性)
-	s.seedReporterAgent()             // 预置「报告撰写」agent + 工具绑定 + finding 触发器(一次性)
-	s.upgradeReporterTriggerMessage() // 老库补迁移:让 reporter 回传 evidence_version(一次性)
-	s.migrateReporterWorkflow()       // 修复旧库残留的 reproduction 工具/提示词绑定
+	s.seedReporterAgent()               // 预置「报告撰写」agent + 工具绑定 + finding 触发器(一次性)
+	s.upgradeReporterTriggerMessage()   // 老库补迁移:让 reporter 回传 evidence_version(一次性)
+	s.migrateReporterWorkflow()         // 修复旧库残留的 reproduction 工具/提示词绑定
 	if s.m.pg.GetBool(settingBrowserScreenshot, false) {
 		// Re-apply the opt-in after startup seeding so an existing database gets
 		// both reporter visibility and the repaired Playwright launch arguments.

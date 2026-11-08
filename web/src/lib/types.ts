@@ -42,6 +42,8 @@ export interface Task {
   active_run_seconds?: number; // completed running segments in seconds
   run_segment_started_unix?: number; // current running segment start; 0 when inactive
   paused?: boolean;
+  pause_reason?: string;
+  reconnect?: { attempt: number; max: number; next_at?: number; exhausted: boolean; last_error?: string };
   queued?: boolean;
   active?: boolean;
   in_flight?: number;
@@ -60,6 +62,7 @@ export interface Task {
   source_task_ids?: string[]; // directly related tasks inherited as read-only context
   archive_blocked_by_task_id?: string; // live direct dependent that must be archived first
   company_ids?: number[]; // associated company scopes; current company assets join the task at creation
+  share_global_assets?: boolean; // opt-in global asset visibility; default false
   coverage_enabled?: boolean; // 资产覆盖度功能开关(创建时定,默认开)；false=不计算/不展示覆盖度
 }
 
@@ -994,18 +997,33 @@ export interface Settings {
   web_search_backend: string; // "ddgs" | "brave-free" | "tavily" | "deepseek"
   brave_key_set: boolean;
   tavily_key_set: boolean;
+  deepseek_search_key_set: boolean;
   // write-only: only sent on PUT to store/clear the key.
   brave_search_api_key?: string;
   tavily_search_api_key?: string;
+  deepseek_search_api_key?: string;
   // 独立出口代理(http/https/socks5)，用于访问搜索端点；与记录流量的 MITM 代理无关。空=直连。
   web_search_proxy?: string;
   // 全局出口代理(http/https/socks5，可带 user:pass)，所有目标流量走它。开启流量捕获时作为
   // MITM 上游；关闭捕获时直接注入 agent 的 bash/WebFetch。空=直连。
   global_proxy?: string;
-  show_egress_ip?: boolean;
-  install_proxy?: string;
-  python_interpreter?: string;
-  workers?: number;
+  proxy_pool?: ProxyPoolEntry[];
+  proxy_pool_active_id?: string;
+  proxy_pool_switch_log?: ProxySwitchLog[];
+  proxy_rotate_timed_enabled?: boolean;
+  proxy_rotate_interval_seconds?: number;
+  proxy_rotate_on_failure?: boolean;
+  proxy_rotate_strategy?: "sequential" | "random";
+  proxy_health_fail_threshold?: number;
+  proxy_health_cooldown_seconds?: number;
+  proxy_health_check_interval_seconds?: number;
+  proxy_reconnect_max_attempts?: number;
+  proxy_reconnect_interval_seconds?: number;
+  show_egress_ip?: boolean; // 在顶栏显示直连 / 全局代理出口 IP；默认关闭
+  egress_probe_url?: string; // 自定义 IP 探测服务；空=默认公共回显服务
+  install_proxy?: string; // hostd 安装器拉取自更新包用的出口代理(http/socks5)
+  python_interpreter?: string; // 自定义脚本工具的 python 解释器路径(空=运行时检测)
+  workers?: number; // 并发工作 agent 数(默认3)；对之后启动的任务生效
   worker_pools: WorkerPool[];
   compaction_timeout_seconds?: number;
   compaction_max_members?: number;
@@ -1038,6 +1056,22 @@ export interface Settings {
   egress_hint?: string; // 对外可达地址说明(公网 IP/宿主内网地址等,自由文本)
   egress_port_map?: string; // 端口映射说明(容器端口→宿主端口)
 }
+
+export interface ProxyPoolEntry {
+  id: string;
+  url: string;
+  name?: string;
+  remark?: string;
+  enabled: boolean;
+  egress_ip?: string;
+  latency_ms?: number;
+  last_error?: string;
+  last_checked_at?: string;
+  consecutive_failures: number;
+  health: "healthy" | "unhealthy-cooling" | "disabled" | string;
+}
+
+export interface ProxySwitchLog { at: string; from: string; to: string; reason: string }
 
 export interface WorkerPool {
   profile_id: string;
@@ -1121,7 +1155,7 @@ export interface NotificationDelivery {
 export interface LLMProfile {
   id: string;
   name: string;
-  format: "openai" | "anthropic" | "openai-responses";
+  format: "openai" | "anthropic" | "openai-responses" | "jev";
   base_url?: string;
   proxy?: string;
   model: string;
@@ -1455,6 +1489,7 @@ export interface JudgeConfig {
   ask_timeout_seconds: number; // 模型判 ask 转人工后的审批等待超时
   ask_timeout_action: "allow" | "deny"; // 审批超时后的默认动作
   incomplete_script_action: "ask" | "model"; // 脚本快照不完整时：人工审查或继续模型审查
+  confidence_threshold: number; // Jev 置信度低于此值时转人工
 }
 
 // JudgeUsage: 模型兜底审批(judge 通道)的累计 token 用量 + 近 N 天每日序列。
@@ -2024,35 +2059,8 @@ export interface InstallBatchResult {
   skipped: { tool_id: string; reason: string }[];
 }
 
-/** 代理池：一个上游代理的持久化条目。 */
-export interface ProxyPoolEntry {
-  url: string;
-  name: string;
-  enabled: boolean;
-  weight: number;
-}
 
-/** 代理池运行态：熔断计数、最近成功/失败时间、熔断剩余秒数。 */
-export interface ProxyPoolRunning {
-  url: string;
-  name: string;
-  failures: number;
-  weight?: number;
-  last_ok?: string;
-  last_fail?: string;
-  break_remaining?: number;
-}
 
-export interface ProxyPoolState {
-  entries: ProxyPoolEntry[];
-  strategy: string;
-  running: ProxyPoolRunning[];
-  capturing: boolean;
-  check_target?: string;
-  health_minutes?: number;
-  health_cooldown?: number;
-  last_check?: { at: string; target: string; count: number; ok_count: number; auto?: boolean } | null;
-}
 
 /** 漏洞情报同步配置（读取时凭据已掩码，只回 *_set 布尔）。 */
 export interface VulnIntelConfig {

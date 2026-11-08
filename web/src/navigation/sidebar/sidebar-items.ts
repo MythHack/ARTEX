@@ -96,7 +96,6 @@ export const sidebarItems: NavGroup[] = [
       { id: "tools", title: "工具", url: "/system/tools", icon: Wrench },
       { id: "notify", title: "通知推送", url: "/system/notify", icon: BellRing },
       { id: "vulnintel", title: "漏洞情报", url: "/system/vulnintel", icon: ShieldCheck },
-      { id: "proxypool", title: "代理池", url: "/system/proxypool", icon: Network },
       { id: "hostenv", title: "宿主环境", url: "/system/hostenv", icon: MonitorCog },
       { id: "c2", title: "监听器 / C2", url: "/system/c2", icon: RadioTower },
       { id: "intercept", title: "拦截规则", url: "/system/intercept", icon: ShieldAlert },

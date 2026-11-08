@@ -561,7 +561,7 @@ func (d *DB) migrateBuiltinRulePatterns() error {
 	const clearName = "[内置] 清空系统关键目录"
 	if _, err := d.Exec(`
 INSERT INTO intercept_rules(name, enabled, priority, match_target, match_type, pattern, action, message, timeout_enabled, timeout_seconds, timeout_action)
-SELECT $1, true, 100, 'tool_input', 'regex', $2, 'deny', $3, false, 60, 'allow'
+SELECT $1, true, 100, 'tool_input', 'regex', $2, 'deny', $3, true, 30, 'deny'
 WHERE NOT EXISTS (SELECT 1 FROM intercept_rules WHERE name = $1)`,
 		clearName,
 		`\brm\b[^"'\n]{0,120}["'\s][^"'\n]{0,80}/(?:etc|bin|usr|boot|var|lib|sys|proc|dev|sbin|root)/\*`,

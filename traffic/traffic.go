@@ -169,7 +169,9 @@ type Traffic struct {
 	// through (nil = dial targets directly). Both the intercepted and the
 	// transparent-passthrough paths honor it (go-mitmproxy's getUpstreamConn),
 	// so no host escapes it. Hot-swappable at runtime via SetUpstreamProxy.
-	upstream atomic.Pointer[url.URL]
+	upstream        atomic.Pointer[url.URL]
+	upstreamMu      sync.RWMutex
+	upstreamFailure func(error)
 	// pool 非空时代理池优先于 upstream:per-request 按策略轮换上游,
 	// 失败(RequestError)计数熔断。见 pool.go。
 	pool atomic.Pointer[selector]
@@ -328,7 +330,6 @@ func (t *Traffic) ProxyPoolEnabled() bool {
 	return t.pool.Load() != nil
 }
 
-
 // SetUpstreamProxy points every captured request at a global egress proxy
 // (http/https/socks5, optional user:pass in the URL). An empty raw string clears
 // it, restoring direct dialing. The change is atomic and takes effect on the next
@@ -345,6 +346,27 @@ func (t *Traffic) SetUpstreamProxy(raw string) error {
 	}
 	t.upstream.Store(u)
 	return nil
+}
+
+// SetUpstreamFailureHandler observes failures from the configured global
+// upstream proxy. The callback is intentionally best-effort and must not block
+// the MITM request path.
+func (t *Traffic) SetUpstreamFailureHandler(fn func(error)) {
+	t.upstreamMu.Lock()
+	t.upstreamFailure = fn
+	t.upstreamMu.Unlock()
+}
+
+func (t *Traffic) reportUpstreamFailure(err error) {
+	if err == nil || t.upstream.Load() == nil {
+		return
+	}
+	t.upstreamMu.RLock()
+	fn := t.upstreamFailure
+	t.upstreamMu.RUnlock()
+	if fn != nil {
+		go fn(err)
+	}
 }
 
 // ValidateProxyURL parses and checks a proxy URL (http/https/socks5, optional
@@ -481,7 +503,12 @@ func (s *sink) RequestError(f *mproxy.Flow, err error) {
 			pool.ReportResult(raws, false)
 		}
 	}
+	s.t.reportUpstreamFailure(err)
 	s.t.maybePassthrough(f, err)
+}
+
+func (s *sink) HTTPConnectError(_ *mproxy.Flow, err error) {
+	s.t.reportUpstreamFailure(err)
 }
 
 // maybePassthrough marks a host to be tunneled transparently on the next

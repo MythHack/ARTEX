@@ -34,6 +34,8 @@ import type {
   DeleteTaskResult,
   Edge,
   EgressReport,
+  ProxyPoolEntry,
+  ProxySwitchLog,
   EvidenceBodyPreview,
   ExplorationNodePage,
   ExplorationNodeQuery,
@@ -115,7 +117,6 @@ import type {
   TrafficEvidenceRole,
   TrafficHost,
   TrafficResp,
-  ProxyPoolState,
   C2Config,
   C2ConfigPatch,
   ConnectBack,
@@ -265,6 +266,13 @@ const del = <T>(p: string, body?: unknown) =>
 
 // Go serializes nil slices as JSON null — coerce to [].
 const arr = <T>(x: T[] | null | undefined): T[] => x ?? [];
+
+// Empty Go slices can arrive as null from older servers. Keep proxy-pool
+// consumers safe across initial load, import, and health-check refreshes.
+function normalizeProxyPool<T extends { entries: ProxyPoolEntry[]; switch_log: ProxySwitchLog[] }>(pool: T): T {
+  return { ...pool, entries: arr(pool.entries), switch_log: arr(pool.switch_log) };
+}
+
 const tq = (task?: string, sep: "?" | "&" = "?") => (task ? `${sep}task=${encodeURIComponent(task)}` : "");
 
 // findingFilterParams 把发现页的筛选条件序列化成 query string。列表 / 分组 /
@@ -325,9 +333,9 @@ function schedulePayload(input: ScheduleInput) {
 }
 
 export const api = {
-  // 后端应用版本号（release 时由 ldflags 注入，默认 "dev"）。
-  health: () => get<{ ok: boolean; status: string }>("/health"),
-  version: () => get<{ service: string; version: string }>("/version"),
+  // 健康检查受可选 Basic Auth 保护且不返回应用名称或版本；版本号仅向已登录管理员提供。
+  health: () => get<{ ok: boolean }>("/health"),
+  version: () => http<{ version: string }>("/version", { cache: "no-store" }),
   systemMetrics: () => get<SystemMetrics>("/system/metrics"),
 
   // ---- auth ----
@@ -353,6 +361,7 @@ export const api = {
     timeoutSeconds?: number;
     seedFirstIntent?: boolean;
     planHeartbeatSeconds?: number;
+    shareGlobalAssets?: boolean;
     coverageEnabled?: boolean;
     workerCount?: number;
     interceptRules?: AssetInterceptRuleInput[];
@@ -370,6 +379,7 @@ export const api = {
       timeout_seconds: input.timeoutSeconds ?? 0,
       seed_first_intent: input.seedFirstIntent ?? false,
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
+      share_global_assets: input.shareGlobalAssets ?? false,
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
       worker_count: input.workerCount ?? 0, // 0 = 用全局默认 workers
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
@@ -387,7 +397,7 @@ export const api = {
   runScheduleNow: (id: number) =>
     post<{ ok: boolean; started: number; errors?: string[] }>(`/schedules/${id}/run-now`, {}),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
-  updateTask: (id: string, input: { name?: string; pinned?: boolean; remark?: string }) =>
+  updateTask: (id: string, input: { name?: string; pinned?: boolean; remark?: string; share_global_assets?: boolean }) =>
     patch<Task>(`/tasks/${id}`, input),
   renameTask: (id: string, name: string) => patch<Task>(`/tasks/${id}`, { name }),
   pinTask: (id: string, pinned: boolean) => patch<Task>(`/tasks/${id}`, { pinned }),
@@ -1004,36 +1014,47 @@ export const api = {
     web_search_proxy?: string;
     brave_search_api_key?: string;
     tavily_search_api_key?: string;
+    deepseek_search_api_key?: string;
   }) => post<{ ok: boolean; error?: string; count?: number; backend?: string }>(`/settings/web-search/test`, patch),
 
-  // global_proxy 传空 = 测直连；probe_url 可覆盖默认探测地址（隔离网用）。
-  testEgressProxy: (patch: { global_proxy?: string; probe_url?: string }) =>
+  // global_proxy 传空=测直连；probe_url 省略=已保存地址，空串=默认，非空=临时覆盖。
+  testEgressProxy: (patch: { global_proxy?: string; probe_url?: string; resume?: boolean }) =>
     post<EgressReport>(`/settings/proxy/test`, patch),
+  proxyPool: () =>
+    get<{ entries: ProxyPoolEntry[]; active_id: string; active_proxy: string; switch_log: ProxySwitchLog[] }>(
+      `/settings/proxy-pool`,
+    ).then(normalizeProxyPool),
+  importProxyPool: (payload: Record<string, unknown>) =>
+    post<{
+      entries: ProxyPoolEntry[];
+      active_id: string;
+      switch_log: ProxySwitchLog[];
+      errors: Array<{ line: number; input: string; error: string }>;
+    }>(`/settings/proxy-pool/import`, payload).then((r) => ({ ...normalizeProxyPool(r), errors: arr(r.errors) })),
+  updateProxyPool: (id: string, payload: Partial<Pick<ProxyPoolEntry, "url" | "name" | "remark" | "enabled">>) =>
+    put<{ entry: ProxyPoolEntry }>(`/settings/proxy-pool/${encodeURIComponent(id)}`, payload),
+  deleteProxyPool: (id: string) => del<{ ok: boolean }>(`/settings/proxy-pool/${encodeURIComponent(id)}`),
+  testProxyPoolEntry: (id: string) =>
+    post<{ ok: boolean; result?: EgressReport["checks"][number]["result"] }>(
+      `/settings/proxy-pool/${encodeURIComponent(id)}/test`,
+      {},
+    ),
+  testAllProxyPool: () =>
+    post<{ entries: ProxyPoolEntry[]; active_id: string; switch_log: ProxySwitchLog[] }>(
+      `/settings/proxy-pool/test-all`,
+      {},
+    ).then(normalizeProxyPool),
+  activateProxyPool: (id: string) =>
+    post<{ ok: boolean; active_id: string; active_proxy: string }>(
+      `/settings/proxy-pool/${encodeURIComponent(id)}/activate`,
+      {},
+    ),
+  testTaskProxy: (taskID: string) => post<{ ok: boolean; error?: string }>(`/tasks/${taskID}/proxy/test`, {}),
 
   // ---- 漏洞 IM 推送 ----
   // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
   // 不塞进扁平的 settings 键值里。
   notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
-  proxyPoolGet: () => get<ProxyPoolState>(`/proxypool`),
-  proxyPoolPut: (payload: {
-    entries: { url: string; name: string; enabled: boolean; weight: number }[];
-    strategy: string;
-  }) => put<ProxyPoolState>(`/proxypool`, payload),
-  // 批量导入：一行一个代理，自动识别 host:port / http(s):// / socks5:// / host:port:user:pass
-  proxyPoolBulk: (payload: { text: string; mode?: "append" | "replace"; strategy?: string; weight?: number }) =>
-    post<{
-      ok: boolean;
-      added: number;
-      updated: number;
-      total: number;
-      invalid: { line: number; raw: string; reason: string }[];
-    }>(`/proxypool/bulk`, payload),
-  // 连通性验证：urls 为空 = 全部已启用条目
-  proxyPoolCheck: (payload: { urls?: string[]; target?: string; timeout_seconds?: number; break_on_fail?: boolean }) =>
-    post<{
-      target: string;
-      results: { index: number; url: string; ok: boolean; latency_ms: number; exit_ip?: string; error?: string; checked_at: string }[];
-    }>(`/proxypool/check`, payload),
   vulnintelStatus: () => get<VulnIntelStatus>(`/vulnintel/status`),
   vulnintelSaveConfig: (payload: VulnIntelConfigPatch) => put<{ ok: boolean }>(`/vulnintel/config`, payload),
   vulnintelSyncNow: () => post<{ accepted: boolean }>(`/vulnintel/sync`, {}),
