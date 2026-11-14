@@ -126,6 +126,12 @@ func TestCaptureApprovalLifecycle(t *testing.T) {
 				initialAction = "ask"
 			}
 			wantUserMessage := "record this review"
+			// 人工点击 Decide 的路径 decision_source=manual（人工允许/拒绝执行），
+			// 其余（模型裁决、ask 超时释放）按 reason 前缀回落为 model。
+			wantSource := "model"
+			if tc.manual {
+				wantSource = "manual"
+			}
 			// A routine automatic allow (the model itself returned allow) keeps
 			// decision/execution metadata but intentionally omits the bulky
 			// replay context. Every other path — ask, deny, and the timeout
@@ -134,7 +140,7 @@ func TestCaptureApprovalLifecycle(t *testing.T) {
 			if tc.status == "allowed" && initialAction == "allow" {
 				wantUserMessage = ""
 			}
-			if detail.Status != tc.status || detail.DecisionSource != "model" || a == nil || a.ExecutionStatus != tc.execution || a.ToolUseID != "probe-call" || a.UserMessage != wantUserMessage || a.InitialAction != initialAction || a.ModelFallback != (tc.action == "invalid") || a.ProfileID != 7 {
+			if detail.Status != tc.status || detail.DecisionSource != wantSource || a == nil || a.ExecutionStatus != tc.execution || a.ToolUseID != "probe-call" || a.UserMessage != wantUserMessage || a.InitialAction != initialAction || a.ModelFallback != (tc.action == "invalid") || a.ProfileID != 7 {
 				t.Fatalf("unexpected review: row=%+v audit=%+v", detail.InterceptApprovalRow, a)
 			}
 			if tc.status == "allowed" && initialAction == "allow" && (len(a.Context) != 0 || a.UserTruncated || a.ContextTruncated) {

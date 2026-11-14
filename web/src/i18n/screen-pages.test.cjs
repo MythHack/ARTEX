@@ -13,7 +13,9 @@ const cache = new Map();
 const stateSnapshots = new Map();
 const noop = () => undefined;
 function load(inputFile) {
-  let file = path.resolve(inputFile);
+  // Windows: path.resolve 产生反斜杠，而下方 endsWith("/components/…") 与
+  // stateSnapshots 的键都用正斜杠——统一归一，跨平台一致。
+  let file = path.resolve(inputFile).split(path.sep).join("/");
   if (!path.extname(file) || !fs.existsSync(file))
     file = [".ts", ".tsx", ".json", "/index.ts", "/index.tsx"].map((x) => file + x).find(fs.existsSync) || file;
   if (file.endsWith(".css")) return {};
@@ -92,7 +94,7 @@ test("all main pages render English fixed labels and switch back", async () => {
   const files = fs.readdirSync(main, { recursive: true }).filter((f) => f.endsWith("page.tsx"));
   assert.ok(files.length >= 27);
   for (const f of files) {
-    route = "/" + f.replace("/page.tsx", "");
+    route = "/" + f.split(path.sep).join("/").replace(/\/page\.tsx$/, "");
     const Page = load(main + "/" + f).default;
     await i18n.changeLanguage("en");
     const english = visible(render(Page));
@@ -129,7 +131,7 @@ test("all task detail tabs render their English fixed UI", async () => {
 });
 
 test("intelligence renders real preview responses, populated records and localized errors", async () => {
-  const file = base + "/src/components/intelligence-panel.tsx";
+  const file = (base + "/src/components/intelligence-panel.tsx").split(path.sep).join("/");
   const { IntelligencePanel } = load(file);
   const transport = load(base + "/src/lib/mock/handler.ts");
   const original = "原始情报内容";

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -451,11 +452,30 @@ func TestApiContractEndToEndWithRealServer(t *testing.T) {
 	t.Logf("cmd = %s", cmd)
 
 	// 真跑这条命令（用 bash，因为生产环境是 Linux 的 bash -c）。
-	sh, err := exec.LookPath("bash")
-	if err != nil {
-		sh, err = exec.LookPath("sh")
+	// Windows 上 exec.LookPath("bash") 可能命中 WSL 的 System32\bash.exe：
+	// 它看不到 Windows 路径也连不到宿主 localhost（测试实测表现为
+	// curl Bad hostname + /home/.../C:\... python 报错）。优先选 Git Bash。
+	sh := ""
+	if runtime.GOOS == "windows" {
+		for _, c := range []string{
+			`C:\Program Files\Git\bin\bash.exe`,
+			`C:\Program Files\Git\usr\bin\bash.exe`,
+			`C:\Program Files (x86)\Git\bin\bash.exe`,
+		} {
+			if _, err := os.Stat(c); err == nil {
+				sh = c
+				break
+			}
+		}
+	}
+	if sh == "" {
+		var err error
+		sh, err = exec.LookPath("bash")
 		if err != nil {
-			t.Skip("找不到 shell")
+			sh, err = exec.LookPath("sh")
+			if err != nil {
+				t.Skip("找不到 shell")
+			}
 		}
 	}
 	run := exec.Command(sh, "-c", cmd)

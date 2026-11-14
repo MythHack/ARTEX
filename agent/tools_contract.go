@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	actool "github.com/Autumn-27/norma/tool"
@@ -151,6 +152,12 @@ func resolveContractPaths(custom string) []string {
 // 流程：逐个路径 curl 探测（只看 200）→ 第一个命中的下载下来 → 交给解析脚本。
 // 契约文件落在工作目录（不是 /tmp——平台规约）。
 func buildContractCmd(base string, paths []string, scriptPath, workDir string) string {
+	// Windows 部署下命令在 Git Bash 里执行：反斜杠绝对路径交给 curl/python
+	// 原生 exe 时引号/转义易碎，统一转正斜杠（C:/…），Linux 不受影响。
+	if runtime.GOOS == "windows" {
+		scriptPath = filepath.ToSlash(scriptPath)
+		workDir = filepath.ToSlash(workDir)
+	}
 	quoted := make([]string, 0, len(paths))
 	for _, p := range paths {
 		quoted = append(quoted, quoteShell(base+p))
