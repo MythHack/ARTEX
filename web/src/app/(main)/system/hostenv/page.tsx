@@ -21,16 +21,17 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
 import type { HostenvStatus, HostTool, InstallJob, ProxyCheckResult } from "@/lib/types";
 
 const TERMINAL_STATES = new Set(["done", "failed", "cancelled"]);
 
 const KIND_LABEL: Record<HostTool["kind"], string> = {
-  apt: "系统源",
+  apt: "screen.bebeeab6a4d883",
   github: "GitHub Release",
   pip: "pip",
-  manual: "手工安装",
+  manual: "screen.2d5b36c57c75dd",
 };
 
 // 攻击面分类。顺序按攻击流程排：先摸清面(网络/DNS)→ 再打(Web/凭据)
@@ -51,23 +52,24 @@ const CATEGORY_ORDER: HostTool["category"][] = [
 ];
 
 const CATEGORY_LABEL: Record<HostTool["category"], string> = {
-  network: "网络与主机",
-  dns: "子域名与 DNS",
-  web: "Web 应用",
-  cred: "凭据与口令",
-  code: "代码与密钥",
-  exploit: "漏洞利用",
-  middleware: "中间件协议",
-  pivot: "内网与隧道",
-  oob: "外带与回连",
-  material: "资料与字典",
-  runtime: "通用与运行时",
-  "": "其他",
+  network: "screen.447e8fdf4e13bf",
+  dns: "screen.5e76e8cd948494",
+  web: "screen.99708f8ab29952",
+  cred: "screen.1ebe85e3e3cc44",
+  code: "screen.2a1fec504c231b",
+  exploit: "screen.8112954c1019f2",
+  middleware: "screen.c0c8f13582a2ba",
+  pivot: "screen.e6427776189ba7",
+  oob: "screen.4afedb5f121919",
+  material: "screen.c821f84ed574ba",
+  runtime: "screen.d5fa24bfea8f5f",
+  "": "screen.d2909f1647e7c8",
 };
 
 // 宿主环境:工具体检。二进制部署形态下系统里装了什么,agent 就能经 Bash
 // 直接调什么;此页把家底显式化,缺失项可一键安装(由特权助手 artex-hostd 执行)。
 export default function HostEnvPage() {
+  const { ui, liveUI } = useUITranslation();
   const [inv, setInv] = React.useState<HostenvStatus | null>(null);
   const [loaded, setLoaded] = React.useState(false);
   const [proxyInput, setProxyInput] = React.useState("");
@@ -124,9 +126,9 @@ export default function HostEnvPage() {
           next[j.tool_id] = j;
           if (TERMINAL_STATES.has(j.state)) {
             sawTerminal = true;
-            if (j.state === "done") toast.success(`${j.tool_name} 安装完成`);
-            else if (j.state === "failed") toast.error(`${j.tool_name} 安装失败`);
-            else toast.info(`${j.tool_name} 安装已取消`);
+            if (j.state === "done") toast.success(liveUI("screen.951327e22d00ea", { v0: j.tool_name }));
+            else if (j.state === "failed") toast.error(liveUI("screen.5e737b815ef107", { v0: j.tool_name }));
+            else toast.info(liveUI("screen.b9a0e85adef5a7", { v0: j.tool_name }));
           }
         }
         return next;
@@ -135,7 +137,7 @@ export default function HostEnvPage() {
       if (sawTerminal) refresh();
     }, 1200);
     return () => clearInterval(timer);
-  }, [activeJobs, refresh]);
+  }, [activeJobs, refresh, liveUI]);
 
   React.useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
@@ -145,10 +147,10 @@ export default function HostEnvPage() {
     setSavingProxy(true);
     try {
       await api.setSettings({ install_proxy: proxyInput.trim() });
-      toast.success("装机代理已保存");
+      toast.success(liveUI("screen.e87a609aceef53"));
       refresh();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "保存失败");
+      toast.error(e instanceof Error ? e.message : liveUI("screen.6309a3bb5ba4c7"));
     } finally {
       setSavingProxy(false);
     }
@@ -162,10 +164,13 @@ export default function HostEnvPage() {
     try {
       const r = await api.hostenvProxyCheck(proxyInput.trim());
       setProxyCheck(r);
-      if (r.ok) toast.success(`代理可用${r.exit_ip ? `（出口 ${r.exit_ip}）` : ""}`);
-      else toast.error(`代理不可用：${r.error || r.hint || "未知原因"}`);
+      if (r.ok)
+        toast.success(
+          liveUI("screen.45add8b9e44eb3") + (r.exit_ip ? liveUI("screen.4887977f27da7c", { v0: r.exit_ip }) : ""),
+        );
+      else toast.error(liveUI("screen.df4e22d0f18503", { v0: r.error || r.hint || liveUI("screen.a1a9da9ee6ed04") }));
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "测试失败");
+      toast.error(e instanceof Error ? e.message : liveUI("screen.77c9e582e85583"));
     } finally {
       setTestingProxy(false);
     }
@@ -177,7 +182,7 @@ export default function HostEnvPage() {
       setJobsByTool((prev) => ({ ...prev, [tool.id]: j }));
       setSelectedJobTool(tool.id);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "发起安装失败");
+      toast.error(e instanceof Error ? e.message : liveUI("screen.eb05e9208a070e"));
     }
   };
 
@@ -210,16 +215,21 @@ export default function HostEnvPage() {
       if (r.started.length > 0) setSelectedJobTool(r.started[0].tool_id);
       if (r.skipped.length > 0) {
         toast.warning(
-          `${r.started.length} 项已加入安装队列；${r.skipped.length} 项跳过（${r.skipped
-            .slice(0, 3)
-            .map((x) => x.tool_id)
-            .join("、")}${r.skipped.length > 3 ? " 等" : ""}）`,
+          liveUI("screen.981bb7933f6adf", {
+            v0: r.started.length,
+            v1: r.skipped.length,
+            v2: r.skipped
+              .slice(0, 3)
+              .map((x) => x.tool_id)
+              .join("、"),
+            v3: r.skipped.length > 3 ? liveUI("screen.8ab274ae26fa17") : "",
+          }),
         );
       } else {
-        toast.success(`${r.started.length} 项已加入安装队列，将依次执行`);
+        toast.success(liveUI("screen.1f28b6fd8b54d0", { v0: r.started.length }));
       }
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "批量安装发起失败");
+      toast.error(e instanceof Error ? e.message : liveUI("screen.963e9ea05b6dca"));
     } finally {
       setBatchBusy(false);
     }
@@ -285,16 +295,14 @@ export default function HostEnvPage() {
         <CardHeader className="flex-row items-center justify-between">
           <div>
             <CardTitle className="flex items-center gap-2 text-sm">
-              <MonitorCog className="size-4" /> 宿主工具体检
+              <MonitorCog className="size-4" /> {ui("screen.fbc6c2b01710f1")}
             </CardTitle>
-            <CardDescription className="mt-1">
-              系统里有这些工具,Agent 就能直接调用;派任务选手段时会以这份清单为准。
-            </CardDescription>
+            <CardDescription className="mt-1">{ui("screen.a88cfc12b05f72")}</CardDescription>
           </div>
           <div className="flex items-center gap-2">
             {inv && (
               <Badge variant={inv.deploy_mode === "docker" ? "secondary" : "outline"}>
-                {inv.deploy_mode === "docker" ? "Docker 容器" : "宿主二进制"}
+                {inv.deploy_mode === "docker" ? ui("screen.7cabcc483eb40c") : ui("screen.c1dd4700a63e33")}
               </Badge>
             )}
             {installerReady && missingInstallable.length > 0 && (
@@ -305,11 +313,11 @@ export default function HostEnvPage() {
                 onClick={() => installMany(missingInstallable)}
               >
                 {installing ? <Loader2Icon className="animate-spin" /> : <DownloadIcon />}
-                一键安装缺失（{missingInstallable.length}）
+                {ui("screen.a1e2404f1730e4", { v0: missingInstallable.length })}
               </Button>
             )}
             <Button size="sm" variant="outline" onClick={refresh}>
-              <RefreshCwIcon /> 刷新
+              <RefreshCwIcon /> {ui("screen.aee88743413144")}
             </Button>
           </div>
         </CardHeader>
@@ -326,7 +334,7 @@ export default function HostEnvPage() {
               <div className="flex flex-col gap-2 rounded-lg border bg-muted/30 p-3">
                 <div className="flex items-center justify-between gap-2">
                   <Label htmlFor="install-proxy" className="text-sm">
-                    装机代理
+                    {ui("screen.ec4a7500846f5d")}
                   </Label>
                   <div className="flex items-center gap-2">
                     {proxyCheck && (
@@ -335,12 +343,13 @@ export default function HostEnvPage() {
                         title={proxyCheck.hint || proxyCheck.error || ""}
                       >
                         {proxyCheck.ok
-                          ? `可用${proxyCheck.latency_ms ? ` · ${proxyCheck.latency_ms}ms` : ""}`
-                          : "不可用"}
+                          ? ui("screen.4d99c976beb882") +
+                            (proxyCheck.latency_ms ? ` · ${proxyCheck.latency_ms}ms` : "")
+                          : ui("screen.460b3574e4bdb8")}
                       </Badge>
                     )}
                     <span className="text-muted-foreground text-xs">
-                      {installerReady ? "装东西时走它（apt / GitHub 下载）" : "宿主助手未运行，暂不可用"}
+                      {installerReady ? ui("screen.94e5c43fb66db0") : ui("screen.e4d06c9c4871d3")}
                     </span>
                   </div>
                 </div>
@@ -349,7 +358,7 @@ export default function HostEnvPage() {
                     id="install-proxy"
                     autoComplete="off"
                     className="font-mono text-xs"
-                    placeholder="http://10.0.0.14:7897 或 socks5://host:1080（留空=直连）"
+                    placeholder={ui("screen.50f6fb3e284225")}
                     value={proxyInput}
                     disabled={!loaded || savingProxy}
                     onChange={(e) => {
@@ -365,7 +374,7 @@ export default function HostEnvPage() {
                     disabled={!loaded || testingProxy}
                   >
                     {testingProxy ? <Loader2Icon className="animate-spin" /> : <PlugIcon />}
-                    测试
+                    {ui("screen.6aa8f49cc992df")}
                   </Button>
                   <Button
                     type="button"
@@ -374,50 +383,45 @@ export default function HostEnvPage() {
                     onClick={saveProxy}
                     disabled={!loaded || savingProxy}
                   >
-                    保存
+                    {ui("screen.a3030bf8f16dc6")}
                   </Button>
                 </div>
                 {proxyCheck && !proxyCheck.ok && (
                   <p className="text-destructive text-xs">
-                    {proxyCheck.error || "代理不可用"}
+                    {proxyCheck.error || ui("screen.da2d68cde96dd1")}
                     {proxyCheck.hint ? ` — ${proxyCheck.hint}` : ""}
                   </p>
                 )}
                 {proxyCheck?.ok && proxyCheck.exit_ip && (
                   <p className="text-muted-foreground text-xs">
-                    出口 IP: <span className="font-mono">{proxyCheck.exit_ip}</span>
+                    {ui("screen.db92b1d35eb173")} <span className="font-mono">{proxyCheck.exit_ip}</span>
                   </p>
                 )}
-                <p className="text-muted-foreground text-xs">
-                  国内环境装 nuclei 这类走 GitHub Release 的工具通常需要它；与「全局代理」（Agent
-                  目标流量）互不影响。代理随时可改，改完点「测试」确认通路——代理会失效， 装工具失败时先来这里看。
-                </p>
+                <p className="text-muted-foreground text-xs">{ui("screen.1abf63ba92e0d6")}</p>
               </div>
 
               {!installerReady && inv?.installer.reason && (
                 <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
                   {inv.installer.reason}
                   {inv.deploy_mode === "docker" && (
-                    <span className="text-muted-foreground">
-                      {" "}
-                      容器镜像里的工具是构建时固化的，需要额外工具请基于官方镜像自建。
-                    </span>
+                    <span className="text-muted-foreground">{ui("screen.7fb282d1989f8d")}</span>
                   )}
                 </div>
               )}
 
               {installerReady && inv?.installer.upgrade_required && (
                 <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
-                  助手版本较旧，不具备自我换装能力，因此无法随主程序自动升级。 在服务器上重跑一次{" "}
-                  <code className="font-mono">install.sh</code> 完成引导后， 之后每次发版助手都会自动跟随。
+                  {ui("screen.af11dfce168a1e")}{" "}
+                  <code className="font-mono">install.sh</code> {ui("screen.f801196be8eeb5")}
                 </div>
               )}
 
               <p className="text-muted-foreground text-sm">
-                可用 <span className="font-medium text-foreground">{available.length}</span> / {inv?.tools.length ?? 0}
+                {ui("screen.4d99c976beb882")} <span className="font-medium text-foreground">{available.length}</span> / {inv?.tools.length ?? 0}
                 {missing.length > 0 && (
                   <span className="ml-3">
-                    缺失 {missing.length} 项{installerReady && "，可一键安装"}
+                    {ui("screen.65364e6fd8c7b5")} {missing.length} {ui("screen.49ccde43a15497")}
+                    {installerReady ? ui("screen.697438e1bec810") : ""}
                   </span>
                 )}
               </p>
@@ -440,12 +444,12 @@ export default function HostEnvPage() {
                               (isCollapsed ? "" : "rotate-90")
                             }
                           />
-                          <span className="font-medium text-sm">{CATEGORY_LABEL[g.category]}</span>
+                          <span className="font-medium text-sm">{ui(CATEGORY_LABEL[g.category])}</span>
                           <span className="text-muted-foreground text-xs">
-                            {okCount}/{g.tools.length} 可用
+                            {okCount}/{g.tools.length} {ui("screen.4d99c976beb882")}
                             {g.tools.length - okCount > 0 && (
                               <span className="ml-1 text-amber-600 dark:text-amber-400">
-                                缺 {g.tools.length - okCount}
+                                {ui("screen.ba2acccacf879d", { v0: g.tools.length - okCount })}
                               </span>
                             )}
                           </span>
@@ -461,7 +465,7 @@ export default function HostEnvPage() {
                                 installMany(g.tools.filter((t) => !t.available && t.installable))
                               }
                             >
-                              装齐本组
+                              {ui("screen.820548af0f25d0")}
                             </Button>
                           )}
                       </div>
@@ -469,11 +473,11 @@ export default function HostEnvPage() {
                         <Table>
                           <TableHeader>
                             <TableRow>
-                              <TableHead className="w-32">工具</TableHead>
-                              <TableHead>用途</TableHead>
-                              <TableHead className="w-24">状态</TableHead>
-                              <TableHead>安装方式 / 提示</TableHead>
-                              <TableHead className="w-28 text-right">操作</TableHead>
+                              <TableHead className="w-32">{ui("screen.5ca6730d441522")}</TableHead>
+                              <TableHead>{ui("screen.05b36669c4ad9a")}</TableHead>
+                              <TableHead className="w-24">{ui("screen.6320b4a8722a85")}</TableHead>
+                              <TableHead>{ui("screen.9b5189009269a6")}</TableHead>
+                              <TableHead className="w-28 text-right">{ui("screen.ed31fbb483ee1b")}</TableHead>
                             </TableRow>
                           </TableHeader>
                           <TableBody>
@@ -482,7 +486,7 @@ export default function HostEnvPage() {
                                 <TableCell className="font-mono text-sm">{t.bin}</TableCell>
                                 <TableCell className="text-muted-foreground text-sm">{t.purpose}</TableCell>
                                 <TableCell>
-                                  {t.available ? <Badge>可用</Badge> : <Badge variant="outline">缺失</Badge>}
+                                  {t.available ? <Badge>{ui("screen.4d99c976beb882")}</Badge> : <Badge variant="outline">{ui("screen.65364e6fd8c7b5")}</Badge>}
                                 </TableCell>
                                 <TableCell className="text-muted-foreground text-xs">
                                   {t.available ? (
@@ -491,7 +495,7 @@ export default function HostEnvPage() {
                                     // break-all：缺失项的提示里可能带长 URL（如 msfconsole 的官方文档），
                                     // 不换行会把表格撑到横向溢出，需要左右拖动才看得到第一列。
                                     <span className="break-all">
-                                      <span className="mr-1 text-foreground/70">{KIND_LABEL[t.kind]}</span>
+                                      <span className="mr-1 text-foreground/70">{ui(KIND_LABEL[t.kind])}</span>
                                       {t.install}
                                     </span>
                                   )}
@@ -511,10 +515,10 @@ export default function HostEnvPage() {
                                         <DownloadIcon />
                                       )}
                                       {toolJobState(t.id) === "queued"
-                                        ? "排队中"
+                                        ? ui("screen.d6f766f2adf532")
                                         : toolJobState(t.id) === "running"
-                                          ? "安装中"
-                                          : "安装"}
+                                          ? ui("screen.f9d5b2b63e5a47")
+                                          : ui("screen.e8f88f51ccb085")}
                                     </Button>
                                   )}
                                 </TableCell>
@@ -538,7 +542,7 @@ export default function HostEnvPage() {
           <CardHeader className="flex-row items-center justify-between">
             <div className="min-w-0 flex-1">
               <CardTitle className="flex items-center gap-2 text-sm">
-                <TerminalIcon className="size-4" /> 安装进度
+                <TerminalIcon className="size-4" /> {ui("screen.421f0e796c878a")}
               </CardTitle>
               <CardDescription className="mt-2 flex flex-wrap items-center gap-1.5">
                 {Object.values(jobsByTool)
@@ -570,7 +574,7 @@ export default function HostEnvPage() {
             <div className="flex items-center gap-2">
               {selectedJob && !TERMINAL_STATES.has(selectedJob.state) && (
                 <Button size="sm" variant="outline" onClick={cancel}>
-                  <XIcon /> 取消
+                  <XIcon /> {ui("screen.2cd0f3be8738a8")}
                 </Button>
               )}
               {selectedJob && TERMINAL_STATES.has(selectedJob.state) && (
@@ -588,7 +592,7 @@ export default function HostEnvPage() {
                     setSelectedJobTool(null);
                   }}
                 >
-                  关闭
+                  {ui("common.close")}
                 </Button>
               )}
             </div>
@@ -613,7 +617,7 @@ export default function HostEnvPage() {
               ref={logRef}
               className="max-h-80 overflow-auto rounded-md bg-muted p-3 font-mono text-xs leading-relaxed"
             >
-              {selectedJob.log || "等待输出…（排队中的任务会在轮到它时开始输出）"}
+              {selectedJob.log || ui("screen.01cb8eea7d66d5")}
             </pre>
           </CardContent>
         </Card>

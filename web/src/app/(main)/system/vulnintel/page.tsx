@@ -21,13 +21,14 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
 import type { VulnIntelStatus } from "@/lib/types";
 
 const SOURCE_LABEL: Record<string, string> = {
-  nvd: "NVD(CVE 全量/增量)",
-  kev: "CISA KEV(在野利用)",
-  poc: "GitHub PoC 聚合",
+  nvd: "screen.34e525f8abe74b",
+  kev: "screen.02d11ba93f9ba8",
+  poc: "screen.a53514afe2511b",
 };
 
 type ProbeRow = {
@@ -51,6 +52,7 @@ function fmtTime(v?: string): string {
 // 原先这页只读,失败原因藏在 badge 的 title 里,也没有任何配置入口——
 // 现在配置、诊断、修复动作都在同一页。
 export default function VulnintelPage() {
+  const { ui, liveUI } = useUITranslation();
   const [status, setStatus] = React.useState<VulnIntelStatus | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState("");
@@ -102,10 +104,10 @@ export default function VulnintelPage() {
         backfill_days: backfillDays,
         max_runtime_minutes: maxRuntimeMin,
       });
-      toast.success("配置已保存，下一轮同步生效");
+      toast.success(liveUI("screen.9ce730f24c1a26"));
       load();
     } catch (e) {
-      toast.error("保存失败: " + e);
+      toast.error(liveUI("screen.9f94c6b3fdb1d4", { v0: String(e) }));
     } finally {
       setSaving(false);
     }
@@ -115,9 +117,9 @@ export default function VulnintelPage() {
     setSyncing(true);
     try {
       await api.vulnintelSyncNow();
-      toast.success("已触发同步，稍后刷新查看水位");
+      toast.success(liveUI("screen.4ff204e5859222"));
     } catch (e) {
-      toast.error("触发失败: " + e);
+      toast.error(liveUI("screen.b3c81a29eec60c", { v0: String(e) }));
     } finally {
       setSyncing(false);
     }
@@ -129,10 +131,10 @@ export default function VulnintelPage() {
       const res = await api.vulnintelProbe();
       setProbeRows(res.results ?? []);
       const bad = (res.results ?? []).filter((r) => !r.ok).length;
-      if (bad === 0) toast.success("所有数据源连通正常");
-      else toast.warning(`${bad} 个数据源不可用，展开看修复建议`);
+      if (bad === 0) toast.success(liveUI("screen.d1e8ccb660f059"));
+      else toast.warning(liveUI("screen.9b8ebca77e0b8e", { v0: bad }));
     } catch (e) {
-      toast.error("检测失败: " + e);
+      toast.error(liveUI("screen.1f46bcdea827d1", { v0: String(e) }));
     } finally {
       setProbing(false);
     }
@@ -141,10 +143,10 @@ export default function VulnintelPage() {
   const toggleEnabled = async (on: boolean) => {
     try {
       await api.vulnintelSaveConfig({ enabled: on });
-      toast.success(on ? "已开启同步" : "已关闭同步");
+      toast.success(on ? liveUI("screen.7c424ed2928517") : liveUI("screen.c97ace8bc6be83"));
       load();
     } catch (e) {
-      toast.error("设置失败: " + e);
+      toast.error(liveUI("screen.72293f9e65cbd4", { v0: String(e) }));
     }
   };
 
@@ -155,31 +157,31 @@ export default function VulnintelPage() {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <ShieldAlertIcon className="size-5" />
-          <h1 className="text-lg font-semibold">漏洞情报</h1>
+          <h1 className="text-lg font-semibold">{ui("screen.152ea9270e8d07")}</h1>
           {status && (
             <Badge variant={status.enabled ? "default" : "secondary"}>
-              {status.enabled ? "同步开启" : "同步关闭"}
+              {status.enabled ? ui("screen.a8936de6e2a95e") : ui("screen.81aebbd944969d")}
             </Badge>
           )}
           {status?.sync_running && (
             <Badge variant="outline">
               <Loader2Icon className="mr-1 size-3 animate-spin" />
-              同步进行中
+              {ui("screen.1bdda0ff939d66")}
             </Badge>
           )}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button variant="outline" size="sm" onClick={probe} disabled={probing}>
             <PlugZapIcon className={"mr-1 size-4" + (probing ? " animate-pulse" : "")} />
-            测试连通性
+            {ui("screen.d5061c58ddc3bb")}
           </Button>
           <Button variant="outline" size="sm" onClick={syncNow} disabled={syncing}>
             <RefreshCwIcon className={"mr-1 size-4" + (syncing ? " animate-spin" : "")} />
-            立即同步
+            {ui("screen.36e7a43a1c674e")}
           </Button>
           <Button variant="outline" size="sm" onClick={load} disabled={loading}>
             <RefreshCwIcon className={"mr-1 size-4" + (loading ? " animate-spin" : "")} />
-            刷新
+            {ui("screen.aee88743413144")}
           </Button>
         </div>
       </div>
@@ -192,7 +194,7 @@ export default function VulnintelPage() {
             <Card>
               <CardHeader className="pb-2">
                 <CardTitle className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
-                  <DatabaseIcon className="size-4" /> CVE 记录
+                  <DatabaseIcon className="size-4" /> {ui("screen.d28c18b3d43a8a")}
                 </CardTitle>
               </CardHeader>
               <CardContent>
@@ -201,7 +203,7 @@ export default function VulnintelPage() {
             </Card>
             <Card>
               <CardHeader className="pb-2">
-                <CardTitle className="text-sm font-medium text-muted-foreground">KEV 在野利用</CardTitle>
+                <CardTitle className="text-sm font-medium text-muted-foreground">{ui("screen.fb67169d84bb84")}</CardTitle>
               </CardHeader>
               <CardContent>
                 <p className="text-2xl font-semibold tabular-nums text-red-500">{status.counts.kev.toLocaleString()}</p>
@@ -209,7 +211,7 @@ export default function VulnintelPage() {
             </Card>
             <Card>
               <CardHeader className="pb-2">
-                <CardTitle className="text-sm font-medium text-muted-foreground">PoC 仓库</CardTitle>
+                <CardTitle className="text-sm font-medium text-muted-foreground">{ui("screen.79a99b3849b59b")}</CardTitle>
               </CardHeader>
               <CardContent>
                 <p className="text-2xl font-semibold tabular-nums">{status.counts.pocs.toLocaleString()}</p>
@@ -219,16 +221,14 @@ export default function VulnintelPage() {
 
           <Card>
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium">同步配置</CardTitle>
-              <CardDescription className="text-xs">
-                凭据只写不读：留空表示保持当前值不变。改完点「保存配置」，下一轮同步生效。
-              </CardDescription>
+              <CardTitle className="text-sm font-medium">{ui("screen.bc03f55f6d8a42")}</CardTitle>
+              <CardDescription className="text-xs">{ui("screen.695957d66725d6")}</CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
               <div className="flex items-center gap-3">
                 <Switch checked={!!status.enabled} onCheckedChange={toggleEnabled} id="vi-enabled" />
                 <Label htmlFor="vi-enabled" className="text-sm">
-                  开启定时同步
+                  {ui("screen.9e4fe121d6a88c")}
                 </Label>
                 <span className="text-muted-foreground text-xs">{status.next_tick_hint}</span>
               </div>
@@ -236,31 +236,31 @@ export default function VulnintelPage() {
               <div className="grid gap-3 sm:grid-cols-2">
                 <div className="grid gap-1.5">
                   <Label htmlFor="vi-nvd" className="text-xs">
-                    NVD API Key{cfg?.nvd_key_set ? "（已配置）" : "（未配置）"}
+                    {cfg?.nvd_key_set ? ui("screen.cd71a968d16738") : ui("screen.588fd906aeb0f4")}
                   </Label>
                   <Input
                     id="vi-nvd"
                     type="password"
                     value={nvdKey}
                     onChange={(e) => setNvdKey(e.target.value)}
-                    placeholder={cfg?.nvd_key_set ? "••••••••" : "留空 = 匿名（5 次/30 秒）"}
+                    placeholder={cfg?.nvd_key_set ? "••••••••" : ui("screen.30ebcafd82e94a")}
                   />
                 </div>
                 <div className="grid gap-1.5">
                   <Label htmlFor="vi-gh" className="text-xs">
-                    GitHub Token{cfg?.github_token_set ? "（已配置）" : "（未配置）"}
+                    {cfg?.github_token_set ? ui("screen.3ba22e069636e9") : ui("screen.e5f4f82cb7c674")}
                   </Label>
                   <Input
                     id="vi-gh"
                     type="password"
                     value={ghToken}
                     onChange={(e) => setGhToken(e.target.value)}
-                    placeholder={cfg?.github_token_set ? "••••••••" : "留空 = 匿名（PoC 聚合会限速）"}
+                    placeholder={cfg?.github_token_set ? "••••••••" : ui("screen.a31ebeebfeb4c3")}
                   />
                 </div>
                 <div className="grid gap-1.5">
                   <Label htmlFor="vi-proxy" className="text-xs">
-                    同步专用代理（留空 = 跟随维护代理）
+                    {ui("screen.63cb61ceef5728")}
                   </Label>
                   <Input
                     id="vi-proxy"
@@ -270,13 +270,13 @@ export default function VulnintelPage() {
                   />
                   {cfg?.maintenance_proxy && (
                     <span className="text-muted-foreground text-xs">
-                      当前维护代理：{cfg.maintenance_proxy}
+                      {ui("screen.2b965e000b3813", { v0: cfg.maintenance_proxy })}
                     </span>
                   )}
                 </div>
                 <div className="grid gap-1.5">
                   <Label htmlFor="vi-backfill" className="text-xs">
-                    首次回填天数（0 = 全量）
+                    {ui("screen.9719f34ed32220")}
                   </Label>
                   <Input
                     id="vi-backfill"
@@ -288,7 +288,7 @@ export default function VulnintelPage() {
                 </div>
                 <div className="grid gap-1.5">
                   <Label htmlFor="vi-runtime" className="text-xs">
-                    单轮上限（分钟）
+                    {ui("screen.ab147551c2f676")}
                   </Label>
                   <Input
                     id="vi-runtime"
@@ -302,7 +302,7 @@ export default function VulnintelPage() {
                   <div className="flex items-center gap-2">
                     <Switch checked={pocEnabled} onCheckedChange={setPocEnabled} id="vi-poc" />
                     <Label htmlFor="vi-poc" className="text-sm">
-                      聚合 GitHub PoC 仓库
+                      {ui("screen.f06113842d0ab0")}
                     </Label>
                   </div>
                 </div>
@@ -311,7 +311,7 @@ export default function VulnintelPage() {
               <div className="flex justify-end">
                 <Button size="sm" onClick={saveConfig} disabled={saving}>
                   <SaveIcon className="mr-1 size-4" />
-                  保存配置
+                  {ui("screen.6e584e3d5ce64a")}
                 </Button>
               </div>
             </CardContent>
@@ -319,30 +319,30 @@ export default function VulnintelPage() {
 
           <Card>
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium">同步状态</CardTitle>
+              <CardTitle className="text-sm font-medium">{ui("screen.2f377a47158122")}</CardTitle>
             </CardHeader>
             <CardContent>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b text-left text-muted-foreground">
-                      <th className="py-2 pr-4 font-medium">数据源</th>
-                      <th className="py-2 pr-4 font-medium">最近同步</th>
-                      <th className="py-2 pr-4 font-medium">本轮处理</th>
-                      <th className="py-2 pr-4 font-medium">状态</th>
+                      <th className="py-2 pr-4 font-medium">{ui("screen.186be2232e2c9b")}</th>
+                      <th className="py-2 pr-4 font-medium">{ui("screen.d7a5f76dfcdade")}</th>
+                      <th className="py-2 pr-4 font-medium">{ui("screen.1e11701d6ec73a")}</th>
+                      <th className="py-2 pr-4 font-medium">{ui("screen.6320b4a8722a85")}</th>
                     </tr>
                   </thead>
                   <tbody>
                     {status.sources.length === 0 && (
                       <tr>
                         <td colSpan={4} className="py-3 text-muted-foreground">
-                          尚未开始同步（首次启动约 90 秒后开始；全量回填需数轮）
+                          {ui("screen.7dfe1ad4423aa0")}
                         </td>
                       </tr>
                     )}
                     {status.sources.map((s) => (
                       <tr key={s.source} className="border-b align-top last:border-0">
-                        <td className="py-2 pr-4">{SOURCE_LABEL[s.source] ?? s.source}</td>
+                        <td className="py-2 pr-4">{ui(SOURCE_LABEL[s.source] ?? s.source)}</td>
                         <td className="py-2 pr-4 tabular-nums">{fmtTime(s.last_sync_at)}</td>
                         <td className="py-2 pr-4 tabular-nums">{s.total_synced.toLocaleString()}</td>
                         <td className="py-2 pr-4">
@@ -350,17 +350,17 @@ export default function VulnintelPage() {
                             <div className="space-y-1">
                               <Badge variant="destructive" className="gap-1">
                                 <TriangleAlertIcon className="size-3" />
-                                有错误
+                                {ui("screen.7deaf76d44fad6")}
                               </Badge>
                               <p className="max-w-xl text-muted-foreground text-xs">{s.last_error}</p>
                               {s.error_hint && (
                                 <p className="max-w-xl text-xs text-amber-600 dark:text-amber-400">
-                                  建议：{s.error_hint}
+                                  {ui("screen.8fe974714f5005", { v0: s.error_hint })}
                                 </p>
                               )}
                             </div>
                           ) : (
-                            <Badge variant="default">正常</Badge>
+                            <Badge variant="default">{ui("screen.296de0e31f8c22")}</Badge>
                           )}
                         </td>
                       </tr>
@@ -374,21 +374,23 @@ export default function VulnintelPage() {
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="flex items-center gap-2 text-sm font-medium">
-                <FolderGitIcon className="size-4" /> nuclei 模板库
+                <FolderGitIcon className="size-4" /> {ui("screen.647e00ce656f91")}
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-2">
               <p className="text-muted-foreground text-xs">
-                目录：{status.nuclei?.dir || status.nuclei_templates_dir || "未配置"}
+                {ui("screen.8cf3739efdd298", {
+                  v0: status.nuclei?.dir || status.nuclei_templates_dir || ui("screen.80a57e03f0717f"),
+                })}
               </p>
               {status.nuclei && (
                 <>
                   <div className="flex flex-wrap items-center gap-2">
-                    <Badge variant="secondary">{status.nuclei.templates} 个模板</Badge>
-                    {status.nuclei.is_git && <Badge variant="outline">git 仓库</Badge>}
+                    <Badge variant="secondary">{ui("screen.1d81e52c61728d", { v0: status.nuclei.templates })}</Badge>
+                    {status.nuclei.is_git && <Badge variant="outline">{ui("screen.3ca6aec01101bf")}</Badge>}
                     {status.nuclei.updated_at && (
                       <span className="text-muted-foreground text-xs">
-                        最近更新 {fmtTime(status.nuclei.updated_at)}
+                        {ui("screen.f06a14160b9f81", { v0: fmtTime(status.nuclei.updated_at) })}
                       </span>
                     )}
                   </div>
@@ -402,7 +404,7 @@ export default function VulnintelPage() {
             <Card>
               <CardHeader className="pb-2">
                 <CardTitle className="flex items-center gap-2 text-sm font-medium">
-                  <ActivityIcon className="size-4" /> 连通性自检
+                  <ActivityIcon className="size-4" /> {ui("screen.de94f8b3ec85cd")}
                 </CardTitle>
               </CardHeader>
               <CardContent>
@@ -410,21 +412,21 @@ export default function VulnintelPage() {
                   <table className="w-full text-sm">
                     <thead>
                       <tr className="border-b text-left text-muted-foreground">
-                        <th className="py-2 pr-4 font-medium">数据源</th>
-                        <th className="py-2 pr-4 font-medium">结果</th>
-                        <th className="py-2 pr-4 font-medium">耗时</th>
-                        <th className="py-2 pr-4 font-medium">说明</th>
+                        <th className="py-2 pr-4 font-medium">{ui("screen.186be2232e2c9b")}</th>
+                        <th className="py-2 pr-4 font-medium">{ui("screen.bb7ef73495dd8a")}</th>
+                        <th className="py-2 pr-4 font-medium">{ui("screen.e77e3d58b0dcff")}</th>
+                        <th className="py-2 pr-4 font-medium">{ui("screen.4262c45dc797bb")}</th>
                       </tr>
                     </thead>
                     <tbody>
                       {probeRows.map((r) => (
                         <tr key={r.source} className="border-b align-top last:border-0">
-                          <td className="py-2 pr-4">{SOURCE_LABEL[r.source] ?? r.source}</td>
+                          <td className="py-2 pr-4">{ui(SOURCE_LABEL[r.source] ?? r.source)}</td>
                           <td className="py-2 pr-4">
                             {r.ok ? (
-                              <Badge variant="default">通 {r.status}</Badge>
+                              <Badge variant="default">{ui("screen.7e3cf34858df8f", { v0: r.status })}</Badge>
                             ) : (
-                              <Badge variant="destructive">{r.status ? `HTTP ${r.status}` : "失败"}</Badge>
+                              <Badge variant="destructive">{r.status ? `HTTP ${r.status}` : ui("screen.28384d7afd2e4f")}</Badge>
                             )}
                           </td>
                           <td className="py-2 pr-4 tabular-nums">{r.latency_ms} ms</td>

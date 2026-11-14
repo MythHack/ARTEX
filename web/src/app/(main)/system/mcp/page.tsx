@@ -1,24 +1,17 @@
 "use client";
-
 import * as React from "react";
-import { toast } from "sonner";
-import { PlusIcon, RefreshCwIcon, ServerIcon, Trash2Icon } from "lucide-react";
 
+import { PlusIcon, RefreshCwIcon, ServerIcon, Trash2Icon } from "lucide-react";
+import { toast } from "sonner";
+
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
-import { Badge } from "@/components/ui/badge";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle,
-  SheetDescription,
-} from "@/components/ui/sheet";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -29,9 +22,11 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
+import { useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
-import type { MCPServer, MCPTool, Agent } from "@/lib/types";
+import type { Agent, MCPServer, MCPTool } from "@/lib/types";
 
 type Transport = "stdio" | "http" | "sse";
 type FormState = {
@@ -54,6 +49,8 @@ const emptyForm: FormState = {
 };
 
 export default function MCPPage() {
+  const { ui } = useUITranslation();
+
   const [servers, setServers] = React.useState<MCPServer[]>([]);
   const [agents, setAgents] = React.useState<Agent[]>([]);
   const [visibility, setVisibility] = React.useState<Record<number, string[]>>({});
@@ -71,7 +68,10 @@ export default function MCPPage() {
   const [refreshing, setRefreshing] = React.useState(false);
 
   const load = React.useCallback(() => {
-    api.agents().then(setAgents).catch(() => {});
+    api
+      .agents()
+      .then(setAgents)
+      .catch(() => {});
     api
       .mcpServers()
       .then((ss) => {
@@ -149,15 +149,15 @@ export default function MCPPage() {
 
   async function saveForm() {
     if (!form.name.trim()) {
-      toast.error("请填写名称");
+      toast.error(ui("screen.fbc79033bfa23d"));
       return;
     }
     if (form.transport === "stdio" && !form.command.trim()) {
-      toast.error("请填写命令");
+      toast.error(ui("screen.6e9a1a549d159a"));
       return;
     }
     if (form.transport !== "stdio" && !form.url.trim()) {
-      toast.error("请填写远程 URL");
+      toast.error(ui("screen.fb19ca44a607a5"));
       return;
     }
     setSaving(true);
@@ -185,11 +185,11 @@ export default function MCPPage() {
         enabled: editing ? editing.enabled : true,
         ...base,
       });
-      toast.success(editing ? "已保存" : "已添加 MCP 服务器");
+      toast.success(editing ? ui("screen.1bd91a7d0c53c9") : ui("screen.53b36687882f85"));
       if (!editing) setOpen(false);
       load();
     } catch (e) {
-      toast.error(`保存失败：${(e as Error).message}`);
+      toast.error(ui("screen.6ade7baf8737c0") + (e as Error).message);
     } finally {
       setSaving(false);
     }
@@ -201,10 +201,10 @@ export default function MCPPage() {
     try {
       const t = await api.refreshMcpServer(editing.id);
       setTools(t);
-      toast.success(`发现 ${t.length} 个工具`);
+      toast.success(ui("screen.536acc520167f3", { v0: t.length }));
       load();
     } catch (e) {
-      toast.error(`刷新失败：${(e as Error).message}`);
+      toast.error(ui("screen.0c57a1d38e6afa") + (e as Error).message);
     } finally {
       setRefreshing(false);
     }
@@ -214,12 +214,12 @@ export default function MCPPage() {
     setDeleting(true);
     try {
       await api.deleteMcpServer(s.id);
-      toast.success(`已删除：${s.name}`);
+      toast.success(ui("screen.e196bc4beeeaad", { v0: s.name }));
       setOpen(false);
       load();
       setPendingDelete(null);
     } catch (e) {
-      toast.error(`删除失败：${(e as Error).message}`);
+      toast.error(ui("screen.0580fcee37e020") + (e as Error).message);
     } finally {
       setDeleting(false);
     }
@@ -230,7 +230,7 @@ export default function MCPPage() {
       await api.saveMcpServer({ ...s, enabled: !s.enabled });
       load();
     } catch (e) {
-      toast.error(`操作失败：${(e as Error).message}`);
+      toast.error(ui("screen.37cdfdb143a7a8") + (e as Error).message);
     }
   }
 
@@ -238,10 +238,15 @@ export default function MCPPage() {
     const on = (visibility[serverId] ?? []).includes(agentId);
     try {
       await api.toggleVisibility(agentId, "mcp", serverId, !on);
-      toast.success(`${on ? "取消" : "授予"}「${agentName}」可见`);
+      toast.success(
+        ui("screen.3c3fed693f6db5", {
+          v0: on ? ui("screen.2cd0f3be8738a8") : ui("screen.2e87bd556c124f"),
+          v1: agentName,
+        }),
+      );
       load();
     } catch (e) {
-      toast.error(`操作失败：${(e as Error).message}`);
+      toast.error(ui("screen.37cdfdb143a7a8") + (e as Error).message);
     }
   }
 
@@ -249,33 +254,33 @@ export default function MCPPage() {
     return (
       <div className="grid gap-4 py-4">
         <div className="grid gap-2">
-          <Label>传输方式</Label>
+          <Label>{ui("screen.84dada05d8d523")}</Label>
           <div className="flex gap-2">
             <Button
               type="button"
               variant={form.transport === "stdio" ? "default" : "outline"}
               onClick={() => setF({ transport: "stdio" })}
             >
-              stdio（本地）
+              {ui("screen.45b3199c421835")}
             </Button>
             <Button
               type="button"
               variant={form.transport === "http" ? "default" : "outline"}
               onClick={() => setF({ transport: "http" })}
             >
-              http（远程）
+              {ui("screen.3bdf0ff38a5f12")}
             </Button>
             <Button
               type="button"
               variant={form.transport === "sse" ? "default" : "outline"}
               onClick={() => setF({ transport: "sse" })}
             >
-              sse（旧版）
+              {ui("screen.f70349dee545aa")}
             </Button>
           </div>
         </div>
         <div className="grid gap-2">
-          <Label htmlFor="m-name">名称</Label>
+          <Label htmlFor="m-name">{ui("screen.d44e9b3d3b31d3")}</Label>
           <Input
             id="m-name"
             placeholder="filesystem"
@@ -286,7 +291,7 @@ export default function MCPPage() {
         {form.transport === "stdio" ? (
           <>
             <div className="grid gap-2">
-              <Label htmlFor="m-cmd">命令</Label>
+              <Label htmlFor="m-cmd">{ui("screen.928f87d4507bf9")}</Label>
               <Input
                 id="m-cmd"
                 className="font-mono"
@@ -296,7 +301,7 @@ export default function MCPPage() {
               />
             </div>
             <div className="grid gap-2">
-              <Label htmlFor="m-args">参数（空格分隔）</Label>
+              <Label htmlFor="m-args">{ui("screen.f99517115abfc7")}</Label>
               <Input
                 id="m-args"
                 className="font-mono"
@@ -308,7 +313,7 @@ export default function MCPPage() {
           </>
         ) : (
           <div className="grid gap-2">
-            <Label htmlFor="m-url">远程 URL</Label>
+            <Label htmlFor="m-url">{ui("screen.63340f3743eeeb")}</Label>
             <Input
               id="m-url"
               className="font-mono"
@@ -317,26 +322,19 @@ export default function MCPPage() {
               onChange={(e) => setF({ url: e.target.value })}
             />
             <label className="flex items-center gap-2 text-sm">
-              <Checkbox
-                checked={form.insecure}
-                onCheckedChange={(v) => setF({ insecure: v === true })}
-              />
-              跳过 TLS 证书校验（自签证书）
+              <Checkbox checked={form.insecure} onCheckedChange={(v) => setF({ insecure: v === true })} />
+              {ui("screen.5938afb19912b5")}
             </label>
           </div>
         )}
         <div className="grid gap-2">
           <Label htmlFor="m-env">
-            {form.transport !== "stdio"
-              ? "请求头（每行 KEY=VALUE，如 Authorization=Bearer xxx）"
-              : "环境变量（每行 KEY=VALUE）"}
+            {form.transport !== "stdio" ? ui("screen.1b79247a56f3a5") : ui("screen.4c47bd79cb47ae")}
           </Label>
           <Textarea
             id="m-env"
             className="font-mono"
-            placeholder={
-              form.transport !== "stdio" ? "Authorization=Bearer xxxx" : "API_KEY=xxxx\nFOO=bar"
-            }
+            placeholder={form.transport !== "stdio" ? "Authorization=Bearer xxxx" : "API_KEY=xxxx\nFOO=bar"}
             value={form.env}
             onChange={(e) => setF({ env: e.target.value })}
           />
@@ -349,24 +347,24 @@ export default function MCPPage() {
     return (
       <div className="flex flex-col gap-3 py-4">
         <div className="flex items-center justify-between">
-          <span className="text-muted-foreground text-sm">{tools.length} 个工具</span>
+          <span className="text-muted-foreground text-sm">
+            {tools.length} {ui("screen.e43b2a10830f3e")}
+          </span>
           <Button size="sm" variant="outline" disabled={refreshing} onClick={refreshTools}>
-            <RefreshCwIcon className={refreshing ? "animate-spin" : ""} /> 刷新
+            <RefreshCwIcon className={refreshing ? "animate-spin" : ""} /> {ui("screen.aee88743413144")}
           </Button>
         </div>
         {toolsLoading ? (
-          <p className="text-muted-foreground text-sm">加载中…</p>
+          <p className="text-muted-foreground text-sm">{ui("screen.4927a53bcc886a")}</p>
         ) : tools.length === 0 ? (
-          <p className="text-muted-foreground text-sm">尚未发现工具，点击刷新重新获取。</p>
+          <p className="text-muted-foreground text-sm">{ui("screen.f8ed21a54f39ec")}</p>
         ) : (
           <div className="flex flex-col divide-y">
             {tools.map((t) => (
               <div key={t.name} className="py-2.5">
                 <code className="font-mono text-sm">{t.name}</code>
                 {t.description && (
-                  <p className="mt-0.5 text-muted-foreground text-xs leading-relaxed">
-                    {t.description}
-                  </p>
+                  <p className="text-muted-foreground mt-0.5 text-xs leading-relaxed">{t.description}</p>
                 )}
               </div>
             ))}
@@ -379,8 +377,8 @@ export default function MCPPage() {
   return (
     <div className="flex flex-1 flex-col gap-4 md:gap-6">
       <div>
-        <h1 className="font-semibold text-xl tracking-tight">MCP</h1>
-        <p className="text-muted-foreground text-sm">外部 MCP 工具服务器 · 按 Agent 授权可见</p>
+        <h1 className="text-xl font-semibold tracking-tight">MCP</h1>
+        <p className="text-muted-foreground text-sm">{ui("screen.87d38b3a8308a7")}</p>
       </div>
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -390,7 +388,7 @@ export default function MCPPage() {
           className="flex min-h-[116px] flex-col items-center justify-center gap-2 rounded-xl border border-foreground/70 border-dashed text-foreground/70 transition hover:bg-muted/60 hover:shadow-sm"
         >
           <PlusIcon className="size-6" />
-          <span className="text-sm">添加 MCP</span>
+          <span className="text-sm">{ui("screen.c7121fa89693b0")}</span>
         </button>
 
         {servers.map((s) => (
@@ -410,7 +408,7 @@ export default function MCPPage() {
                   <Switch
                     checked={s.enabled}
                     onCheckedChange={() => toggleEnabled(s)}
-                    aria-label="启用"
+                    aria-label={ui("screen.f4f0ead1116b5b")}
                   />
                   <Button
                     size="icon"
@@ -425,10 +423,12 @@ export default function MCPPage() {
             </CardHeader>
             <CardContent className="grid gap-3">
               <p className="text-muted-foreground text-sm">
-                {s.tools && s.tools.length > 0 ? `${s.tools.length} 个工具` : "尚未发现工具"}
+                {s.tools && s.tools.length > 0
+                  ? ui("screen.0092721f98c2ec", { v0: s.tools.length })
+                  : ui("screen.46c990b44f62f8")}
               </p>
               <div className="grid gap-2" onClick={(e) => e.stopPropagation()}>
-                <span className="text-muted-foreground text-xs">可见性（按 Agent 授权）</span>
+                <span className="text-muted-foreground text-xs">{ui("screen.6d6c9bd4c4498a")}</span>
                 <div className="flex flex-wrap gap-x-4 gap-y-2">
                   {agents.map((a) => (
                     <label key={a.key} className="flex items-center gap-2 text-sm">
@@ -447,15 +447,10 @@ export default function MCPPage() {
       </div>
 
       <Sheet open={open} onOpenChange={setOpen}>
-        <SheetContent
-          side="right"
-          className="w-full data-[side=right]:sm:max-w-lg"
-        >
+        <SheetContent side="right" className="w-full data-[side=right]:sm:max-w-lg">
           <SheetHeader>
-            <SheetTitle>{editing ? editing.name : "添加 MCP 服务器"}</SheetTitle>
-            <SheetDescription>
-              stdio（本地起进程）或 http（远程 Streamable HTTP）
-            </SheetDescription>
+            <SheetTitle>{editing ? editing.name : ui("screen.c52661984f930a")}</SheetTitle>
+            <SheetDescription>{ui("screen.797024aa7a9b52")}</SheetDescription>
           </SheetHeader>
 
           {editing ? (
@@ -465,16 +460,17 @@ export default function MCPPage() {
               className="flex min-h-0 flex-1 flex-col px-4"
             >
               <TabsList>
-                <TabsTrigger value="config">配置</TabsTrigger>
+                <TabsTrigger value="config">{ui("screen.148d195e21b05d")}</TabsTrigger>
                 <TabsTrigger value="tools">
-                  工具列表{tools.length ? `（${tools.length}）` : ""}
+                  {ui("screen.415dd9f106a567")}
+                  {tools.length ? `（${tools.length}）` : ""}
                 </TabsTrigger>
               </TabsList>
               <TabsContent value="config" className="min-h-0 flex-1 overflow-y-auto">
                 {renderForm()}
                 <div className="flex gap-2 pt-2 pb-6">
                   <Button onClick={saveForm} disabled={saving}>
-                    保存
+                    {ui("screen.a3030bf8f16dc6")}
                   </Button>
                 </div>
               </TabsContent>
@@ -487,7 +483,7 @@ export default function MCPPage() {
               {renderForm()}
               <div className="pt-2 pb-6">
                 <Button onClick={saveForm} disabled={saving}>
-                  <PlusIcon /> 添加
+                  <PlusIcon /> {ui("screen.7a8a11ead50742")}
                 </Button>
               </div>
             </div>
@@ -499,18 +495,18 @@ export default function MCPPage() {
       <AlertDialog open={!!pendingDelete} onOpenChange={(o) => { if (!o) setPendingDelete(null); }}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>删除 MCP 服务器「{pendingDelete?.name}」？</AlertDialogTitle>
+            <AlertDialogTitle>{ui("screen.358aee9f1d13a3", { v0: pendingDelete?.name ?? "" })}</AlertDialogTitle>
             <AlertDialogDescription>
-              将移除该服务器及其全部工具发现结果；引用其工具的 Agent 会立即失去这些工具。此操作不可撤销。
+              {ui("screen.94049427704926")}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleting}>取消</AlertDialogCancel>
+            <AlertDialogCancel disabled={deleting}>{ui("screen.2cd0f3be8738a8")}</AlertDialogCancel>
             <AlertDialogAction
               disabled={deleting}
               onClick={(e) => { e.preventDefault(); if (pendingDelete) void removeServer(pendingDelete); }}
             >
-              {deleting ? "删除中…" : "删除"}
+              {deleting ? ui("screen.5e8e7af57abbcb") : ui("screen.2f9daa828907b9")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

@@ -3,14 +3,16 @@
 import Link from "next/link";
 
 import { Button } from "@/components/ui/button";
+import { useUITranslation } from "@/i18n/use-ui-translation";
 
 export default function NotFound() {
+  const { ui } = useUITranslation();
   return (
     <div className="flex h-dvh flex-col items-center justify-center space-y-2 text-center">
-      <h1 className="font-semibold text-2xl">页面不存在</h1>
-      <p className="text-muted-foreground">你要找的页面不存在或已被移动。</p>
+      <h1 className="font-semibold text-2xl">{ui("screen.e75737c1ab90e1")}</h1>
+      <p className="text-muted-foreground">{ui("screen.39a4262a84700c")}</p>
       <Link prefetch={false} replace href="/function/tasks">
-        <Button variant="outline">回到工作台</Button>
+        <Button variant="outline">{ui("screen.f2e60784b2030a")}</Button>
       </Link>
     </div>
   );

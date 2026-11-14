@@ -10,6 +10,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import { useUITranslation } from "@/i18n/use-ui-translation";
 import { api, http } from "@/lib/api";
 
 interface Identity {
@@ -29,6 +30,7 @@ interface Identity {
 const empty: Partial<Identity> = { kind: "password", enabled: true };
 
 export function IdentitiesTab({ taskId }: { taskId: string }) {
+  const { ui, liveUI } = useUITranslation();
   const [items, setItems] = React.useState<Identity[]>([]);
   const [draft, setDraft] = React.useState<Partial<Identity>>({ ...empty });
   const [loading, setLoading] = React.useState(true);
@@ -40,10 +42,10 @@ export function IdentitiesTab({ taskId }: { taskId: string }) {
         setLoading(false);
       })
       .catch((e) => {
-        toast.error(`加载身份失败：${(e as Error).message}`);
+        toast.error(liveUI("screen.09a1e625b27738", { v0: (e as Error).message }));
         setLoading(false);
       });
-  }, [taskId]);
+  }, [taskId, liveUI]);
 
   React.useEffect(() => {
     load();
@@ -51,16 +53,16 @@ export function IdentitiesTab({ taskId }: { taskId: string }) {
 
   const save = () => {
     if (!draft.name?.trim()) {
-      toast.error("身份名称不能为空");
+      toast.error(liveUI("screen.c3549f2bcb3f50"));
       return;
     }
     http<Identity>(`/tasks/${taskId}/identities`, { method: "POST", body: JSON.stringify({ ...draft, name: draft.name!.trim() }) })
       .then((it) => {
         setItems((prev) => [...prev, it]);
         setDraft({ ...empty });
-        toast.success("身份已保存");
+        toast.success(liveUI("screen.3cb45b95836312"));
       })
-      .catch((e) => toast.error(`保存失败：${(e as Error).message}`));
+      .catch((e) => toast.error(liveUI("screen.20e1b0f2590bc7", { v0: (e as Error).message })));
   };
 
   const toggle = (it: Identity, on: boolean) => {
@@ -68,47 +70,44 @@ export function IdentitiesTab({ taskId }: { taskId: string }) {
       .then((updated) => {
         setItems((prev) => prev.map((x) => (x.id === it.id ? updated : x)));
       })
-      .catch((e) => toast.error(`更新失败：${(e as Error).message}`));
+      .catch((e) => toast.error(liveUI("screen.4cdda2a76dca47", { v0: (e as Error).message })));
   };
 
   const remove = (it: Identity) => {
     http(`/tasks/${taskId}/identities/${it.id}`, { method: "DELETE" })
       .then(() => setItems((prev) => prev.filter((x) => x.id !== it.id)))
-      .catch((e) => toast.error(`删除失败：${(e as Error).message}`));
+      .catch((e) => toast.error(liveUI("screen.77dcc9d08e857c", { v0: (e as Error).message })));
   };
 
   return (
     <div className="space-y-4">
       <Card>
         <CardHeader>
-          <CardTitle>新增身份</CardTitle>
-          <CardDescription>
-            配置后 Planner 可在意图中绑定身份（identity_id），Worker 将强制使用该身份的会话执行。
-            未配置或 identity_id=0 时按匿名执行；匿名意图与带身份意图应并行派发，不能互相替代。
-          </CardDescription>
+          <CardTitle>{ui("screen.d197da806d759f")}</CardTitle>
+          <CardDescription>{ui("screen.e4acc6430dfda3")}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
           <div className="grid gap-2 md:grid-cols-2">
             <div>
-              <Label htmlFor="identity-name">名称</Label>
+              <Label htmlFor="identity-name">{ui("screen.d44e9b3d3b31d3")}</Label>
               <Input
                 id="identity-name"
-                placeholder="如：普通用户A / 管理员B"
+                placeholder={ui("screen.edbb80aea815ae")}
                 value={draft.name ?? ""}
                 onChange={(e) => setDraft({ ...draft, name: e.target.value })}
               />
             </div>
             <div>
-              <Label htmlFor="identity-kind">类型</Label>
+              <Label htmlFor="identity-kind">{ui("screen.ba40014ff496f6")}</Label>
               <Select value={draft.kind} onValueChange={(v) => setDraft({ ...draft, kind: v as Identity["kind"] })}>
                 <SelectTrigger id="identity-kind">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="password">账号密码</SelectItem>
+                  <SelectItem value="password">{ui("screen.164c7afc61581e")}</SelectItem>
                   <SelectItem value="cookie">Cookie</SelectItem>
                   <SelectItem value="token">Token / API Key</SelectItem>
-                  <SelectItem value="header">自定义请求头</SelectItem>
+                  <SelectItem value="header">{ui("screen.f3f7f9ecdd8d23")}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -116,18 +115,18 @@ export function IdentitiesTab({ taskId }: { taskId: string }) {
           {draft.kind === "password" && (
             <div className="grid gap-2 md:grid-cols-2">
               <div>
-                <Label htmlFor="identity-username">账号</Label>
+                <Label htmlFor="identity-username">{ui("screen.311bb313fdeca6")}</Label>
                 <Input id="identity-username" value={draft.username ?? ""} onChange={(e) => setDraft({ ...draft, username: e.target.value })} />
               </div>
               <div>
-                <Label htmlFor="identity-password">密码</Label>
+                <Label htmlFor="identity-password">{ui("screen.a621ab606db2a1")}</Label>
                 <Input id="identity-password" type="password" value={draft.password ?? ""} onChange={(e) => setDraft({ ...draft, password: e.target.value })} />
               </div>
             </div>
           )}
           {draft.kind === "cookie" && (
             <div>
-              <Label htmlFor="identity-cookie">Cookie 字符串</Label>
+              <Label htmlFor="identity-cookie">{ui("screen.4b6c25b2047e36")}</Label>
               <Textarea id="identity-cookie" rows={2} placeholder="session=xxx; token=yyy" value={draft.cookie ?? ""} onChange={(e) => setDraft({ ...draft, cookie: e.target.value })} />
             </div>
           )}
@@ -139,7 +138,7 @@ export function IdentitiesTab({ taskId }: { taskId: string }) {
           )}
           {draft.kind === "header" && (
             <div>
-              <Label htmlFor="identity-headers">自定义请求头（JSON）</Label>
+              <Label htmlFor="identity-headers">{ui("screen.e5b1ae88e140ee")}</Label>
               <Textarea id="identity-headers" rows={2} placeholder='{"X-User-Role": "admin"}' value={draft.headers ? JSON.stringify(draft.headers) : ""} onChange={(e) => {
                 try {
                   setDraft({ ...draft, headers: JSON.parse(e.target.value || "{}") });
@@ -150,28 +149,28 @@ export function IdentitiesTab({ taskId }: { taskId: string }) {
             </div>
           )}
           <div>
-            <Label htmlFor="identity-notes">备注</Label>
-            <Input id="identity-notes" placeholder="用途说明（如：普通用户，用于水平越权对比）" value={draft.notes ?? ""} onChange={(e) => setDraft({ ...draft, notes: e.target.value })} />
+            <Label htmlFor="identity-notes">{ui("screen.daede9881787ab")}</Label>
+            <Input id="identity-notes" placeholder={ui("screen.cb4f16e95e7df8")} value={draft.notes ?? ""} onChange={(e) => setDraft({ ...draft, notes: e.target.value })} />
           </div>
-          <Button onClick={save}>保存身份</Button>
+          <Button onClick={save}>{ui("screen.f9cca06953e647")}</Button>
         </CardContent>
       </Card>
 
       <Card>
         <CardHeader>
-          <CardTitle>已配置身份（{items.length}）</CardTitle>
-          <CardDescription>启用后 Planner 可在 add_intent 中绑定 identity_id；Worker 将强制使用该身份的会话执行。</CardDescription>
+          <CardTitle>{ui("screen.7fbacccdd73555", { v0: items.length })}</CardTitle>
+          <CardDescription>{ui("screen.db2f4bccb89c8c")}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
-          {loading ? <p className="text-sm text-muted-foreground">加载中…</p> : null}
-          {!loading && items.length === 0 ? <p className="text-sm text-muted-foreground">尚未配置身份，当前全部按匿名执行。</p> : null}
+          {loading ? <p className="text-sm text-muted-foreground">{ui("screen.4927a53bcc886a")}</p> : null}
+          {!loading && items.length === 0 ? <p className="text-sm text-muted-foreground">{ui("screen.b316d37aaf5dfa")}</p> : null}
           {items.map((it) => (
             <div key={it.id} className="flex items-center justify-between rounded border p-3">
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <span className="font-medium">{it.name}</span>
                   <code className="rounded bg-muted px-1.5 py-0.5 text-xs">{it.kind}</code>
-                  {it.enabled ? <span className="text-xs text-green-600">启用</span> : <span className="text-xs text-muted-foreground">禁用</span>}
+                  {it.enabled ? <span className="text-xs text-green-600">{ui("screen.f4f0ead1116b5b")}</span> : <span className="text-xs text-muted-foreground">{ui("screen.7df5c456c765e4")}</span>}
                 </div>
                 {it.notes ? <p className="truncate text-xs text-muted-foreground">{it.notes}</p> : null}
                 <p className="truncate text-xs text-muted-foreground">
@@ -183,7 +182,7 @@ export function IdentitiesTab({ taskId }: { taskId: string }) {
               </div>
               <div className="flex items-center gap-2">
                 <Switch checked={it.enabled} onCheckedChange={(v) => toggle(it, v)} />
-                <Button size="sm" variant="destructive" onClick={() => remove(it)}>删除</Button>
+                <Button size="sm" variant="destructive" onClick={() => remove(it)}>{ui("screen.2f9daa828907b9")}</Button>
               </div>
             </div>
           ))}

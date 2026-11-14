@@ -20,13 +20,14 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
 import type { C2Config, ListenerSession, ListenerView } from "@/lib/types";
 
 const MODE_LABEL: Record<string, string> = {
-  direct: "直连（本机可达）",
-  ssh: "SSH 中继托管",
-  manual: "手工转发",
+  direct: "screen.558ca3d73f0ec3",
+  ssh: "screen.411fda6a943cb4",
+  manual: "screen.958edf57483b89",
 };
 
 function fmtBytes(n: number): string {
@@ -41,6 +42,7 @@ function fmtTime(iso: string): string {
 }
 
 export default function C2Page() {
+  const { ui, liveUI } = useUITranslation();
   // ── C2 出口配置 ──
   const [cfg, setCfg] = React.useState<C2Config | null>(null);
   const [mode, setMode] = React.useState<string>("direct");
@@ -74,9 +76,9 @@ export default function C2Page() {
       setHasPass(c.has_pass);
       setPass("");
     } catch (e) {
-      toast.error(`加载 C2 配置失败：${(e as Error).message}`);
+      toast.error(liveUI("screen.f6fca8fde47099", { v0: (e as Error).message }));
     }
-  }, []);
+  }, [liveUI]);
 
   const loadListeners = React.useCallback(async () => {
     setRefreshing(true);
@@ -84,11 +86,11 @@ export default function C2Page() {
       const r = await api.listeners();
       setListeners(r.listeners ?? []);
     } catch (e) {
-      toast.error(`加载监听器失败：${(e as Error).message}`);
+      toast.error(liveUI("screen.4bcd7850af6eeb", { v0: (e as Error).message }));
     } finally {
       setRefreshing(false);
     }
-  }, []);
+  }, [liveUI]);
 
   React.useEffect(() => {
     void loadCfg();
@@ -115,9 +117,9 @@ export default function C2Page() {
       setCfg(saved);
       setHasPass(saved.has_pass);
       setPass("");
-      toast.success("C2 出口配置已保存");
+      toast.success(liveUI("screen.060dddf55dee27"));
     } catch (e) {
-      toast.error(`保存失败：${(e as Error).message}`);
+      toast.error(liveUI("screen.20e1b0f2590bc7", { v0: (e as Error).message }));
     } finally {
       setSavingCfg(false);
     }
@@ -127,23 +129,25 @@ export default function C2Page() {
     const p = Number(port);
     const nm = name.trim();
     if (!nm) {
-      toast.error("请填写监听器名称");
+      toast.error(liveUI("screen.38c2ed175e70bc"));
       return;
     }
     if (!Number.isInteger(p) || p < 1024 || p > 65535) {
-      toast.error("端口须为 1024-65535 的整数（低端口绑定为特权操作，走外部转发）");
+      toast.error(liveUI("screen.5655b6d1e29b3a"));
       return;
     }
     setStarting(true);
     try {
       const r = await api.startListener(nm, p);
-      toast.success(`监听器 ${r.name} 已启动，回连地址 ${r.connect_back.lhost}:${r.connect_back.lport}`);
+      toast.success(
+        liveUI("screen.009ee02dfdca75", { v0: r.name, v1: r.connect_back.lhost, v2: r.connect_back.lport }),
+      );
       setName("");
       setPort("");
       await loadListeners();
       setExpanded(r.name);
     } catch (e) {
-      toast.error(`启动失败：${(e as Error).message}`);
+      toast.error(liveUI("screen.e3c3ddff13abc1", { v0: (e as Error).message }));
     } finally {
       setStarting(false);
     }
@@ -153,11 +157,11 @@ export default function C2Page() {
     setStopping(true);
     try {
       const r = await api.stopListener(l.name);
-      toast.success(`已停止 ${r.stopped}（${r.sessions.length} 条会话已留档）`);
+      toast.success(liveUI("screen.078c9237b27e4e", { v0: r.stopped, v1: r.sessions.length }));
       setPendingStop(null);
       await loadListeners();
     } catch (e) {
-      toast.error(`停止失败：${(e as Error).message}`);
+      toast.error(liveUI("screen.8db4fd2d271d4e", { v0: (e as Error).message }));
     } finally {
       setStopping(false);
     }
@@ -169,69 +173,75 @@ export default function C2Page() {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-base">
-            <RadioTower className="size-4" /> C2 出口配置
+            <RadioTower className="size-4" /> {ui("screen.4fd8f95547862d")}
           </CardTitle>
         </CardHeader>
         <CardContent className="grid gap-4">
           <p className="text-muted-foreground text-sm">
-            决定反弹 shell / OOB 该连哪里：<b>direct</b>=本机可达（零配置）；
-            <b>ssh</b>=本机无公网+公网中转机，平台自动建 SSH 反向隧道（断线重连，随监听器启停）；
-            <b>manual</b>=已有手工转发，只展示中转地址。agent 调 <code>listener_start</code> 时
-            回连地址以此配置解析，无需自行判断网络形态。
+            {ui("screen.9ce8be9b326844")}
+            <b>direct</b>
+            {ui("screen.6a177a280d3886")}
+            <b>ssh</b>
+            {ui("screen.9aac7b2e715a05")}
+            <b>manual</b>
+            {ui("screen.ce8241ae862b0c")} <code>listener_start</code> {ui("screen.7c435f6743a836")}
           </p>
           <div className="grid gap-2 sm:max-w-sm">
-            <Label>出口形态</Label>
+            <Label>{ui("screen.404fd6c8177e0a")}</Label>
             <Select value={mode} onValueChange={setMode}>
               <SelectTrigger>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="direct">direct · 本机可达</SelectItem>
-                <SelectItem value="ssh">ssh · 公网中转机托管</SelectItem>
-                <SelectItem value="manual">manual · 已有手工转发</SelectItem>
+                <SelectItem value="direct">{ui("screen.10db06d3d3e201")}</SelectItem>
+                <SelectItem value="ssh">{ui("screen.c9db95815576f6")}</SelectItem>
+                <SelectItem value="manual">{ui("screen.b63305f19d126c")}</SelectItem>
               </SelectContent>
             </Select>
           </div>
           {(mode === "ssh" || mode === "manual") && (
             <div className="grid gap-2 sm:max-w-sm">
-              <Label>中转机公网地址（回显给目标的 LHOST）</Label>
-              <Input value={host} onChange={(e) => setHost(e.target.value)} placeholder="例如 1.2.3.4" />
+              <Label>{ui("screen.f535f68d7cbe50")}</Label>
+              <Input value={host} onChange={(e) => setHost(e.target.value)} placeholder={ui("screen.33db8dc3bea133")} />
             </div>
           )}
           {mode === "ssh" && (
             <>
               <div className="grid gap-2 sm:max-w-sm">
-                <Label>中转机 SSH（user@host[:port]）</Label>
+                <Label>{ui("screen.532c5e5e4b14fa")}</Label>
                 <Input value={ssh} onChange={(e) => setSsh(e.target.value)} placeholder="root@1.2.3.4:22" />
               </div>
               <div className="grid gap-2 sm:max-w-sm">
-                <Label>SSH 密码{hasPass ? "（已设置，留空保持不变）" : ""}</Label>
+                <Label>
+                  {ui("screen.6f0890a1b0b0b5")}
+                  {hasPass ? ui("screen.7e51bb5e26adf8") : ""}
+                </Label>
                 <Input
                   type="password"
                   value={pass}
                   onChange={(e) => setPass(e.target.value)}
-                  placeholder={hasPass ? "••••••••" : "中转机 SSH 密码"}
+                  placeholder={hasPass ? "••••••••" : ui("screen.0eb502fd3103f9")}
                 />
               </div>
               <div className="grid gap-2 sm:max-w-sm">
-                <Label>SSH 私钥路径（可选，与密码二选一）</Label>
+                <Label>{ui("screen.734686f9eac07f")}</Label>
                 <Input value={key} onChange={(e) => setKey(e.target.value)} placeholder="/root/.ssh/id_rsa" />
               </div>
             </>
           )}
           {mode === "direct" && (
             <div className="grid gap-2 sm:max-w-sm">
-              <Label>出口网卡（可选，留空自动取默认路由源地址）</Label>
-              <Input value={iface} onChange={(e) => setIface(e.target.value)} placeholder="例如 eth0" />
+              <Label>{ui("screen.b21b550553d63f")}</Label>
+              <Input value={iface} onChange={(e) => setIface(e.target.value)} placeholder={ui("screen.1d0161cfe06b39")} />
             </div>
           )}
           <div>
             <Button onClick={saveCfg} disabled={savingCfg}>
-              {savingCfg ? "保存中…" : "保存配置"}
+              {savingCfg ? ui("screen.ff509c9ba052a2") : ui("screen.6e584e3d5ce64a")}
             </Button>
             {cfg && (
               <span className="text-muted-foreground ml-3 text-sm">
-                当前：<b>{MODE_LABEL[cfg.mode] ?? cfg.mode}</b>
+                {ui("screen.55e54c335c596e", { v0: ui(MODE_LABEL[cfg.mode] ?? cfg.mode) })}
                 {cfg.ssh ? ` · ${cfg.ssh}` : ""}
               </span>
             )}
@@ -244,31 +254,31 @@ export default function C2Page() {
         <CardHeader>
           <CardTitle className="flex items-center justify-between text-base">
             <span className="flex items-center gap-2">
-              <RadioTower className="size-4" /> 回连接收器（{listeners.length}）
+              <RadioTower className="size-4" /> {ui("screen.5ac0c406f84d5b", { v0: listeners.length })}
             </span>
             <Button size="sm" variant="outline" onClick={() => void loadListeners()} disabled={refreshing}>
-              <RefreshCwIcon className={refreshing ? "animate-spin" : ""} /> 刷新
+              <RefreshCwIcon className={refreshing ? "animate-spin" : ""} /> {ui("screen.aee88743413144")}
             </Button>
           </CardTitle>
         </CardHeader>
         <CardContent className="grid gap-4">
           <div className="grid items-end gap-2 sm:grid-cols-[1fr_140px_auto]">
             <div className="grid gap-1">
-              <Label>监听器名称</Label>
-              <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="例如 shell-main" />
+              <Label>{ui("screen.7d71d1644ea7d0")}</Label>
+              <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="shell-main" />
             </div>
             <div className="grid gap-1">
-              <Label>端口（1024-65535）</Label>
+              <Label>{ui("screen.910bf737a892f3")}</Label>
               <Input value={port} onChange={(e) => setPort(e.target.value)} placeholder="4444" inputMode="numeric" />
             </div>
             <Button onClick={() => void startListener()} disabled={starting}>
-              <PlayIcon /> {starting ? "启动中…" : "启动监听"}
+              <PlayIcon /> {starting ? ui("screen.fc89857ef91751") : ui("screen.49b50f08b0ea5a")}
             </Button>
           </div>
 
           {listeners.length === 0 && (
             <p className="text-muted-foreground text-sm">
-              暂无运行中的监听器。agent 在任务里调 <code>listener_start</code> 也会走到这里（启停需人工审批）。
+              {ui("screen.ea43637993a375")} <code>listener_start</code> {ui("screen.f6576daf9c78f5")}
             </p>
           )}
 
@@ -277,9 +287,9 @@ export default function C2Page() {
               <div className="flex flex-wrap items-center gap-2 p-3">
                 <Badge variant="secondary">{l.name}</Badge>
                 <span className="font-mono text-sm">:{l.port}</span>
-                <span className="text-muted-foreground text-sm">起于 {fmtTime(l.started_at)}</span>
+                <span className="text-muted-foreground text-sm">{ui("screen.3c386034377baf", { v0: fmtTime(l.started_at) })}</span>
                 <Badge variant={l.sessions.some((s) => s.open) ? "default" : "outline"}>
-                  {l.sessions.length} 会话
+                  {ui("screen.4e5cc0414b0115", { v0: l.sessions.length })}
                 </Badge>
                 <div className="grow" />
                 <Button
@@ -287,16 +297,16 @@ export default function C2Page() {
                   variant="ghost"
                   onClick={() => setExpanded(expanded === l.name ? null : l.name)}
                 >
-                  {expanded === l.name ? "收起会话" : "查看会话"}
+                  {expanded === l.name ? ui("screen.3992c4aada6279") : ui("screen.f2b4237b35f0b3")}
                 </Button>
                 <Button size="sm" variant="outline" className="text-destructive" onClick={() => setPendingStop(l)}>
-                  <SquareIcon /> 停止
+                  <SquareIcon /> {ui("screen.ca4d973c0b006b")}
                 </Button>
               </div>
               {expanded === l.name && (
                 <div className="border-t">
                   {l.sessions.length === 0 ? (
-                    <p className="text-muted-foreground p-3 text-sm">尚无回连会话。</p>
+                    <p className="text-muted-foreground p-3 text-sm">{ui("screen.017b362c1f15a6")}</p>
                   ) : (
                     l.sessions.map((s) => <SessionRow key={s.id} s={s} />)
                   )}
@@ -311,19 +321,21 @@ export default function C2Page() {
       <AlertDialog open={!!pendingStop} onOpenChange={(o) => { if (!o) setPendingStop(null); }}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>停止监听器「{pendingStop?.name}」？</AlertDialogTitle>
+            <AlertDialogTitle>{ui("screen.01f3498f35cefb", { v0: pendingStop?.name ?? "" })}</AlertDialogTitle>
             <AlertDialogDescription>
-              端口立即关闭，{pendingStop?.sessions.length ?? 0} 条会话随停止留档（数据保留，可在停止响应中导出）。
-              SSH 中继模式下托管隧道将一并拆除。
+              {ui("screen.79828ef5309b07")}
+              {pendingStop?.sessions.length ?? 0}
+              {ui("screen.2bcd7da1b57cfb")}
+              {ui("screen.230b67d01d4100")}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={stopping}>取消</AlertDialogCancel>
+            <AlertDialogCancel disabled={stopping}>{ui("screen.2cd0f3be8738a8")}</AlertDialogCancel>
             <AlertDialogAction
               disabled={stopping}
               onClick={(e) => { e.preventDefault(); if (pendingStop) void stopListener(pendingStop); }}
             >
-              {stopping ? "停止中…" : "停止"}
+              {stopping ? ui("screen.02099d7931da52") : ui("screen.ca4d973c0b006b")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -333,6 +345,7 @@ export default function C2Page() {
 }
 
 function SessionRow({ s }: { s: ListenerSession }) {
+  const { ui } = useUITranslation();
   const [openView, setOpenView] = React.useState(false);
   return (
     <div className="border-b px-3 py-2 last:border-b-0">
@@ -340,15 +353,15 @@ function SessionRow({ s }: { s: ListenerSession }) {
         className="flex w-full flex-wrap items-center gap-2 text-left text-sm"
         onClick={() => setOpenView(!openView)}
       >
-        <Badge variant={s.open ? "default" : "secondary"}>{s.open ? "在线" : "已断开"}</Badge>
+        <Badge variant={s.open ? "default" : "secondary"}>{s.open ? ui("screen.b9086662b1df1f") : ui("screen.1f0ac6953e0411")}</Badge>
         <span className="font-mono">{s.remote}</span>
-        <span className="text-muted-foreground">接入 {fmtTime(s.connected_at)}</span>
+        <span className="text-muted-foreground">{ui("screen.6bc3cbfb542cec", { v0: fmtTime(s.connected_at) })}</span>
         <span className="text-muted-foreground">{fmtBytes(Number(s.bytes_in))}</span>
-        <span className="text-muted-foreground grow text-right text-xs">{openView ? "收起" : "查看捕获内容"}</span>
+        <span className="text-muted-foreground grow text-right text-xs">{openView ? ui("screen.afd4b783536b82") : ui("screen.9001d54474d625")}</span>
       </button>
       {openView && (
         <pre className="bg-muted mt-2 max-h-64 overflow-auto rounded p-2 text-xs whitespace-pre-wrap">
-          {s.preview || "（无捕获内容）"}
+          {s.preview || ui("screen.ee039d2f4c85e1")}
         </pre>
       )}
     </div>

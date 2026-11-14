@@ -2,13 +2,18 @@
 
 import * as React from "react";
 
+import { createAppI18n } from "@/i18n/instance";
+
 // 根错误边界：layout / 全局 provider 这一层抛出时，app/error.tsx 兜不住，
 // 必须由 global-error.tsx 接住（它要自带 <html>/<body>）。
 // 这里刻意只用内联样式：走到这一步时样式系统本身可能就是坏的。
+// i18n 用模块级实例直接 t()：global-error 不经过 layout 的 I18nextProvider。
 type ErrorProps = {
   error: Error & { digest?: string };
   reset: () => void;
 };
+
+const i18n = createAppI18n();
 
 export default function GlobalError({ error, reset }: ErrorProps) {
   React.useEffect(() => {
@@ -32,9 +37,9 @@ export default function GlobalError({ error, reset }: ErrorProps) {
         }}
       >
         <div style={{ maxWidth: 720, width: "100%" }}>
-          <h1 style={{ fontSize: 18, margin: "0 0 8px" }}>应用启动失败</h1>
+          <h1 style={{ fontSize: 18, margin: "0 0 8px" }}>{i18n.t("screen.d1d97dda582a86")}</h1>
           <p style={{ fontSize: 13, color: "#a3a3a3", margin: "0 0 16px" }}>
-            页面在初始化时抛了异常。以下信息可用于定位（可直接截图反馈）。
+            {i18n.t("screen.d1d93640143e7a")}
           </p>
           <pre
             style={{
@@ -65,7 +70,7 @@ export default function GlobalError({ error, reset }: ErrorProps) {
               cursor: "pointer",
             }}
           >
-            重试
+            {i18n.t("screen.b8784c8dd5636f")}
           </button>
         </div>
       </body>

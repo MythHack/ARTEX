@@ -21,6 +21,7 @@ export function parseWorkerCountInput(value: string): number | null {
 }
 
 export interface Task {
+  numeric_id?: number; // Underlying numeric identity when demo route IDs use aliases.
   distinct_findings?: FindingDistinctStats;
   id: string;
   remark?: string;
@@ -579,7 +580,7 @@ export interface FindingDeepenResponse {
   queued: boolean;
 }
 
-// FindingStats 是发现全表聚合(统计卡 + 漏洞类型下拉),服务端计算,不受分页影响。
+// FindingStats 的计数跟随列表筛选，不受分页影响；类型和任务选项保留全局范围。
 export interface FindingStats {
   distinct?: FindingDistinctStats;
   total: number;
@@ -1071,7 +1072,12 @@ export interface ProxyPoolEntry {
   health: "healthy" | "unhealthy-cooling" | "disabled" | string;
 }
 
-export interface ProxySwitchLog { at: string; from: string; to: string; reason: string }
+export interface ProxySwitchLog {
+  at: string;
+  from: string;
+  to: string;
+  reason: string;
+}
 
 export interface WorkerPool {
   profile_id: string;
@@ -1978,6 +1984,7 @@ export interface EgressCheck {
   path?: string;
   skipped?: boolean;
   skip_reason?: string;
+  skip_code?: string;
   result: EgressProbeResult;
 }
 
@@ -1989,6 +1996,7 @@ export interface EgressReport {
   agent_proxy: string;
   checks: EgressCheck[];
   warnings?: string[];
+  warning_details?: { code: string; params?: Record<string, unknown>; message: string }[];
 }
 // ── 宿主环境:工具体检 + 一键安装 ──────────────────────────────
 

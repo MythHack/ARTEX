@@ -1,11 +1,9 @@
+"use client";
+
+import { useTranslation } from "react-i18next";
+
+import { type StatusDomain, statusMeta, type Tone, toneClasses, toneDot } from "@/lib/status";
 import { cn } from "@/lib/utils";
-import {
-  statusMeta,
-  toneClasses,
-  toneDot,
-  type StatusDomain,
-  type Tone,
-} from "@/lib/status";
 
 export function StatusBadge({
   domain,
@@ -21,7 +19,8 @@ export function StatusBadge({
   /** 悬停提示。用于把「为什么是这个状态」摆在状态徽章上（如意图的中断原因）。 */
   title?: string;
 }) {
-  const meta = statusMeta(domain, value);
+  const { t } = useTranslation();
+  const meta = statusMeta(domain, value, t);
   return (
     <span
       title={title}
@@ -31,9 +30,7 @@ export function StatusBadge({
         className,
       )}
     >
-      {dot && (
-        <span className={cn("size-1.5 rounded-full", toneDot[meta.tone])} />
-      )}
+      {dot && <span className={cn("size-1.5 rounded-full", toneDot[meta.tone])} />}
       {meta.label}
     </span>
   );

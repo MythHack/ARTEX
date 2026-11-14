@@ -7,6 +7,7 @@ import Link from "next/link";
 import { CircleAlertIcon, RotateCcwIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { useUITranslation } from "@/i18n/use-ui-translation";
 
 // 路由级错误边界。
 //
@@ -33,6 +34,7 @@ function detailOf(error: Error & { digest?: string }): string {
 }
 
 export default function AppError({ error, reset }: ErrorProps) {
+  const { ui } = useUITranslation();
   React.useEffect(() => {
     // 同时打到 console，方便手机连着调试或用户反馈时附带。
     console.error("[artex] 页面渲染出错:", error);
@@ -42,17 +44,15 @@ export default function AppError({ error, reset }: ErrorProps) {
     <div className="flex flex-1 flex-col items-center justify-center gap-4 p-6 text-center">
       <CircleAlertIcon className="size-8 text-destructive" />
       <div className="grid gap-1">
-        <h1 className="font-semibold text-lg">这个页面出错了</h1>
-        <p className="max-w-md text-muted-foreground text-sm">
-          页面在渲染时抛了异常。下面的信息可以帮助定位原因（可直接截图反馈）。
-        </p>
+        <h1 className="font-semibold text-lg">{ui("screen.4a33c6e01c9616")}</h1>
+        <p className="max-w-md text-muted-foreground text-sm">{ui("screen.ec8c22ba65daec")}</p>
       </div>
       <pre className="max-h-64 w-full max-w-2xl overflow-auto whitespace-pre-wrap break-all rounded-md border bg-muted/40 p-3 text-start font-mono text-xs">
         {detailOf(error)}
       </pre>
       <div className="flex flex-wrap items-center justify-center gap-2">
         <Button size="sm" onClick={() => reset()}>
-          <RotateCcwIcon data-icon="inline-start" /> 重试
+          <RotateCcwIcon data-icon="inline-start" /> {ui("screen.b8784c8dd5636f")}
         </Button>
         <Button
           size="sm"
@@ -62,10 +62,10 @@ export default function AppError({ error, reset }: ErrorProps) {
             window.location.href = "/";
           }}
         >
-          返回首页
+          {ui("screen.d66f4359dae371")}
         </Button>
         <Button asChild size="sm" variant="ghost">
-          <Link href="/function/tasks">任务列表</Link>
+          <Link href="/function/tasks">{ui("screen.c5ced4b36c072f")}</Link>
         </Button>
       </div>
     </div>
