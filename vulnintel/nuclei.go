@@ -123,7 +123,8 @@ func hasAnyYAMLTemplate(dir string) bool {
 		return nil
 	})
 	return found
-=======
+}
+
 // CountTemplates 递归统计目录下的 .yaml 模板文件数（.yaml，不含 .yml——
 // nuclei-templates 仓库全部用 .yaml）。
 func CountTemplates(dir string) int {
@@ -138,7 +139,6 @@ func CountTemplates(dir string) int {
 		return nil
 	})
 	return n
->>>>>>> theirs
 }
 
 // NucleiInstalled reports whether the nuclei binary is on PATH.

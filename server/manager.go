@@ -16,16 +16,6 @@ import (
 	"sync/atomic"
 	"time"
 
-<<<<<<< ours
-	"github.com/Autumn-27/artex/agent"
-	pgdb "github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/enrich"
-	"github.com/Autumn-27/artex/guard"
-	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/artex/traffic"
-	"github.com/Autumn-27/artex/vulnintel"
-=======
->>>>>>> theirs
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/artex/agent"
 	pgdb "github.com/Autumn-27/artex/db"
@@ -1124,13 +1114,10 @@ func (m *Manager) deepSeekSearchKey() string {
 	return strings.TrimSpace(key)
 }
 
-<<<<<<< ours
 func (m *Manager) setDeepSeekSearchKey(key string) error {
 	return m.pg.SetSetting(settingDeepSeekSearchKey, strings.TrimSpace(key))
 }
 
-=======
->>>>>>> theirs
 // WebSearchEnabled reports whether web search is enabled.
 func (m *Manager) WebSearchEnabled() bool {
 	m.mu.RLock()

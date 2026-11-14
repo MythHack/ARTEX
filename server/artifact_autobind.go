@@ -17,11 +17,7 @@ import (
 	"sort"
 	"strings"
 
-<<<<<<< ours
 	"github.com/Autumn-27/artex/db"
-=======
-	"github.com/Autumn-27/artex/db"
->>>>>>> theirs
 )
 
 var hostInTextRe = regexp.MustCompile(`(?i)(?:https?://)?([a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+)(?::\d+)?`)

@@ -10,13 +10,8 @@ import (
 	"strings"
 	"time"
 
-<<<<<<< ours
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
-=======
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
->>>>>>> theirs
 )
 
 type goalSpec struct {
@@ -275,17 +270,6 @@ func (s *Server) admitTaskWhenScheduledWithGenerationChecked(t *Task, mode strin
 		}
 		return false, err
 	}
-<<<<<<< ours
-	if lifecycle.Status == "timeout" && status == "running" {
-		// ApplyTaskAdmission reset this timed-out run's persisted clock. Clear the
-		// matching Engine gates before either parking it in FIFO or starting work;
-		// otherwise the old settling flag would make every worker skip forever.
-		s.engine.resetTimeoutRevival(t.ID)
-	} else if wasTerminal {
-		// A final settle round may finish as done. Revival must release its
-		// worker/planner barrier too, while preserving its deadline/checkpoint.
-		s.engine.settling.Delete(t.ID)
-=======
 	if wasTerminal && status == "running" {
 		// 终态复活（timeout/done/failed）统一清 Engine 侧的 per-run 闸门：
 		// ApplyTaskAdmission 已把 first_run_at/deadline_at 清零（旧一轮预算已耗尽，
@@ -309,7 +293,6 @@ func (s *Server) admitTaskWhenScheduledWithGenerationChecked(t *Task, mode strin
 			}
 		}
 		log.Printf("[admission] task %s 从终态 %q 复活，超时预算已重置", t.ID, lifecycle.Status)
->>>>>>> theirs
 	}
 	if shouldQueue {
 		if !wasQueued {

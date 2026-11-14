@@ -463,13 +463,8 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		writeProductError(w, 400, "invalid_request", "请求格式错误", nil)
 		return
 	}
-<<<<<<< ours
 	if req.Username != "ARTEX" {
 		writeProductError(w, 401, "invalid_credentials", "用户名或密码错误", nil)
-=======
-	if req.Username != "POJUN" && req.Username != "ARTEX" { // v0.4.19 改名：兼容旧用户名
-		writeErr(w, 401, "用户名或密码错误")
->>>>>>> theirs
 		return
 	}
 	hash, ok, err := pg.GetSetting(authPassKey)

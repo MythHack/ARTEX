@@ -4,12 +4,6 @@ import (
 	"context"
 	"fmt"
 
-<<<<<<< ours
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/hosttools"
-	"github.com/Autumn-27/artex/intercept"
-=======
->>>>>>> theirs
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
@@ -26,24 +20,6 @@ import (
 // autonomous intent-generation loop (that is the planner's job).
 type MainAgent struct {
 	findingRecorder FindingRecorder
-<<<<<<< ours
-	prov            llm.Provider
-	model           string
-	tx              *transcript.Store // raw LLM conversation persistence (nil = off)
-	window          int               // context window in tokens (for compaction)
-	windowFn        func() int        // optional dynamic task-chain minimum
-	maxTurns        int               // max agent turns per run (0 = unlimited)
-	proxyAddr       string            // recording proxy for WebFetch (empty = direct)
-	proxyAddrFn     func() string
-	proxyCACert     string                                 // recording proxy's CA cert path (HTTPS verify)
-	webSearch       WebSearchOpts                          // web_search tool backend selection (off by default)
-	workDir         string                                 // shared work dir (surfaced in prompt as artifact-output target)
-	steerWork       func(intentID int64, msg string) error // engine callback: steer a running work (nil = off)
-	attributions    func() map[string]int                  // Guard 归因读取（nil = 概览不带 guard_attributions 块）
-	nonStreamingFn  func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
-	noaEnabledFn    func() bool                            // resolver: use experimental noa compaction? (nil = off)
-	maxTokensFn     func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
-=======
 	// 授权边界守卫开关（v0.4.63）：装配时从设置读取，传到 ToolSet。
 	scopeGuard           bool
 	scopeInheritWrites   bool
@@ -55,6 +31,7 @@ type MainAgent struct {
 	windowFn             func() int                             // optional dynamic task-chain minimum
 	maxTurns             int                                    // max agent turns per run (0 = unlimited)
 	proxyAddr            string                                 // recording proxy for WebFetch (empty = direct)
+	proxyAddrFn          func() string                          // fork: 动态代理地址（轮询时重读设置）
 	proxyCACert          string                                 // recording proxy's CA cert path (HTTPS verify)
 	webSearch            WebSearchOpts                          // web_search tool backend selection (off by default)
 	workDir              string                                 // shared work dir (surfaced in prompt as artifact-output target)
@@ -63,7 +40,6 @@ type MainAgent struct {
 	nonStreamingFn       func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
 	noaEnabledFn         func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn          func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
->>>>>>> theirs
 }
 
 // SetNoaEnabled wires a resolver deciding whether runs use the experimental noa
