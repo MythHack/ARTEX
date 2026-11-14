@@ -1,27 +1,44 @@
+# Windows（Docker Desktop）用户请加 -f docker-compose.windows.yml 启动：
+#   docker compose -f docker-compose.yml -f docker-compose.windows.yml up -d
+# 它把 data/ 换成 named volume（NTFS bind mount 的小文件 I/O 实测慢约
+# 两个数量级，流量/证据写入会明显变卡），并放开回连端口映射。
+# 详见 docker-compose.windows.yml 头注释与 docs/部署手册.md 的 Windows 章节。
+
 services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-artex}
+      POSTGRES_USER: ${POSTGRES_USER:-pojun}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 设置 POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB:-artex}
+      POSTGRES_DB: ${POSTGRES_DB:-pojun}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-artex} -d ${POSTGRES_DB:-artex}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pojun} -d ${POSTGRES_DB:-pojun}"]
       interval: 5s
       timeout: 3s
       retries: 10
     restart: unless-stopped
 
+<<<<<<< ours
   artex:
     image: ${ARTEX_IMAGE:-ruoji6/artex}:${ARTEX_TAG:-latest}
+=======
+  pojun:
+    # 镜像在 GHCR 与 Docker Hub 双源发布；默认走 GHCR（发布工作流必然推送），
+    # 需要换源时用 ARTEX_IMAGE 覆盖。
+    image: ${ARTEX_IMAGE:-ghcr.io/chu0119/pojun}:${ARTEX_TAG:-latest}
+>>>>>>> theirs
     depends_on:
       postgres:
         condition: service_healthy
     environment:
+<<<<<<< ours
       TZ: Asia/Shanghai
       ARTEX_PG_DSN: postgres://${POSTGRES_USER:-artex}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-artex}?sslmode=disable
+=======
+      ARTEX_PG_DSN: postgres://${POSTGRES_USER:-pojun}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pojun}?sslmode=disable
+>>>>>>> theirs
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ARTEX_LLM_PROVIDER: ${ARTEX_LLM_PROVIDER:-}

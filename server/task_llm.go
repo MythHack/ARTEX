@@ -12,11 +12,17 @@ import (
 	"strings"
 	"time"
 
+<<<<<<< ours
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/llmrec"
+=======
+>>>>>>> theirs
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/llmrec"
 )
 
 type taskAgentBundle struct {
@@ -49,10 +55,20 @@ type llmActivityMetadata struct {
 }
 
 type taskLLMRuntime struct {
+<<<<<<< ours
 	s            *Server
 	taskID       string
 	agentKey     string
 	pinProfileID *int64
+=======
+	s        *Server
+	taskID   string
+	agentKey string
+	// pin > 0 时本 runtime 永远跑在该 profile 上（B10：压缩器等固定用途的场景），
+	// 覆盖 agent 绑定和任务链；profile 失效（被删/无 key）时落回原链继续跑。
+	// 不推进任务链的故障转移状态（绑定语义），也不参与链轮转。
+	pin int64
+>>>>>>> theirs
 }
 
 type taskLLMError struct {
@@ -112,6 +128,7 @@ type taskLLMStreamHooks struct {
 	withoutThinking func() (llm.Provider, error)
 }
 
+<<<<<<< ours
 // current resolves the provider this role runs on. Pinned workers use only their
 // assigned profile; legacy task agents use Agent 绑定 → 任务 LLM 配置链 → 全局/环境配置.
 // 绑定优先于任务链：某个角色被显式指定了模型，就一直跑在那个模型上；绑定不存在或
@@ -129,6 +146,21 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 		}
 		t, _ := r.s.m.Task(r.taskID)
 		return taskLLMSelection{task: t, provider: prov, retry: cfg.Retry}, nil
+=======
+// current resolves the provider this role runs on, by precedence:
+// pinned profile (B10) → Agent 绑定 → 任务 LLM 配置链 → 全局/环境配置。
+// pin 与绑定同语义：额度错误不推进任务链。绑定优先于任务链：某个角色被显式指定了模型，
+// 就一直跑在那个模型上；绑定不存在或构建失败时才降级到任务链，任务链为空时再降级到全局配置。
+// 返回的 profile id 只有走任务链时才非零 —— streamTaskLLM 以此判断额度错误是否
+// 应该推进任务的故障转移状态（绑定/全局路径不改任务链状态，沿用既有语义）。
+func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
+	// pin 方（B10 压缩器等固定用途）：指定 profile 有效就直接返回，省掉任务状态
+	// 的 DB 读。profile 失效（被删/无 key）→ 落回下面的原链继续跑，不硬失败。
+	if r.pin > 0 {
+		if prov, cfg, ok := r.s.providerForProfile(r.pin); ok {
+			return taskLLMSelection{provider: prov, retry: cfg.Retry}, nil
+		}
+>>>>>>> theirs
 	}
 	taskNum, err := parseTaskID(r.taskID)
 	if err != nil {
@@ -169,14 +201,22 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 }
 
 // activeCfg resolves the task's currently-active LLM config, mirroring current()'s
-// source precedence (agent binding → active chain profile → global). Read-only and
+// source precedence (pin → agent binding → active chain profile → global). Read-only and
 // best-effort: ok=false when nothing resolves, leaving the per-setting fallback to
 // the caller. If failover switches profiles, the change takes effect on the next
 // agent run (a fresh Session is built per run in captureRun).
 func (r *taskLLMRuntime) activeCfg() (agent.Config, bool) {
+<<<<<<< ours
 	if r.pinProfileID != nil {
 		_, cfg, ok := r.s.providerForProfile(*r.pinProfileID)
 		return cfg, ok
+=======
+	// pin 方（B10）：与 current() 的 pin 分支一致，优先取钉住的配置。
+	if r.pin > 0 {
+		if _, cfg, ok := r.s.providerForProfile(r.pin); ok {
+			return cfg, true
+		}
+>>>>>>> theirs
 	}
 	taskNum, err := parseTaskID(r.taskID)
 	if err != nil {
@@ -441,7 +481,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 				// thinking.type=disabled）→ 换一个不发 thinking 的 provider 重试一次。
 				//
 				// 为什么在这里兜底而不是让每个调用方自己小心：这个 400 在
-				// ARTEX 里已经踩了三次（裁决/压缩/旁路摘要），每次都是某个
+				// POJUN 里已经踩了三次（裁决/压缩/旁路摘要），每次都是某个
 				// 新的调用方硬编码了 thinking。放在统一入口，一处修好全局生效。
 				//
 				// 降级必须【换 provider】而不是改请求：thinking 参数在 provider
@@ -704,8 +744,19 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	mainRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "mainagent"}
 	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
 	window := workerRuntime.CompactionWindow()
+	// 授权边界守卫开关（v0.4.63）：每个 agent bundle 装配时读一次设置。
+	var scopeGuard, scopeInherit, notifyDedup bool
+	if s.m.PG() != nil {
+		scopeGuard = s.m.PG().GetBool("scope_write_guard", true)
+		scopeInherit = s.m.PG().GetBool("scope_inherit_writes", false)
+		notifyDedup = s.m.PG().GetBool("notify_cross_task_dedup", true)
+	} else {
+		scopeGuard, notifyDedup = true, true
+	}
 	wk := agent.NewWorker(workerRuntime, "task-router", s.m.dir, tx, window, s.agentMaxTurns("worker"))
+	wk.SetScopeFlags(scopeGuard, scopeInherit, notifyDedup)
 	wk.SetFindingRecorder(s.evidenceStore())
+	wk.SetArtifactRecorder(s) // v0.5.0 证据附件：save_evidence 落盘登记
 	wk.SetCompactionWindowResolver(workerRuntime.CompactionWindow)
 	wk.SetNonStreaming(workerRuntime.nonStreaming) // 按任务当前激活 profile 的流式开关(每轮读)
 	wk.SetMaxTokens(workerRuntime.maxTokens)       // 同上,输出上限也跟随当前激活 profile
@@ -715,7 +766,19 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetProxyProvider(s.m.ProxyAddr)
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
+	// 任务级登录凭据（v0.4.8）：装配时读一次并注入 worker system prompt。
+	// 认证配置当前只在创建任务时录入；若以后加编辑接口，需要在保存后 invalidate
+	// 本任务的 agent bundle 让下一轮重新装配。
+	if s.m.PG() != nil {
+		if id64, err := strconv.ParseInt(t.ID, 10, 64); err == nil {
+			if pgTask, err2 := s.m.PG().GetTask(id64); err2 == nil && pgTask != nil && pgTask.AuthConfig != nil && pgTask.AuthConfig.Enabled {
+				wk.SetTaskAuthBlock(pgTask.AuthConfig.PromptBlock())
+			}
+		}
+	}
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
+	pl.SetScopeFlags(scopeGuard, scopeInherit, notifyDedup)
+	pl.SetIntentQueueLimit(s.intentQueueBudget) // 派发节流（v0.4.68）：本轮新增上限
 	pl.SetFindingRecorder(s.evidenceStore())
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)
 	pl.SetNonStreaming(plannerRuntime.nonStreaming)
@@ -723,17 +786,35 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	pl.SetKillWork(s.engine.KillWork)
 	pl.SetSteerWork(s.engine.SteerWork)
-	// Guard 归因 → graph_overview 的 guard_attributions 块（planner 看到 blocked/error
-	// 计数后可换打法，v0.3.88 体检 N5）。t.Guard 在 manager.go 建任务时必然创建。
-	pl.SetAttributions(t.Guard.Attributions)
+	// Guard 归因 → graph_overview 的 guard_attributions 块（计数 + B6 最近样本，
+	// planner 看到 blocked/error 计数与被拦命令后可换打法，v0.3.88 体检 N5）。
+	// t.Guard 在 manager.go 建任务时必然创建。
+	pl.SetAttributions(t.Guard.AttributionStats)
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	pl.SetProxyProvider(s.m.ProxyAddr)
 	pl.SetWebSearch(s.webSearchFor("planner"))
 	pl.SetConstraintInject(s.constraintInjectPlanner) // 操作约束注入 planner(可配置,默认开)
 	// cold-digest §7: 冷节点后台压缩。引擎经权威解析器实际驱动的就是这套 per-task planner
+<<<<<<< ours
 	// (agentsForTask),Compactor 必须接在这里。走任务路由的 planner provider(§4:与 agent
 	compactor := agent.NewCompactor(plannerRuntime, "task-router")
 	compactor.SetBodyBudget(s.m.CompactionMaxTokens, s.m.CompactionThinking)
+=======
+	// (agentsForTask),Compactor 必须接在这里。压缩用 Complete 一次性生成 body。
+	// B10:压缩器默认与 planner 共用 runtime(同任务链,历史行为);设置了
+	// compactor_profile_id 时给压缩器一个钉住该 profile 的独立 runtime——机械压缩
+	// 一次一发,体感上适合低价高速模型,不必跟着 planner 的长会话模型烧额度。
+	// pin 失效时 runtime 内部落回原链,不会有硬失败。设置在更新后只对新任务的
+	// bundle 生效(putSettings 里 invalidateTaskAgents 让运行中任务的下一轮也拿到)。
+	compactorRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "planner", pin: s.m.CompactorProfileID()}
+	if compactorRuntime.pin > 0 {
+		log.Printf("[compactor] task %s: 压缩器钉在 profile #%d", t.ID, compactorRuntime.pin)
+	}
+	compactor := agent.NewCompactor(compactorRuntime, "task-router")
+	// 压缩的输出预算与墙钟上限从设置读(0=用包内默认)。这两个值必须给足:
+	// 思考型模型的思考长度随 max_tokens 预算线性膨胀,预算给小了模型会一直想、
+	// 正文一个字都吐不出来(实测 1500/2048/4096/8192 全部正文为空)。
+>>>>>>> theirs
 	compactor.SetOutputTokens(s.m.CompactionTokens())
 	if secs := s.m.CompactionTimeout(); secs > 0 {
 		compactor.SetMaxDuration(time.Duration(secs) * time.Second)
@@ -741,6 +822,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	compactor.SetMaxBlockMembers(s.m.CompactionMaxMembers())
 	pl.SetCompactor(compactor)
 	main := agent.NewMainAgent(mainRuntime, "task-router", s.m.dir, tx, mainRuntime.CompactionWindow(), s.agentMaxTurns("mainagent"))
+	main.SetScopeFlags(scopeGuard, scopeInherit, notifyDedup)
 	main.SetFindingRecorder(s.evidenceStore())
 	main.SetCompactionWindowResolver(mainRuntime.CompactionWindow)
 	main.SetNonStreaming(mainRuntime.nonStreaming)
@@ -749,8 +831,8 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	main.SetProxyProvider(s.m.ProxyAddr)
 	main.SetWebSearch(s.webSearchFor("mainagent"))
-	main.SetSteerWork(s.engine.SteerWork) // steer_work：人对运行中 work 实时纠偏
-	main.SetAttributions(t.Guard.Attributions) // Guard 归因 → 概览（人在环路同享打回计数）
+	main.SetSteerWork(s.engine.SteerWork)          // steer_work：人对运行中 work 实时纠偏
+	main.SetAttributions(t.Guard.AttributionStats) // Guard 归因样本（B6）→ 概览（人在环路同享打回计数与实物）
 	bundle := &taskAgentBundle{
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
 		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main, pinnedWorkers: map[int64]*agent.Worker{},

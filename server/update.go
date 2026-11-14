@@ -57,11 +57,10 @@ func bootUpdateState() selfupdate.State {
 // 每 IP 每小时 60 次——不缓存的话，多开几个标签页或刷几次页面就把配额耗光了，
 // 之后真想更新时反而查不动。用户显式点"检查更新"时可以 force 绕过缓存。
 type releaseCache struct {
-	mu      sync.Mutex
-	rel     *selfupdate.Release
-	err     error
-	at      time.Time
-	network string
+	mu  sync.Mutex
+	rel *selfupdate.Release
+	err error
+	at  time.Time
 	// fetch 是取数函数，仅为测试留的注入点；为 nil 时走真正的 GitHub 查询。
 	fetch func(context.Context, *http.Client) (*selfupdate.Release, error)
 }
@@ -81,11 +80,11 @@ var relCache = &releaseCache{}
 //
 // 取数期间一直持有锁：并发请求会排队等同一次查询的结果，而不是各自去打 GitHub
 // （页面刚加载时多个标签页同时来查，正是最容易触发限流的时刻）。
-func (c *releaseCache) get(ctx context.Context, client *http.Client, force bool, network string) (*selfupdate.Release, error) {
+func (c *releaseCache) get(ctx context.Context, client *http.Client, force bool) (*selfupdate.Release, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if !force && c.network == network {
+	if !force {
 		ttl := releaseTTL
 		if c.err != nil {
 			ttl = releaseErrTTL
@@ -107,7 +106,7 @@ func (c *releaseCache) get(ctx context.Context, client *http.Client, force bool,
 	if err != nil && ctx.Err() != nil && errors.Is(ctx.Err(), context.Canceled) {
 		return c.rel, err
 	}
-	c.rel, c.err, c.at, c.network = rel, err, time.Now(), network
+	c.rel, c.err, c.at = rel, err, time.Now()
 	return rel, err
 }
 
@@ -123,7 +122,7 @@ type updateProgress struct {
 // updateHub 持有一次升级的进度并广播给 SSE 订阅者。
 //
 // running 同时充当互斥：升级期间再次 POST /api/update/apply 直接 409，
-// 避免两个 goroutine 同时往同一个 artex.new 写。
+// 避免两个 goroutine 同时往同一个 pojun.new 写。
 type updateHub struct {
 	mu      sync.Mutex
 	running bool
@@ -228,13 +227,8 @@ func (s *Server) updateCheck(w http.ResponseWriter, r *http.Request) {
 
 	// 顶栏提示走缓存（默认）；用户点"检查更新"时带 force=1 强制回源。
 	force := r.URL.Query().Get("force") != ""
-	client, network, err := s.updateClient()
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	defer client.CloseIdleConnections()
-	rel, err := relCache.get(r.Context(), client, force, network)
+	client := selfupdate.NewClient(s.maintenanceProxy())
+	rel, err := relCache.get(r.Context(), client, force)
 	if err != nil {
 		out["error"] = err.Error()
 		writeJSON(w, 200, out)
@@ -277,13 +271,8 @@ func (s *Server) updateApply(w http.ResponseWriter, r *http.Request) {
 	current := BuildVersion
 
 	// 走缓存：确保装上的就是用户在界面上看到并确认的那个版本。
-	client, network, err := s.updateClient()
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	defer client.CloseIdleConnections()
-	rel, err := relCache.get(r.Context(), client, false, network)
+	client := selfupdate.NewClient(s.maintenanceProxy())
+	rel, err := relCache.get(r.Context(), client, false)
 	if err != nil {
 		writeErr(w, 502, err.Error())
 		return
@@ -305,7 +294,6 @@ func (s *Server) updateApply(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		// 刻意用 s.ctx 而不是请求的 ctx：HTTP 响应一返回请求就结束了，
 		// 挂在它上面下载会立刻被取消。
-		defer client.CloseIdleConnections()
 		err := selfupdate.Stage(s.ctx, client, rel, current, func(ph selfupdate.Phase, pct int, msg string) {
 			updHub.publish(ph, pct, msg)
 		})
@@ -323,7 +311,7 @@ func (s *Server) updateApply(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 202, map[string]any{"ok": true, "target": rel.TagName})
 }
 
-// updateRollback 主动退回上一版本（换装前备份的 artex.old）。
+// updateRollback 主动退回上一版本（换装前备份的 pojun.old）。
 func (s *Server) updateRollback(w http.ResponseWriter, r *http.Request) {
 	if _, running := updHub.snapshot(); running {
 		writeErr(w, 409, "更新正在进行中，无法回滚")

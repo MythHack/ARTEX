@@ -26,10 +26,13 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/hosttools"
-	"github.com/Autumn-27/artex/proxyprobe"
-)
+	"github.com/Autumn-27/artex/proxyprobe")
 
 // State 任务状态。
+// scriptInstallTimeout 是 script 类安装的墙钟上限。给足慢网络的空间（下载 +
+// 解压 + 编译），但绝不允许无限挂起：超时后记失败，队列继续推进下一项。
+const scriptInstallTimeout = "900"
+
 type State string
 
 const (
@@ -47,15 +50,15 @@ const (
 
 // Job 一次安装任务。
 type Job struct {
-	ID       string    `json:"id"`
-	ToolID   string    `json:"tool_id"`
-	ToolName string    `json:"tool_name"`
-	State    State     `json:"state"`
-	ExitCode int       `json:"exit_code"`
-	Err      string    `json:"error,omitempty"`
-	StartedAt  time.Time `json:"started_at"`
-	EndedAt    time.Time `json:"ended_at,omitempty"`
-	Log      string    `json:"log"`
+	ID        string    `json:"id"`
+	ToolID    string    `json:"tool_id"`
+	ToolName  string    `json:"tool_name"`
+	State     State     `json:"state"`
+	ExitCode  int       `json:"exit_code"`
+	Err       string    `json:"error,omitempty"`
+	StartedAt time.Time `json:"started_at"`
+	EndedAt   time.Time `json:"ended_at,omitempty"`
+	Log       string    `json:"log"`
 
 	mu     sync.Mutex
 	buf    bytes.Buffer
@@ -241,6 +244,16 @@ func (s *Server) run(ctx context.Context, j *Job, tool hosttools.Tool, proxy str
 		return s.runGitHub(ctx, j, tool, proxy)
 	case hosttools.KindPip:
 		return s.runPip(ctx, j, tool, proxy)
+	case hosttools.KindScript:
+		// 所有 script 类安装统一套 wall-clock 超时：catalog 的脚本里包含 GitHub/
+		// 镜像下载，网络窗口差时 curl 没有内建超时会无限等待，把串行安装队列卡死
+		// （实测 jadx 的 release 下载阻塞 install-all 15 分钟以上）。
+		// timeout 命令来自 coreutils，Debian/Kali 默认自带；不存在时退回无超时。
+		limit := scriptInstallTimeout
+		if _, err := exec.LookPath("timeout"); err == nil {
+			return s.execLogged(ctx, j, "timeout", []string{limit, "/bin/sh", "-c", tool.Script}, proxyEnv(proxy))
+		}
+		return s.execLogged(ctx, j, "/bin/sh", []string{"-c", tool.Script}, proxyEnv(proxy))
 	}
 	return 1, fmt.Errorf("不支持的安装方式: %s", tool.Kind)
 }
@@ -290,7 +303,61 @@ func (s *Server) runApt(ctx context.Context, j *Job, tool hosttools.Tool, proxy 
 
 func (s *Server) runPip(ctx context.Context, j *Job, tool hosttools.Tool, proxy string) (int, error) {
 	argv := pipArgv(tool, proxy)
-	return s.execLogged(ctx, j, argv[0], argv[1:], []string{"PIP_DISABLE_PIP_VERSION_CHECK=1"})
+	code, err := s.execLogged(ctx, j, argv[0], argv[1:], proxyEnv(proxy))
+	if err == nil {
+		return code, nil
+	}
+	// 网络抖动重试两层：
+	// 1) 原样重试 1 次（PyPI 连接重置是常态——实测 kube-hunter 手动第二次即成功，
+	//    旧实现只重试一次 --ignore-installed，恰好落在抖动窗口里就漏装）；
+	// 2) 仍失败再换 --ignore-installed（Debian/Ubuntu 的 dist-packages 没有 RECORD
+	//    文件，pip 卸载会报 uninstall-no-record-file）。
+	for attempt := 1; attempt <= 2; attempt++ {
+		j.append(fmt.Sprintf("[warn] pip 安装失败，%ds 后重试（第 %d/2 次）\n", attempt*5, attempt))
+		select {
+		case <-ctx.Done():
+			return code, err
+		case <-time.After(time.Duration(attempt*5) * time.Second):
+		}
+		code, err = s.execLogged(ctx, j, argv[0], argv[1:], proxyEnv(proxy))
+		if err == nil {
+			return code, nil
+		}
+	}
+	j.append("[warn] pip 仍失败，改用 --ignore-installed 重试\n")
+	argv = appendIgnoreInstalled(argv)
+	return s.execLogged(ctx, j, argv[0], argv[1:], proxyEnv(proxy))
+}
+
+// appendIgnoreInstalled 在 pip 的 install 子命令后插入 --ignore-installed。
+func appendIgnoreInstalled(argv []string) []string {
+	out := make([]string, 0, len(argv)+1)
+	for _, a := range argv {
+		out = append(out, a)
+		if a == "install" {
+			out = append(out, "--ignore-installed")
+		}
+	}
+	return out
+}
+
+// proxyEnv 把已校验的代理注入子进程环境，供 curl/git/pip/gem 等脚本使用。
+func proxyEnv(proxy string) []string {
+	env := []string{
+		"PIP_DISABLE_PIP_VERSION_CHECK=1",
+		"DEBIAN_FRONTEND=noninteractive",
+		// hostd 的 ProtectHome=true 会让 /root 不可写；pip/gem 默认把缓存写 HOME。
+		"HOME=/var/lib/pojun-hostd",
+		"XDG_CACHE_HOME=/var/cache/pojun-hostd",
+		"PIP_CACHE_DIR=/var/cache/pojun-hostd/pip",
+	}
+	if proxy == "" {
+		return env
+	}
+	for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"} {
+		env = append(env, k+"="+proxy)
+	}
+	return append(env, "NO_PROXY=127.0.0.1,localhost", "no_proxy=127.0.0.1,localhost")
 }
 
 // runGitHub 从 GitHub Release 取单文件二进制并装到 /usr/local/bin。
@@ -305,18 +372,35 @@ func (s *Server) runGitHub(ctx context.Context, j *Job, tool hosttools.Tool, pro
 	u := GitHubAssetURL(tool, tag)
 	j.append(fmt.Sprintf("[*] 下载 %s\n", u))
 
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	resp, err := client.Do(req)
-	if err != nil {
-		return 1, fmt.Errorf("下载失败: %w", err)
+	var blob []byte
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		req.Header.Set("User-Agent", "pojun-hostd")
+		resp, err := client.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			blob, err = io.ReadAll(io.LimitReader(resp.Body, 128<<20))
+			resp.Body.Close()
+			if err == nil && len(blob) > 0 {
+				lastErr = nil
+				break
+			}
+		} else if err == nil {
+			err = fmt.Errorf("HTTP %d", resp.StatusCode)
+			resp.Body.Close()
+		}
+		lastErr = err
+		if attempt < 3 {
+			j.append(fmt.Sprintf("[warn] 下载失败（%v），%d 秒后重试…\n", err, attempt*2))
+			select {
+			case <-ctx.Done():
+				return 1, ctx.Err()
+			case <-time.After(time.Duration(attempt*2) * time.Second):
+			}
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 1, fmt.Errorf("下载失败: HTTP %d", resp.StatusCode)
-	}
-	blob, err := io.ReadAll(io.LimitReader(resp.Body, 128<<20))
-	if err != nil {
-		return 1, err
+	if lastErr != nil {
+		return 1, fmt.Errorf("下载失败: %w", lastErr)
 	}
 	j.append(fmt.Sprintf("[*] 已下载 %.1f MB,解压…\n", float64(len(blob))/(1<<20)))
 
@@ -329,6 +413,9 @@ func (s *Server) runGitHub(ctx context.Context, j *Job, tool hosttools.Tool, pro
 // installFromArchive 从归档里取出目标二进制装到 /usr/local/bin。
 // 支持 zip / tar(.gz) / 单文件 gz 三种形态。
 func installFromArchive(j *Job, blob []byte, tool hosttools.Tool) (int, error) {
+	if tool.Raw {
+		return installBinary(j, tool, blob)
+	}
 	want := tool.BinInZip
 	if want == "" {
 		want = tool.Bin
@@ -398,7 +485,13 @@ func installBinary(j *Job, tool hosttools.Tool, data []byte) (int, error) {
 	if want == "" {
 		want = tool.Bin
 	}
-	dst := filepath.Join(binDir, tool.Bin)
+	dst := tool.DestPath
+	if dst == "" {
+		dst = filepath.Join(binDir, tool.Bin)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return 1, fmt.Errorf("创建目录失败: %w", err)
+	}
 	tmp := dst + ".tmp"
 	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
 	if err != nil {
@@ -439,7 +532,13 @@ func installFromZip(j *Job, zr *zip.Reader, tool hosttools.Tool) (int, error) {
 			return 1, err
 		}
 		defer rc.Close()
-		dst := filepath.Join(binDir, tool.Bin)
+		dst := tool.DestPath
+		if dst == "" {
+			dst = filepath.Join(binDir, tool.Bin)
+		}
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return 1, fmt.Errorf("创建目录失败: %w", err)
+		}
 		tmp := dst + ".tmp"
 		out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
 		if err != nil {
@@ -497,8 +596,28 @@ func httpClient(proxy string) *http.Client {
 }
 
 func latestTag(ctx context.Context, client *http.Client, apiURL string) (string, error) {
+	// 通道 1：GitHub API。共享出口 IP 常被 403 限流（Kali 实测 5 个 PD 工具全挂在这）。
+	tag, apiErr := latestTagViaAPI(ctx, client, apiURL)
+	if apiErr == nil && tag != "" {
+		return tag, nil
+	}
+	// 通道 2：releases/latest 的 302 Location——浏览器同款路径，不消耗 API 配额。
+	// apiURL 形如 https://api.github.com/repos/<owner>/<repo>/releases/latest。
+	if repo, ok := strings.CutPrefix(apiURL, "https://api.github.com/repos/"); ok {
+		repo, _ = strings.CutSuffix(repo, "/releases/latest")
+		if repo != "" {
+			if tag, err := latestTagViaRedirect(ctx, client, "https://github.com/"+repo+"/releases/latest"); err == nil && tag != "" {
+				return tag, nil
+			}
+		}
+	}
+	return "", apiErr
+}
+
+func latestTagViaAPI(ctx context.Context, client *http.Client, apiURL string) (string, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "pojun-hostd")
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -519,6 +638,31 @@ func latestTag(ctx context.Context, client *http.Client, apiURL string) (string,
 	return payload.TagName, nil
 }
 
+// latestTagViaRedirect 不跟随重定向，从 Location 路径末尾取 tag。
+func latestTagViaRedirect(ctx context.Context, client *http.Client, url string) (string, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Set("User-Agent", "pojun-hostd")
+	// 不跟随：拿到 302 的 Location 即可（跟随后会落到 release 页 HTML）。
+	noFollow := *client
+	noFollow.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := noFollow.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	loc := resp.Header.Get("Location")
+	if loc == "" {
+		return "", fmt.Errorf("HTTP %d 且无 Location", resp.StatusCode)
+	}
+	if i := strings.LastIndex(loc, "/tag/"); i >= 0 {
+		tag := strings.TrimSuffix(loc[i+len("/tag/"):], "/")
+		if tag != "" {
+			return tag, nil
+		}
+	}
+	return "", fmt.Errorf("Location 里没有 tag: %s", loc)
+}
+
 // ── HTTP ─────────────────────────────────────────
 
 // Handler 返回挂在 Unix socket 上的 mux。
@@ -527,7 +671,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{
-			"ok": true, "service": "artex-hostd",
+			"ok": true, "service": "pojun-hostd",
 			"version": s.Version,
 			"pkg_mgr": string(s.pkgMgr),
 			"tools":   len(hosttools.Inventory()),
@@ -537,7 +681,7 @@ func (s *Server) Handler() http.Handler {
 	// /version 供主服务做版本对齐：主程序自我升级后会拿自己的版本号来敲门，
 	// 助手发现自己落后就自我换装（见 UpgradeSelf 的注释：只能由它自己来做）。
 	mux.HandleFunc("GET /version", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"service": "artex-hostd", "version": s.Version})
+		writeJSON(w, 200, map[string]any{"service": "pojun-hostd", "version": s.Version})
 	})
 
 	mux.HandleFunc("POST /self-upgrade", func(w http.ResponseWriter, r *http.Request) {

@@ -233,10 +233,10 @@ func loginGuard(w http.ResponseWriter, r *http.Request, action string) bool {
 	return true
 }
 
-// signJWT issues a 7-day HS256 token for user ARTEX.
+// signJWT issues a 7-day HS256 token for user POJUN.
 func signJWT(key []byte) (string, error) {
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-		Subject:   "ARTEX",
+		Subject:   "POJUN",
 		ExpiresAt: jwt.NewNumericDate(time.Now().Add(jwtTTL)),
 		IssuedAt:  jwt.NewNumericDate(time.Now()),
 	}).SignedString(key)
@@ -253,16 +253,43 @@ func verifyJWT(tokenStr string, key []byte) bool {
 	return err == nil && t.Valid
 }
 
-// extractToken reads the JWT from Authorization: Bearer header,
-// artex_token cookie, or ?token= query param (for SSE connections).
+// sseQueryTokenPaths 是唯一接受 ?token= 查询参数的端点白名单：浏览器 EventSource
+// 无法带 Authorization 头,这些 URL 直连的 SSE 流端点历史上靠 query token 认证。
+// 其余任何路径不再从 query 取 token（N1 收敛）——token 会进访问日志/X-Forwarded 头/
+// Referer,能走 cookie（前端已配好）的路径不该把这个风险留着。EventSource 同源默认带
+// cookie,query 只是 cookie 不可用时的后备。side-questions 的 events 端点带请求 id,
+// 由 queryTokenAllowed 里的前缀+后缀判断覆盖。
+var sseQueryTokenPaths = map[string]bool{
+	"/api/exploration/activity/stream": true,
+	"/api/logs/stream":                 true,
+	"/api/update/stream":               true,
+}
+
+// queryTokenAllowed reports whether ?token= may be trusted for this request:
+// only the four URL-direct SSE stream endpoints (see sseQueryTokenPaths).
+func queryTokenAllowed(r *http.Request) bool {
+	if sseQueryTokenPaths[r.URL.Path] {
+		return true
+	}
+	// side-questions events 按请求 id 动态:/api/side-questions/<id>/events
+	return strings.HasPrefix(r.URL.Path, "/api/side-questions/") && strings.HasSuffix(r.URL.Path, "/events")
+}
+
+// extractToken reads the JWT from Authorization: Bearer header, or the
+// pojun_token cookie. ?token= query is only honored on the SSE stream endpoints
+// (queryTokenAllowed) — elsewhere the token would leak into access logs and
+// Referer headers without giving up anything the cookie doesn't already do.
 func extractToken(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		return strings.TrimPrefix(h, "Bearer ")
 	}
-	if c, err := r.Cookie("artex_token"); err == nil && c.Value != "" {
+	if c, err := r.Cookie("pojun_token"); err == nil && c.Value != "" {
 		return c.Value
 	}
-	return r.URL.Query().Get("token")
+	if queryTokenAllowed(r) {
+		return r.URL.Query().Get("token")
+	}
+	return ""
 }
 
 // requireAuth wraps h with JWT validation.
@@ -436,8 +463,13 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		writeProductError(w, 400, "invalid_request", "请求格式错误", nil)
 		return
 	}
+<<<<<<< ours
 	if req.Username != "ARTEX" {
 		writeProductError(w, 401, "invalid_credentials", "用户名或密码错误", nil)
+=======
+	if req.Username != "POJUN" && req.Username != "ARTEX" { // v0.4.19 改名：兼容旧用户名
+		writeErr(w, 401, "用户名或密码错误")
+>>>>>>> theirs
 		return
 	}
 	hash, ok, err := pg.GetSetting(authPassKey)

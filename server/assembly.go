@@ -7,14 +7,22 @@ import (
 	"io"
 	"log"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+<<<<<<< ours
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/traffic"
+=======
+>>>>>>> theirs
 	"github.com/Autumn-27/norma/skill"
 	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/traffic"
 )
 
 // wireAgentAugment connects the PG agent_visibility table into the agent runtime:
@@ -25,6 +33,64 @@ import (
 // capture is on) to add to EVERY agent's base list — the DB tools table then
 // filters them per-agent binding. Empty/nil → no host tools this run (capture off).
 func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.CoreTool, map[string][]string)) {
+	// 技能速查块注入 system prompt（v0.4.60）：Skill 是元工具，模型不被 system
+	// prompt 显式提醒就几乎不调（56k 调用里 Skill 只触发 8 次、任务 18 零次）。
+	// 这里按 agent 的绑定清单生成「名称+何时用」速查表；描述已按触发场景撰写，
+	// 直接截首句。registry 60s 缓存——prompt 每次 run 都渲染，不能每次读 21 个文件。
+	// 技能速查块注入 system prompt（v0.4.60）：Skill 是元工具，模型不被 system
+	// prompt 显式提醒就几乎不调（56k 调用里 Skill 只触发 8 次、任务 18 零次）。
+	// 按 agent 绑定清单生成「名称+何时用」速查表；registry 60s 缓存——prompt
+	// 每次 run 都渲染，不能每次读 21 个文件。
+	var (
+		idxMu      sync.Mutex
+		idxCacheAt time.Time
+		idxDesc    map[string]string
+	)
+	loadDesc := func() map[string]string {
+		idxMu.Lock()
+		defer idxMu.Unlock()
+		if time.Since(idxCacheAt) < time.Minute {
+			return idxDesc
+		}
+		idxDesc = map[string]string{}
+		if allReg, err := skill.LoadDir(skillDir); err == nil && allReg != nil {
+			for _, sk := range allReg.List() {
+				if sk.Dir == "" {
+					continue
+				}
+				d := strings.TrimSpace(sk.Description)
+				if i := strings.IndexAny(d, "。；;\n"); i > 0 {
+					d = d[:i]
+				}
+				if r := []rune(d); len(r) > 80 {
+					d = string(r[:80]) + "…"
+				}
+				idxDesc[filepath.Base(sk.Dir)] = d
+			}
+		}
+		idxCacheAt = time.Now()
+		return idxDesc
+	}
+	agent.SkillIndexBlock = func(agentKey string) string {
+		a, err := pg.GetAgentByKey(agentKey)
+		if err != nil || a == nil {
+			return ""
+		}
+		names, err := pg.AgentSkillNames(a.ID)
+		if err != nil || len(names) == 0 {
+			return ""
+		}
+		desc := loadDesc()
+		var b strings.Builder
+		b.WriteString("【技能速查（你已绑定的 skill；命中场景必须先调 Skill 元工具加载全文再动手）】\n")
+		for _, n := range names {
+			if d, ok := desc[n]; ok && d != "" {
+				b.WriteString("- " + n + "：" + d + "\n")
+			}
+		}
+		b.WriteString("调用方式：Skill(name=\"<名称>\")。技能内有验证口径/假点清单/报告模板，先加载可避免漏检与误报。")
+		return b.String()
+	}
 	agent.ToolAugment = func(ctx context.Context, agentKey string) ([]actool.CoreTool, agent.DeferredInfo, func()) {
 		a, err := pg.GetAgentByKey(agentKey)
 		if err != nil || a == nil {
@@ -240,6 +306,7 @@ func seedPrompts(pg *db.DB) {
 // and缺省入参 get injected. MCP/skill/host tools have no row and pass through.
 func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 	agent.FindingTrafficBindingEnabled = func() bool { return pg.GetBool(settingAgentTrafficBinding, false) }
+<<<<<<< ours
 	agent.IntelligenceEnabled = func() bool { return pg.GetBool(db.SettingTaskIntelligence, false) }
 	agent.IntelligenceRecord = func(ctx context.Context, taskID, nodeID int64, worker string, input db.IntelligenceInput) (int64, error) {
 		if !pg.GetBool(db.SettingTaskIntelligence, false) {
@@ -257,6 +324,25 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 			}
 		}
 		return item.ID, nil
+=======
+	// 证据附件列表（v0.4.9）：agent 的 list_artifacts 工具读取本任务已登记附件。
+	agent.ListTaskArtifacts = func(taskID string) ([]db.TaskArtifact, error) { return pg.ListTaskArtifacts(taskID) }
+	// reporter 的 chat 会话没有任务上下文（v0.4.20）：允许工具按 finding_id
+	// 反查所属任务，避免 list_artifacts 永远返回空。
+	agent.FindingTaskID = func(findingID int64) (string, error) {
+		f, err := pg.GetFinding(findingID)
+		if err != nil {
+			return "", err
+		}
+		if f == nil || f.TaskID == nil {
+			return "", fmt.Errorf("finding %d 无所属任务", findingID)
+		}
+		return strconv.FormatInt(*f.TaskID, 10), nil
+	}
+	// reporter 需要看附件清单来引用截图（worker 由 builtinToolsByAgent 自动绑定）。
+	if err := pg.AddAgentToToolBinding("reporter", []string{"list_artifacts"}); err != nil {
+		log.Printf("[tools] reporter 绑定 list_artifacts 失败: %v", err)
+>>>>>>> theirs
 	}
 	// Seed the built-in domain tools (first-insert only; DO NOTHING preserves edits).
 	// No startup prune: rows we didn't seed are left alone so future user-defined

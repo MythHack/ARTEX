@@ -19,7 +19,7 @@ import (
 //	 adaptive thinking; thinking.type=\"disabled\" (including reasoning.effort=none)
 //	 is not allowed (2013)"}}
 //
-// 这个坑在 ARTEX 里**已经踩了三次**：裁决路径（server/intercept.go）、
+// 这个坑在 POJUN 里**已经踩了三次**：裁决路径（server/intercept.go）、
 // 压缩路径（agent/compaction.go）、旁路摘要路径（sidequestion/context.go）——
 // 三处都各自硬编码了 thinking 参数，各修一次，但只要再有一处新代码带上
 // thinking，就会复发第四次。

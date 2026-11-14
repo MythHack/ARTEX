@@ -11,8 +11,7 @@ import (
 	actool "github.com/Autumn-27/norma/tool"
 
 	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-)
+	"github.com/Autumn-27/artex/db")
 
 // maxLedgerSkillName caps the skill name stored for a MISS — that string comes
 // straight from the model and is otherwise unbounded.

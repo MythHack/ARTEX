@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -11,11 +12,17 @@ import (
 	"sync/atomic"
 	"time"
 
+<<<<<<< ours
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
+=======
+>>>>>>> theirs
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/intercept"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -85,6 +92,18 @@ func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
 	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err)
 }
 
+// isTransientContextCanceled：worker run 以 err 携带 context canceled 收场、但任务级
+// ctx 仍活着——取消发生在 run 内部（provider 流/内部子 ctx），不是用户暂停也不是
+// planner kill。任务 5 实测 6 条意图以 blocked(error: context canceled) 白白收场全是
+// 这种。与 model_error 同待遇：在 runIntent 的重试循环里退避重跑，重试耗尽才落
+// blocked，一条内部取消不再白丢整条意图。
+func isTransientContextCanceled(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "context canceled")
+}
+
 // Engine drives the event-driven exploration loop with real LLM agents
 // (docs §4.3/§4.4): on asset/exploration-graph change (debounced) it wakes the
 // planner, which reads the route, queries assets, judges goals and emits intents;
@@ -104,6 +123,8 @@ type Engine struct {
 	paused   sync.Map // taskID -> bool, user-paused (planner + workers idle but loops alive)
 	deleting sync.Map // taskID -> bool, delete barrier (no new task-owned writes)
 	dropCnt  sync.Map // taskID -> *int64, running count of dropped (unpersistable) activity records
+	// autoTrack: taskID -> *autopilotTrack，自主推进看门狗的内存状态。
+	autoTrack sync.Map
 
 	// deleteMu makes installing the delete barrier atomic with registering a new
 	// task operation. Once BeginDelete returns, every admitted writer is reflected
@@ -407,6 +428,64 @@ func (e *Engine) ActiveLLMCalls(taskID string) int64 {
 
 func (e *Engine) touch(taskID string) { e.lastAct.Store(taskID, time.Now().Unix()) }
 
+// autoAttributeCompany 任务首次开跑时自动归属公司（v0.4.40）。
+// 数据背景：companies 与 assets.company_id 都有归属，但任务的 company scope 全空
+// ——任务在公司维度是「无主」的，无法按公司分组/汇报。
+// 规则（保守）：范围内资产 100% 属于同一家公司，且该公司资产总量 ≤ 3×范围资产+20
+// （说明公司≈该客户）才自动写 company scope 并快照资产；否则只写建议到活动流。
+func (e *Engine) autoAttributeCompany(t *Task) {
+	if e.m == nil || e.m.pg == nil {
+		return
+	}
+	tid, err := strconv.ParseInt(t.ID, 10, 64)
+	if err != nil || tid <= 0 {
+		return
+	}
+	has, err := e.m.pg.HasCompanyScope(tid)
+	if err != nil || has {
+		return
+	}
+	dist, total, err := e.m.pg.ScopeCompanyDistribution(tid)
+	if err != nil || total == 0 {
+		return
+	}
+	var cid int64
+	others := 0
+	for id, n := range dist {
+		if id <= 0 || n == 0 {
+			continue
+		}
+		if cid == 0 {
+			cid = id
+		} else if id != cid {
+			others++
+		}
+	}
+	if cid == 0 {
+		return
+	}
+	if others == 0 {
+		compTotal, err := e.m.pg.CompanyScopeAssetCount(cid)
+		if err != nil {
+			return
+		}
+		if compTotal <= 3*total+20 {
+			reason := fmt.Sprintf("自动归属：任务范围内 %d 个资产全部属于该公司（公司现有资产 %d，已快照纳入范围；可在任务范围设置中撤销）", total, compTotal)
+			if err := e.m.pg.AddCompanyScopeAuto(tid, cid, reason); err == nil {
+				log.Printf("[task %s] 自动归属公司 #%d（scope 资产 %d，公司资产 %d）", t.ID, cid, total, compTotal)
+				e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+					Summary: fmt.Sprintf("任务已自动归属到公司 #%d：范围内 %d 个资产全部属于该公司，其现有 %d 个资产已一并纳入测试范围；如需调整可在任务范围设置中撤销。", cid, total, compTotal)})
+				return
+			}
+		}
+		e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+			Summary: fmt.Sprintf("归属建议：范围内 %d 个资产全部属于公司 #%d，但该公司共有 %d 个资产（超出本任务范围较多）——如需一并测试，请在任务范围设置里手动关联该公司。", total, cid, compTotal)})
+		return
+	}
+	e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+		Summary: fmt.Sprintf("归属提示：任务范围内资产分属多家公司（主要公司 #%d）。如需按公司组织任务，请在任务范围设置里关联对应企业。", cid)})
+}
+
 func NewEngine(m *Manager) *Engine {
 	return &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
 		execCancel: map[string]context.CancelCauseFunc{}, execCtx: map[string]context.Context{},
@@ -560,7 +639,7 @@ func (e *Engine) drainSteer(intentID int64) (string, bool) {
 // before each tool call it drains a queued course-correction (if any) and blocks the
 // call, handing the message back to the model — which re-plans its next step instead
 // of running the tool. No queued message → the guard behaves exactly as before.
-// 它同时负责「空转回合」的续跑，见 Stop。
+// 它同时负责「空转回合」的续跑（Stop）与「重复调用」拦截（PreToolUse，v0.4.28）。
 type steerHooks struct {
 	inner harness.HookRunner
 	drain func() (string, bool)
@@ -572,6 +651,9 @@ type steerHooks struct {
 	limit int
 	// label 形如 "worker-1 · #42"，只用于日志。
 	label string
+	// repeats 是重复调用检测器（v0.4.28，PentAGI 机制自研）：同名工具+完全相同入参
+	// 连续 ≥3 次即拦截回喂纠正提示；同一串最多拦 2 次后放行兜底。nil = 不介入。
+	repeats *repeatTracker
 }
 
 // 空转回合(只有思考、既无正文也无工具调用)续跑次数的默认值，与 SDK 空响应重试的
@@ -609,6 +691,14 @@ func isThinkingOnlyTurn(messages []llm.Message) bool {
 }
 
 func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
+	// 重复调用检测（v0.4.28）：拦截优先级低于 steer 纠偏——先让排队的人类/规划者
+	// 指令说话，再查重复。
+	if h.repeats != nil {
+		if streak, block := h.repeats.observe(name, input); block {
+			log.Printf("[work %s] 重复调用拦截：%s 连续第 %d 次完全相同入参", h.label, name, streak)
+			return true, repeatBlockText(streak), nil
+		}
+	}
 	if msg, ok := h.drain(); ok {
 		return true, "【规划者实时纠偏】" + msg +
 			"\n（这是规划者对本意图的即时指令；本次工具调用未执行，请据此调整下一步。若与你当前打算冲突，以此为准。）", nil
@@ -832,6 +922,23 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	}
 	e.slotPlans.Store(t.ID, plan)
 	e.deleteMu.RUnlock()
+	// created→running：任务真正开跑后状态列必须与事实一致（此前 bootstrap 准入不写
+	// running，线上任务跑了数小时 DB 里仍是 created）。仅 created 时写，避免覆盖
+	// paused/done 等状态。
+	if t.Status == "created" {
+		if err := e.m.SetTaskStatus(t.ID, "running"); err == nil {
+			t.Status = "running"
+		}
+		// 任务归属公司（v0.4.40）：范围内资产 100% 属于同一家公司且公司资产规模同
+		// 量级时，自动写 company scope 并快照资产；否则只在活动流里给出建议。
+		e.autoAttributeCompany(t)
+		// 开局窄面提示（v0.4.57 复盘）：范围内资产 <10 时提醒操作者预期。
+		e.warnNarrowScope(t)
+	}
+	// 自主推进看门狗：全进程一个，跟随引擎 ctx 退出（每 60s 扫一次）。
+	startAutopilotLoopOnce.Do(func() {
+		go e.startAutopilotLoop(ctx)
+	})
 	e.touch(t.ID)
 	runTaskRoutine(rt, func(loopCtx context.Context) { e.plannerLoop(loopCtx, t) })
 	for _, slot := range slots {
@@ -849,6 +956,7 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	}
 }
 
+<<<<<<< ours
 // workerSlotsForTask preserves an explicit task concurrency override. Tasks
 // using the global default inherit its model pools and their pinned profiles.
 func workerSlotsForTask(t *Task, pools []WorkerPool, global int) ([]WorkerSlot, error) {
@@ -868,6 +976,30 @@ func workerCountForTask(t *Task, global int) int {
 	return global
 }
 
+=======
+// startAutopilotLoopOnce 保证全进程只有一个看门狗协程（首个任务 Run 时启动）。
+var startAutopilotLoopOnce sync.Once
+
+// plannerRoundTimeout 是**一轮规划**自身的墙钟上限（与任务 deadline 无关）。
+//
+// 为什么必须有（实测事故 2026-10-20 线上）：
+//
+//	planner 的 MaxDuration = clampMaxDuration(deadline, 0)，任务没有 deadline 时
+//	就是 0 = 不限时；而 SDK 的 MaxDuration 只在轮边界检查、且只约束**工具执行**
+//	（LLM 调用用的是无 deadline 的 l.ctx）。于是一次上游半开连接（连上了但
+//	永不返回）就让 Plan() 永不返回。
+//
+//	而 runRound 是**串行**的：它没返回，后续所有唤醒（边沿 + 10 分钟心跳）就
+//	全堵在里面出不来 → planner 永久哑火。
+//
+//	实测症状：14:30 启动后 planner 跑到 14:42（任务3）/ 15:45（任务4）就没再出
+//	规划轮；worker 自己把剩余意图跑完（最后一个 exhausted 在 16:53）；此后 6
+//	小时零规划轮、零新意图——「运行中 Worker」恒为 0，任务状态仍是 running
+//	却什么都不干。重启服务立即恢复。
+//
+//	15 分钟的由来：实测一轮规划（1M 上下文 + 几十次工具调用）3–5 分钟，15 分钟
+//	给三倍冗余；同时保证「上游卡死」最多浪费 15 分钟就自愈，不会无限期哑火。
+>>>>>>> theirs
 const plannerRoundTimeout = 15 * time.Minute
 
 var plannerRoundTimeoutOverride time.Duration
@@ -925,6 +1057,62 @@ func resetPlannerTimer(timer *time.Timer, d time.Duration) {
 	timer.Reset(d)
 }
 
+// warnNarrowScope 任务开局提示资产面宽窄（v0.4.57 复盘：任务 16/17 类薄面站点
+// 完整跑完流程但产出有限——提前让操作者知道预期，好调整目标/预算/超时）。
+// 只在 created→running 的首次启动时随 autoAttributeCompany 一起发一次。
+func (e *Engine) warnNarrowScope(t *Task) {
+	if e.m == nil || e.m.pg == nil || e.m.assets == nil {
+		return
+	}
+	tid, err := strconv.ParseInt(t.ID, 10, 64)
+	if err != nil || tid <= 0 {
+		return
+	}
+	cov, err := e.m.assets.TaskCoverageWithSources(tid)
+	if err != nil || cov == nil || !cov.Enabled {
+		return
+	}
+	if cov.Denominator == 0 || cov.Denominator >= 10 {
+		return
+	}
+	e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+		Summary: fmt.Sprintf("开局提示：当前范围内仅 %d 个资产——资产面较窄，预期产出有限；可考虑扩大范围或调低该任务的预算/超时", cov.Denominator)})
+}
+
+// warnFindingsWithoutReport 在任务落终态前检查「已上报但详细报告为空」的漏洞。
+// 终局之后不再派 worker，这些缺口只能提示人在漏洞页补齐——报告导出时一条
+// 空报告漏洞会直接拉低交付质量（v0.4.56 复盘：12 个任务累计 7 条无报告漏洞）。
+func (e *Engine) warnFindingsWithoutReport(t *Task) {
+	if e.m == nil || e.m.pg == nil {
+		return
+	}
+	fs, _, err := e.m.pg.ListFindingsPage(db.FindingFilter{TaskID: t.ID}, 1, 500)
+	if err != nil {
+		return
+	}
+	var missing []string
+	for _, f := range fs {
+		if strings.TrimSpace(f.Report) == "" {
+			title := strings.TrimSpace(f.Name)
+			if title == "" {
+				title = strings.TrimSpace(f.VulnClass)
+			}
+			if title == "" {
+				title = "未分类"
+			}
+			missing = append(missing, fmt.Sprintf("#%d %s", f.ID, title))
+			if len(missing) >= 5 {
+				break
+			}
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+		Summary: fmt.Sprintf("收尾检查：%d 条漏洞缺少详细报告（%s…），可在漏洞页补齐后再导出", len(missing), strings.Join(missing, "、"))})
+}
+
 func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 	interval := plannerHeartbeatInterval(t)
 	// 心跳定时器在 loop 入口臂 = 从任务 start 计时:即使是跳过首轮 planner 的 seed 任务
@@ -935,6 +1123,26 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 
 	// runRound 跑一轮规划(含 debounce 合并 + 各 guard)。src 仅用于日志区分触发来源。
 	runRound := func(src string) {
+		// 有挂起收尾：先尝试收尾；未满足（goal_met 仍在跑意图）就等下一次唤醒，
+		// 不再跑规划——否则 goal_met 之后又派新意图，任务永远停不下来。
+		// 例外：用户刚新增目标/提示 → 撤销非硬上限的收尾并继续规划（max_rounds 是硬上限）。
+		if reason, _ := t.peekSettle(); reason != "" {
+			if suppressAutopilotSettle(t, reason) {
+				// 自主推进：清掉挂起原因后**继续本轮规划**。这里绝不能 return——
+				// 否则原因一直在、每次唤醒都走这个分支，planner 被永久卡死。
+				t.clearSettle()
+				log.Printf("[autopilot] task %s 忽略收尾判据 %s，继续规划", t.ID, reason)
+				_ = e.m.pg.InsertAutopilotEvent(t.ID, "settle_suppressed", "自主推进：忽略 "+reason+" 收尾判据")
+			} else if reason != "auto_rounds" && t.hasPendingFreshDirection() {
+				t.clearSettle()
+				if err := e.m.pg.ResetTaskProgress(t.ID); err != nil {
+					log.Printf("[auto-finish] task %s 新目标重置进度失败: %v", t.ID, err)
+				}
+			} else {
+				e.maybePendingSettle(ctx, t)
+				return
+			}
+		}
 		// debounce: coalesce a burst of changes into one planning round
 		timer := time.NewTimer(e.debounce)
 	drain:
@@ -998,8 +1206,17 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// 还有 open/running 意图 → 保持 running、静默等待；意图已全部跑干 → 落 done。
 		// 整段纯 Go、不触发任何 LLM 调用，也不打规划轮 marker。
 		if open, err := t.Store.HasOpenGoal(); err == nil && !open {
+			// 自主推进：目标虽然全达成，但只要还有可干的事（未测资产/高危未闭环/上一波有
+			// 新增事实），就先续杯加下一层目标、回到 planner——否则会走 goalless 分支直接
+			// 落 done。
+			if t.AutopilotEnabled() && e.maybeExtendAutopilot(t) {
+				log.Printf("[autopilot] task %s 目标全达成但仍有活可干，自动续杯而非收工", t.ID)
+				return
+			}
 			t.drainTriggers() // 丢弃累积的 done/finding 触发，避免 goalless 长会话里无界增长
 			if active, err := t.Store.HasActiveIntent(); err == nil && !active {
+				// 落 done 前点名缺报告的漏洞（见 warnFindingsWithoutReport）。
+				e.warnFindingsWithoutReport(t)
 				// frontier 抽干且无在跑意图 → 收尾。用 Guarded 版做 CAS，避免踩到并发的
 				// pause/delete/超时收尾的状态转换。
 				if won, err := e.m.SetTaskStatusGuarded(t.ID, "done"); err != nil {
@@ -1020,6 +1237,7 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		}
 		e.stampFirstRun(t) // 首次真正规划 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 		e.touch(t.ID)
+<<<<<<< ours
 		emit := func(r db.Activity) {
 			if r.Kind == "tool_result" && r.IsError && e.proxyFailure != nil && isGlobalProxyDialFailure(errors.New(r.Detail+" "+r.Summary)) {
 				e.proxyFailure(t.ID, errors.New(r.Detail+" "+r.Summary))
@@ -1027,6 +1245,10 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			e.emitActivity(t, r)
 		}
 		ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
+=======
+		emit := func(r db.Activity) { e.emitActivity(t, r) }
+		ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false, "") // cancellable by Pause; 带任务 deadline
+>>>>>>> theirs
 		if ectx.Err() != nil || e.IsDeleting(t.ID) {
 			return
 		}
@@ -1052,8 +1274,9 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		log.Printf("[planner] task %s 规划中…(%s 触发)", t.ID, src)
 		// round marker: each Plan() is one planner round; emit a boundary so the
 		// UI can separate rounds in the transcript (kind='round').
+		round := e.nextPlannerRound(t.ID)
 		e.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
-			Summary: fmt.Sprintf("第 %d 轮规划", e.nextPlannerRound(t.ID))})
+			Summary: fmt.Sprintf("第 %d 轮规划", round)})
 		// what fired this round (worker done / finding; may be several — debounce
 		// coalesces a burst; empty for time/heartbeat wakes).
 		triggers := t.drainTriggers()
@@ -1093,6 +1316,13 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 				e.proxyFailure(t.ID, res.err)
 			}
 		case res.met:
+			// 自主推进续杯：目标全部达成时先问一句「还有没有活可干」。有未测资产/
+			// 高危漏洞且波次没用完 → 自动追加下一层目标，本轮不取消 worker、不
+			// settle，当作「未完成」继续规划。
+			if e.maybeExtendAutopilot(t) {
+				res.met = false
+				break
+			}
 			log.Printf("[planner] task %s 判定目标达成: %s", t.ID, res.reason)
 			// 所有目标达成 → 持久化任务状态为 done（前端 DTO 会优先展示该终态）。
 			if err := e.m.SetTaskStatus(t.ID, "done"); err != nil {
@@ -1105,6 +1335,21 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		default:
 			log.Printf("[planner] task %s 规划完成", t.ID)
 		}
+		// 自动收尾判定（v0.5.0）：只登记原因，真正 settle 由 plannerLoop 在本轮
+		// inflight 释放后执行（避免 drain 等自己）。
+		if res.err == nil && ectx.Err() == nil && !e.isSettling(t.ID) {
+			if res.met {
+				t.requestSettle("goal_met", "planner 判定目标达成")
+			} else {
+				e.recordAndEvaluateAutoFinish(t, int64(round), triggers)
+			}
+		}
+		// 覆盖矩阵 / 纵深缺口提醒（v0.4.63）：提示词约束不住弱模型时，
+		// 引擎侧确定性补一层。不要求本轮 res.err==nil——超时/模型故障时同样要提醒。
+		if ectx.Err() == nil && !e.isSettling(t.ID) {
+			e.nudgeCoverageGaps(t)
+			e.nudgeDepthGaps(t)
+		}
 		e.touch(t.ID)
 	}
 
@@ -1114,9 +1359,15 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 			return
 		case <-t.notify:
 			runRound("edge") // worker 结束 / finding / kill / resume / seed 首轮
+			e.maybePendingSettle(ctx, t)
 		case <-heartbeat.C:
 			// 周期兜底:死锁兜底 + 唤醒去监督飞行中的 worker(steer/kill) + 周期复查。
-			runRound("heartbeat")
+			// 积压满时跳过纯心跳规划轮：再规划也只会被 add_intent 拒绝、白烧 token。
+			// 边沿触发（worker 结束/finding）不受影响。
+			if !e.intentBacklogFull(t) {
+				runRound("heartbeat")
+			}
+			e.maybePendingSettle(ctx, t)
 		}
 		// 每次唤醒(边沿或心跳)后重臂心跳:任意规划触发都重算这段静置计时。
 		resetPlannerTimer(heartbeat, interval)
@@ -1211,6 +1462,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	hasChatMessage := message != ""
 	e.stampFirstRun(t) // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 	e.touch(t.ID)
+<<<<<<< ours
 	emit := func(r db.Activity) {
 		if r.Kind == "tool_result" && r.IsError && e.proxyFailure != nil && isGlobalProxyDialFailure(errors.New(r.Detail+" "+r.Summary)) {
 			e.proxyFailure(t.ID, errors.New(r.Detail+" "+r.Summary))
@@ -1218,6 +1470,10 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		e.emitActivity(t, r)
 	}
 	ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
+=======
+	emit := func(r db.Activity) { e.emitActivity(t, r) }
+	ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false, "") // cancellable by Pause; 带任务 deadline
+>>>>>>> theirs
 	if ectx.Err() != nil || e.IsDeleting(t.ID) {
 		if err := transitionIntentState(t.Store, intent.ID, "running", "open"); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 领取后回退失败: %v", name, t.ID, intent.ID, err)
@@ -1240,24 +1496,68 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	label := fmt.Sprintf("%s · #%d", name, iid)
 	workCtx = intercept.WithTaskContext(workCtx, t.ID, label, taskEmit)
+	workCtx = intercept.WithAutopilot(workCtx, t.AutopilotEnabled) // 自主推进提示词尾巴（worker）
+	// 意图级软预算（v0.4.28）：usage 活动的累计 token 到顶 → steer 注入收尾提醒（软的，
+	// 不杀进程，一次为准）；重复调用检测器挂进 steerHooks。两者都可经 settings 关闭/调整。
+	if bw := intentBudgetWatcher(intentBudgetFromPG(e.m.pg), func(msg string) error {
+		return e.SteerWork(iid, msg)
+	}, label); bw != nil {
+		inner := emit
+		emit = func(a db.Activity) {
+			bw(a)
+			inner(a)
+		}
+	}
+	// 证据回验台账 + 注入告警（v0.4.29，P0b #2/#4）：tool_result 的 Detail 就是模型
+	// 实际看到的回显文本（已过 SDK 落盘截断）——台账收集它供 report_finding 逐字核对；
+	// 命中高精度注入特征时经 steer 通道在下一次工具调用前提醒「当数据不当指令」。
+	ledger := agent.NewToolOutputLedger()
+	workCtx = agent.WithToolOutputs(workCtx, ledger, evidenceVerifyModeFromPG(e.m.pg))
+	if injectionGuardFromPG(e.m.pg) {
+		var injAlerts atomic.Int64
+		inner := emit
+		emit = func(a db.Activity) {
+			if a.Kind == "tool_result" && a.Detail != "" {
+				ledger.Add(a.Detail)
+				if pat := scanInjection(a.Detail); pat != "" && injAlerts.Add(1) <= 3 {
+					if err := e.SteerWork(iid, injectionAlertText(pat)); err != nil {
+						log.Printf("[injection %s] 告警入队失败: %v", label, err)
+					} else {
+						log.Printf("[injection %s] 工具输出命中注入特征 %q，已提醒模型按数据处理", label, pat)
+					}
+				}
+			}
+			inner(a)
+		}
+	} else {
+		inner := emit
+		emit = func(a db.Activity) {
+			if a.Kind == "tool_result" && a.Detail != "" {
+				ledger.Add(a.Detail)
+			}
+			inner(a)
+		}
+	}
 	// nudges 有意建在 model_error 重跑循环之外:空转续跑的上限是「这条意图」的总量，
 	// 重跑一轮不该把额度清零重来。
 	hooks := steerHooks{
-		inner:  t.Guard.Hooks(),
-		drain:  func() (string, bool) { return e.drainSteer(iid) },
-		nudges: &atomic.Int64{},
-		limit:  e.emptyTurnNudgeLimit(),
-		label:  label,
+		inner:   t.Guard.Hooks(),
+		drain:   func() (string, bool) { return e.drainSteer(iid) },
+		nudges:  &atomic.Int64{},
+		limit:   e.emptyTurnNudgeLimit(),
+		label:   label,
+		repeats: newRepeatTracker(),
 	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	runStart := time.Now() // 意图墙钟起点（跨 model_error 重试累计），结算时落 payload
 	e.BeginLLMCall(t.ID)
 	var reason harness.TerminalReason
 	var wrote agent.WriteCounts
 	var err error
 	if hasChatMessage {
-		reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)
+		reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message, workCancel)
 	} else {
-		reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
+		reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, workCancel)
 	}
 	if err != nil && e.proxyFailure != nil && isProxyFailure(err) {
 		e.proxyFailure(t.ID, err)
@@ -1268,18 +1568,18 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// 再重试,避免退避挤占其他 worker 的优雅收尾窗口)。
 	maxRetries, retryBackoff := e.modelErrorRetryPolicy()
 	for attempt := 1; attempt <= maxRetries &&
-		retryableWorkerModelError(reason, err) &&
+		(retryableWorkerModelError(reason, err) || isTransientContextCanceled(err)) &&
 		workCtx.Err() == nil && ectx.Err() == nil && !e.IsPaused(t.ID) && !e.isSettling(t.ID); attempt++ {
-		log.Printf("[worker %s] task %s 意图 #%d model_error 收场，%v 后重试 (%d/%d)",
-			name, t.ID, intent.ID, retryBackoff, attempt, maxRetries)
+		log.Printf("[worker %s] task %s 意图 #%d 瞬时故障收场(%v)，%v 后重试 (%d/%d)",
+			name, t.ID, intent.ID, preview(fmt.Sprint(err), 80), retryBackoff, attempt, maxRetries)
 		if sleepCtx(workCtx, retryBackoff) {
 			break // 退避期间被取消（终止/暂停）→ 交给下方分支处理
 		}
 		e.BeginLLMCall(t.ID)
 		if hasChatMessage {
-			reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message)
+			reason, wrote, err = worker.ExecuteWithMessage(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, requestID, message, workCancel)
 		} else {
-			reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
+			reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding, workCancel)
 		}
 		e.EndLLMCall(t.ID)
 	}
@@ -1289,7 +1589,8 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// unregister would always be true (unregister cancels it) → every completed
 	// work would be wrongly marked stopped.
 	workCause := context.Cause(workCtx)
-	killed := workCtx.Err() != nil && ectx.Err() == nil
+	// idle-stop 是自己收场，不是 planner 终止——排除后走下方 exhausted 分流。
+	killed := workCtx.Err() != nil && ectx.Err() == nil && !errors.Is(workCause, agent.AbortIdleStop)
 	action, completeWork := e.detachWork(intent.ID)
 	// A caller may stop waiting and release its in-memory reservation before the
 	// agent honors cancellation. The named context cause remains authoritative and
@@ -1360,6 +1661,19 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		e.touch(t.ID)
 		return true
 	}
+	// 服务停止 / 任务范围取消（非 pause、非收尾、非终态、非 kill）：本 run 是被
+	// 进程级 ctx 取消的，不是 worker 的错。把意图放回 open，服务恢复后重新领取——
+	// 否则每次部署重启都会烧掉若干意图（实测 5 个任务累计 29 条 blocked=context canceled）。
+	if ectx.Err() != nil && !e.isSettling(t.ID) && !isTerminalStatus(e.m.TaskStatus(t.ID)) && !killed {
+		if err := transitionIntentState(t.Store, intent.ID, "running", "open"); err != nil {
+			log.Printf("[worker %s] task %s 意图 #%d 服务停止回退失败: %v", name, t.ID, intent.ID, err)
+		} else {
+			_ = t.Store.SetIntentStopReason(intent.ID, db.IntentStopShutdown)
+		}
+		log.Printf("[worker %s] task %s 意图 #%d 因服务停止回到 open（恢复后重新领取）", name, t.ID, intent.ID)
+		e.touch(t.ID)
+		return true
+	}
 	// killed by the planner: mark stopped (don't write back results, don't auto-reclaim).
 	if killed {
 		if err := transitionIntentState(t.Store, intent.ID, "running", "stopped"); err != nil {
@@ -1384,6 +1698,16 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	state := "done"
 	stopReason := ""
 	switch {
+	case errors.Is(workCause, agent.AbortIdleStop) || errors.Is(err, agent.AbortIdleStop):
+		// 无增量自动收场（issue #2）：方向探到边界，不是失败也不是完成。
+		state = "exhausted"
+		stopReason = db.IntentStopIdleStop
+		log.Printf("[worker %s] intent %d 无增量自动收场(exhausted/idle_stop)，本次写回 %s", name, intent.ID, wrote)
+	case reason == harness.ReasonStopHookPrevented:
+		// Stop hook 路径的收场（模型不再调工具后触发）——同样记 idle_stop。
+		state = "exhausted"
+		stopReason = db.IntentStopIdleStop
+		log.Printf("[worker %s] intent %d 无增量自动收场(exhausted/idle_stop，Stop hook)，本次写回 %s", name, intent.ID, wrote)
 	case err != nil:
 		state = "blocked"
 		stopReason = db.IntentStopError
@@ -1412,6 +1736,41 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		}
 	}
 	log.Printf("[worker %s] task %s 意图 #%d 结束: %s (写回 %s)", name, t.ID, intent.ID, state, wrote)
+	// 意图墙钟遥测（v0.4.27）：wall_ms 落 intent payload，planner 的 compactIntents
+	// 会带上它——「这条方向烧了多久」在图上可审计，不再只活在 activity 里。
+	if err := t.Store.MergeIntentPayload(intent.ID, map[string]any{
+		"wall_ms":  time.Since(runStart).Milliseconds(),
+		"terminal": state,
+	}); err != nil {
+		log.Printf("[worker %s] task %s 意图 #%d 墙钟遥测落库失败: %v", name, t.ID, intent.ID, err)
+	}
+	// B2:exhausted 且零写回 = 「烧了一整轮、没留下任何事实/资产/漏报」。这不是普通
+	// 收场——把该方向的最近几步摘要随 review 触发发给 planner,让他复盘落 fact
+	// (血缘 derived_from 指向该意图),而不是让这段尝试就此蒸发。放在终态落库之后:
+	// ActivityTraceTailTerminalIntent 只对终态意图可见。
+	if state == "exhausted" && wrote.Total() == 0 {
+		var tail string
+		if acts, aErr := t.Store.ActivityTraceTailTerminalIntent(intent.ID, 3); aErr == nil && len(acts) > 0 {
+			parts := make([]string, 0, len(acts))
+			for _, a := range acts {
+				s := strings.TrimSpace(a.Summary)
+				if s == "" {
+					s = strings.TrimSpace(a.Tool)
+				}
+				if s == "" {
+					s = strings.TrimSpace(a.Kind)
+				}
+				// 单步摘要截到 ~200 字节,3 步也不至于把触发块撑爆。
+				if len(s) > 200 {
+					s = s[:200]
+				}
+				parts = append(parts, s)
+			}
+			tail = strings.Join(parts, "；")
+		}
+		t.NotifyReview(intent.ID, tail)
+		log.Printf("[worker %s] task %s 意图 #%d exhausted 零写回,已请求复盘 review", name, t.ID, intent.ID)
+	}
 	e.touch(t.ID)
 	t.NotifyDone(intent.ID) // results changed the graph -> wake the planner (with the just-finished intent id)
 	return true
@@ -1517,10 +1876,42 @@ func sleepCtx(ctx context.Context, d time.Duration) (done bool) {
 
 func (e *Engine) claimNext(t *Task, name string) *db.Node {
 	fr, _ := t.Store.Frontier(20)
+	// 串行前置闸门（默认关）：带 requires_intents 的意图须等全部前置进入终态。
+	gate := intentRequiresGateFromPG(e.m.pg)
 	for _, in := range fr {
+		if gate && e.intentRequiresPending(t, in) {
+			continue
+		}
 		if ok, _ := t.Store.ClaimIntent(in.ID, name); ok {
 			return in
 		}
 	}
 	return nil
+}
+
+// intentRequiresPending 判断意图的 requires_intents 里是否还有未进入终态的前置。
+func (e *Engine) intentRequiresPending(t *Task, in *db.Node) bool {
+	var p struct {
+		Requires []int64 `json:"requires_intents"`
+	}
+	if len(in.Payload) == 0 {
+		return false
+	}
+	if err := json.Unmarshal(in.Payload, &p); err != nil || len(p.Requires) == 0 {
+		return false
+	}
+	states, err := t.Store.NodeStates(p.Requires)
+	if err != nil {
+		return false // 查询失败不阻塞领取（闸门是可选优化）
+	}
+	for _, id := range p.Requires {
+		st, ok := states[id]
+		if !ok {
+			return true // 前置不存在（被删）→ 视为未终结，避免在断链上跑
+		}
+		if st != "done" && st != "failed" && st != "deleted" && st != "met" {
+			return true
+		}
+	}
+	return false
 }

@@ -3,7 +3,11 @@ package report
 import (
 	"encoding/json"
 
+<<<<<<< ours
 	"github.com/Autumn-27/artex/db"
+=======
+	"github.com/Autumn-27/artex/db"
+>>>>>>> theirs
 )
 
 // GoalLine 是报告里的一个任务目标及其达成情况（v0.6.31）。

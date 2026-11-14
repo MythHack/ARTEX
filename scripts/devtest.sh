@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # devtest.sh — 全量测试（真 PostgreSQL）一键跑：Docker 起 PG → 新鲜 pojun_ci 库 →
-# POJUN_PG_DSN=... go test -p 1 ./... -count=1。
+# ARTEX_PG_DSN=... go test -p 1 ./... -count=1。
 #
 # 为什么必须新鲜库：测试里有固定名 fixture（唯一键），共享库连跑多轮会撞键产生假失败。
 # 为什么 -p 1：跨包并行会死锁（AGENTS.md §1）。
@@ -20,7 +20,7 @@ fail() { echo "[devtest] $*" >&2; exit 1; }
 
 # 1) Docker 可用性
 docker version --format '{{.Server.Version}}' >/dev/null 2>&1 \
-  || fail "Docker 不可用（需要本机 Docker Desktop/daemon 在跑）。也可手工起库后直接设 POJUN_PG_DSN 跑 go test。"
+  || fail "Docker 不可用（需要本机 Docker Desktop/daemon 在跑）。也可手工起库后直接设 ARTEX_PG_DSN 跑 go test。"
 
 # 2) 容器：不存在→创建；存在未跑→启动；跑着→复用
 if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
@@ -55,4 +55,4 @@ fi
 PKGS=("$@")
 if [ ${#PKGS[@]} -eq 0 ]; then PKGS=(./...); fi
 echo "[devtest] go test -p 1 ${PKGS[*]} -count=1  (DSN=pojun_ci@127.0.0.1:$PORT)"
-POJUN_PG_DSN="$DSN" go test -p 1 "${PKGS[@]}" -count=1
+ARTEX_PG_DSN="$DSN" go test -p 1 "${PKGS[@]}" -count=1

@@ -93,6 +93,7 @@ func (s *Server) vulnintelStatus(w http.ResponseWriter, r *http.Request) {
 	running, startedAt := m.VulnIntelSyncState()
 	st["sync_running"] = running
 	st["sync_started_at"] = startedAt
+	st["sync_phase"] = m.SyncPhase()
 	st["next_tick_hint"] = "定时同步每 6 小时一轮（启动后约 90 秒跑第一轮）"
 	st["nuclei"] = nucleiTemplatesStatus(m.nucleiDir)
 	writeJSON(w, 200, st)
@@ -255,10 +256,23 @@ func (s *Server) vulnintelSyncNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.m.SyncVulnIntelNow() {
-		writeErr(w, 409, "已有一轮同步在进行中")
+		writeErr(w, 409, "已有一轮同步在进行中（可点「中断」后再发起）")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"accepted": true})
+}
+
+// vulnintelSyncCancel 中断当前同步轮（v0.3.96：此前一轮最长 45 分钟且无法中断，
+// 卡住时用户只能干等）。协作式取消：ctx 贯穿 NVD/GHSA 请求与 nuclei git 子进程。
+func (s *Server) vulnintelSyncCancel(w http.ResponseWriter, r *http.Request) {
+	if pg := s.pg(w); pg == nil {
+		return
+	}
+	if !s.m.CancelVulnIntelSync() {
+		writeErr(w, 409, "当前没有在跑的同步轮")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"cancelling": true})
 }
 
 // --- 连通性诊断 ---

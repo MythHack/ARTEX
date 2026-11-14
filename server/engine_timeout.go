@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+
+	"github.com/Autumn-27/artex/intercept"
 	"fmt"
 	"log"
 	"strconv"
@@ -36,15 +38,23 @@ const (
 // ---------- settling 状态 ----------
 
 func (e *Engine) isSettling(taskID string) bool {
-	v, _ := e.settling.Load(taskID)
-	b, _ := v.(bool)
-	return b
+	_, ok := e.settling.Load(taskID)
+	return ok
 }
 
-// markSettling flips settling on; returns true only for the first caller.
-func (e *Engine) markSettling(taskID string) bool {
-	_, loaded := e.settling.LoadOrStore(taskID, true)
+// markSettling records the settle reason; returns true only for the first caller.
+func (e *Engine) markSettling(taskID, reason string) bool {
+	if reason == "" {
+		reason = "timeout"
+	}
+	_, loaded := e.settling.LoadOrStore(taskID, reason)
 	return !loaded
+}
+
+func (e *Engine) settleReason(taskID string) string {
+	v, _ := e.settling.Load(taskID)
+	s, _ := v.(string)
+	return s
 }
 
 // ---------- 在跑计数(worker.Execute + planner.Plan),用于 drain ----------
@@ -89,12 +99,20 @@ func (e *Engine) taskDeadline(t *Task) int64 {
 	return 0
 }
 
-// resetTimeoutRevival clears only the per-run timeout state after PostgreSQL has
-// atomically committed timeout -> running and reset first_run_at/deadline_at. The
-// configured TimeoutSeconds remains on Task, so the next real Planner/Worker run
-// stamps a fresh full budget. coordStarted is reset because the coordinator that
-// produced the timeout has already completed (or is in its final return path).
-func (e *Engine) resetTimeoutRevival(taskID string) {
+// resetTerminalRevival clears per-run state after PostgreSQL has atomically
+// committed <terminal status> -> running and reset first_run_at/deadline_at.
+// The configured TimeoutSeconds remains on Task, so the next real Planner/Worker
+// run stamps a fresh full budget. coordStarted is reset because the coordinator
+// that settled the previous run has already completed (or is in its final return
+// path) — a revived task must get a live coordinator again, otherwise its new
+// deadline would never be enforced.
+//
+// Covers every terminal status (timeout / done / failed), not just timeout:
+// reviving a "done" task hours after its original deadline used to leave an
+// expired deadline_at behind, and the restarted coordinator settled the revived
+// task within seconds — silently swallowing the human follow-up intent (task 13,
+// 2026-11-05: follow-up #7470 created 16:36:16, final wrap-up round 16:36:17).
+func (e *Engine) resetTerminalRevival(taskID string) {
 	e.settling.Delete(taskID)
 	e.deadline.Delete(taskID)
 	e.stamped.Delete(taskID)
@@ -125,26 +143,21 @@ func (e *Engine) stampFirstRun(t *Task) {
 // clockCtx layers the task's TaskClock (absolute deadline) onto a run's context so
 // worker/planner can clamp their wall-clock budget and pick per-run vs task-timeout
 // wrap-up words. final marks the coordinator-driven terminal planner round.
-func (e *Engine) clockCtx(base context.Context, t *Task, final bool) context.Context {
+func (e *Engine) clockCtx(base context.Context, t *Task, final bool, reason string) context.Context {
 	dl := e.taskDeadline(t)
 	if dl <= 0 && !final {
 		return base // no timeout → unchanged behavior
 	}
-	return agent.WithTaskClock(base, agent.TaskClock{DeadlineUnix: dl, Final: final})
+	return agent.WithTaskClock(base, agent.TaskClock{DeadlineUnix: dl, Final: final, FinalReason: reason})
 }
 
 // ---------- 协调器 ----------
-
-func needsNoResultCoordinator(t *Task) bool {
-	state := t.lifecycleSnapshot()
-	return t.NoResultSeconds > 0 && (state.NoResultCheckedAt == 0 || state.StopReason == db.StopReasonNoResult)
-}
 
 // startDeadlineCoordinator launches the per-task deadline timer once (idempotent).
 // Called from Run() and from the restart reload path, so non-active timeout tasks
 // still get settled after their deadline even without live planner/worker loops.
 func (e *Engine) startDeadlineCoordinator(ctx context.Context, t *Task) {
-	if t == nil || (t.TimeoutSeconds <= 0 && !needsNoResultCoordinator(t)) {
+	if t == nil || t.TimeoutSeconds <= 0 {
 		return
 	}
 	e.deleteMu.RLock()
@@ -152,75 +165,85 @@ func (e *Engine) startDeadlineCoordinator(ctx context.Context, t *Task) {
 		e.deleteMu.RUnlock()
 		return
 	}
-	token := new(int)
-	if _, loaded := e.coordStarted.LoadOrStore(t.ID, token); loaded {
+	if _, loaded := e.coordStarted.LoadOrStore(t.ID, true); loaded {
 		e.deleteMu.RUnlock()
 		return
 	}
 	rt := e.registerTaskRoutines(ctx, t.ID, 1)
 	e.deleteMu.RUnlock()
-	runTaskRoutine(rt, func(loopCtx context.Context) {
-		defer func() {
-			// A terminal task may be revived while this routine is returning. Only
-			// remove our own marker, then ensure that revival has a coordinator.
-			if e.coordStarted.CompareAndDelete(t.ID, token) && loopCtx.Err() == nil && !e.isSettling(t.ID) && !isTerminalStatus(e.m.TaskStatus(t.ID)) {
-				e.startDeadlineCoordinator(ctx, t)
-			}
-		}()
-		e.deadlineCoordinator(loopCtx, t)
-	})
+	runTaskRoutine(rt, func(loopCtx context.Context) { e.deadlineCoordinator(loopCtx, t) })
 }
 
-// deadlineCoordinator watches both the absolute deadline and the one-shot active
-// runtime checkpoint. Only the absolute deadline keeps counting through pauses.
+// deadlineCoordinator waits until the task's absolute deadline, then runs the settle
+// sequence. Absolute wall-clock: it keeps counting through pauses.
 func (e *Engine) deadlineCoordinator(ctx context.Context, t *Task) {
 	for {
-		if ctx.Err() != nil || isTerminalStatus(e.m.TaskStatus(t.ID)) {
+		select {
+		case <-ctx.Done():
 			return
+		default:
 		}
-		state := t.lifecycleSnapshot()
-		if state.NoResultCheckedAt > 0 && state.StopReason == db.StopReasonNoResult {
-			// Recover a committed failed checkpoint interrupted during settling.
-			e.settleTask(ctx, t, db.StopReasonNoResult)
-			return
+		if isTerminalStatus(e.m.TaskStatus(t.ID)) {
+			return // already finished (goals met / failed) — nothing to time out
 		}
-		nap := deadlineMaxSleep
-		if dl := e.taskDeadline(t); dl > 0 {
-			remaining := time.Until(time.Unix(dl, 0))
-			if remaining <= 0 {
-				e.settleTask(ctx, t, "")
+		dl := e.taskDeadline(t)
+		if dl <= 0 {
+			if sleepCtx(ctx, deadlinePollInterval) { // not yet stamped (task hasn't really run)
 				return
 			}
-			nap = min(nap, remaining)
-		} else if t.TimeoutSeconds > 0 {
-			nap = deadlinePollInterval
+			continue
 		}
-		if t.NoResultSeconds > 0 && state.NoResultCheckedAt == 0 {
-			remaining := noResultRemaining(t.NoResultSeconds, state, time.Now().Unix())
-			if remaining <= 0 {
-				stop, err := e.checkNoResultCheckpoint(t)
-				if err != nil {
-					log.Printf("[no-result] task %s 检查失败: %v", t.ID, err)
-					nap = deadlinePollInterval // DB errors never count as zero findings.
-				} else if stop {
-					e.settleTask(ctx, t, db.StopReasonNoResult)
-					return
-				}
-			} else {
-				nap = min(nap, remaining)
+		if remaining := time.Until(time.Unix(dl, 0)); remaining > 0 {
+			nap := remaining
+			if nap > deadlineMaxSleep {
+				nap = deadlineMaxSleep
 			}
+			if sleepCtx(ctx, nap) {
+				return
+			}
+			continue
 		}
-		if t.TimeoutSeconds <= 0 && (t.NoResultSeconds <= 0 || t.lifecycleSnapshot().NoResultCheckedAt > 0) {
-			return
-		}
-		if sleepCtx(ctx, nap) {
-			return
+		e.settleTask(ctx, t)
+		return
+	}
+}
+
+// taskGoalProgress 返回本任务目标的达成数与总数（无目标时 0/0，视为无需证明）。
+func taskGoalProgress(t *Task) (met, total int) {
+	if t == nil || t.Store == nil {
+		return 0, 0
+	}
+	goals, err := t.Store.ListByKind(db.KindGoal, 1000)
+	if err != nil {
+		return 0, 0
+	}
+	for _, g := range goals {
+		total++
+		if g.State == "met" {
+			met++
 		}
 	}
+	return met, total
+}
+
+// settleTerminalStatus 计算收尾终态（红队版 v0.6.31 下放）。
+//
+// 语义：只有「目标全部达成」才允许 done；存在未达成目标时，无论收尾原因是什么
+// （超时 / 自动空转 / 覆盖度 / 轮数上限），终态一律 timeout——UI 据此显示
+// 「未完成」，而不是把做了一半的任务标成完成。totalGoals==0 的任务沿用旧语义。
+func settleTerminalStatus(allGoalsMet bool, reason string, finalRoundMet bool) string {
+	if !allGoalsMet {
+		return "timeout"
+	}
+	if reason == "timeout" && !finalRoundMet {
+		return "timeout"
+	}
+	return "done"
 }
 
 // checkNoResultCheckpoint serializes the decision with terminal transitions and
 // revival. Once marked, later findings cannot reverse the decision.
+// （RuoJi6 无成果止损嫁接进 Pojun reason 架构：命中即以 StopReasonNoResult 收尾。）
 func (e *Engine) checkNoResultCheckpoint(t *Task) (bool, error) {
 	e.m.taskStateMu.Lock()
 	defer e.m.taskStateMu.Unlock()
@@ -259,18 +282,42 @@ func (e *Engine) checkNoResultCheckpoint(t *Task) (bool, error) {
 }
 
 // settleTask runs the ordered settle sequence once (§4 steps ①–⑥).
-func (e *Engine) settleTask(ctx context.Context, t *Task, reason string) {
-	if !e.markSettling(t.ID) {
+func (e *Engine) settleTask(ctx context.Context, t *Task) {
+	e.settleTaskWithReason(ctx, t, "timeout", "到达任务超时上限")
+}
+
+// settleTaskWithReason 是统一收尾入口。reason:
+//   - timeout      任务绝对 deadline（终态 met?done:timeout）
+//   - goal_met     planner 明确判定目标达成且无在跑意图（不再跑终局轮，直接 done）
+//   - auto_idle / auto_coverage / auto_rounds 程序化自动收尾（终态 done）
+func (e *Engine) settleTaskWithReason(ctx context.Context, t *Task, reason, detail string) {
+	if !e.markSettling(t.ID, reason) {
 		return
 	}
-	log.Printf("[deadline] task %s 进入收尾时序,原因=%s", t.ID, reason)
-
+	t.clearSettle()
+	label := reason
+	switch reason {
+	case "timeout":
+		label = "到达超时上限"
+	case "goal_met":
+		label = "planner 判定目标达成且无在跑意图"
+	case "auto_idle", "auto_coverage", "auto_rounds":
+		label = "自动收尾：" + detail
+	case db.StopReasonNoResult:
+		label = "无成果止损：运行满设定时长且达标漏洞数不足"
+	}
+	log.Printf("[settle] task %s 进入收尾（%s）", t.ID, label)
+	if reason != "timeout" {
+		e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+			Summary: fmt.Sprintf("自动收尾：%s", detail)})
+	}
 	// ④ 等在跑 worker/planner drain(在跑 run 因夹逼的 MaxDuration 自行进收尾);
 	// 超过 grace 仍未清空 → 硬 cancel 该任务 exec ctx(settling-aware 分支正确归类)。
 	hardStop := time.Now().Add(settleDrainGrace)
 	for e.inflightCount(t.ID) > 0 {
 		if time.Now().After(hardStop) {
-			log.Printf("[deadline] task %s drain 超时(%s),硬取消在跑 run", t.ID, settleDrainGrace)
+			log.Printf("[settle] task %s drain 超时(%s),硬取消在跑 run", t.ID, settleDrainGrace)
+			// 无成果止损停车的任务，drain 硬取消原因要归到 no-result（终态归类与统计）。
 			cause := agent.AbortSettleDrainTimeout
 			if reason == db.StopReasonNoResult {
 				cause = agent.AbortNoResultStop
@@ -284,27 +331,40 @@ func (e *Engine) settleTask(ctx context.Context, t *Task, reason string) {
 		}
 	}
 
-	// ⑤ 终局一轮 planner(任务超时词,最后目标判定,不产新意图)。
-	met := e.runFinalPlannerRound(ctx, t, reason)
+	// ⑤ 终局一轮 planner。goal_met 已经是 planner 的最终判定，不再多跑一轮；
+	// timeout 用超时收尾词，自动收尾用“按策略收尾”词。
+	met := reason == "goal_met"
+	if reason != "goal_met" {
+		met = e.runFinalPlannerRound(ctx, t, reason)
+	}
 	if !e.beginTaskOperation(t.ID) {
 		return
 	}
 	defer e.decInflight(t.ID)
 
-	// ⑥ 定终态(带守卫):met → done(completed);否则 timeout。若常规路径已先落 done,
-	// 守卫(SetTaskStatusGuarded)会拒绝覆盖,保留 completed 语义。
-	status := "timeout"
-	if met {
-		status = "done"
+	// ⑤′ 落终态前点名缺报告的漏洞（终局后不再派 worker，只能提示人补齐）。
+	e.warnFindingsWithoutReport(t)
+
+	// ⑥ 定终态(带守卫)：只有「目标全部被证明达成」才算 done。
+	// 红队版 v0.6.31 下放：自动收尾（idle/coverage/轮数）与 goal_met 在目标未达成时
+	// 一律落 timeout，由界面显示「未完成·已停止」——旧的「自动收尾统一 done」正是
+	// 「只做了一部分却显示完成」的来源。
+	metGoals, totalGoals := taskGoalProgress(t)
+	allGoalsMet := totalGoals == 0 || metGoals >= totalGoals
+	status := settleTerminalStatus(allGoalsMet, reason, met)
+	if status == "timeout" && !allGoalsMet {
+		log.Printf("[settle] task %s 目标未全部达成(%d/%d)，终态记 timeout（未完成）而非 done", t.ID, metGoals, totalGoals)
 	}
-	won, err := e.m.SetTaskStatusGuardedReason(t.ID, status, reason)
+	won, err := e.m.SetTaskStatusGuarded(t.ID, status)
 	switch {
 	case err != nil:
-		log.Printf("[deadline] task %s 落终态失败: %v", t.ID, err)
+		log.Printf("[settle] task %s 落终态失败: %v", t.ID, err)
 	case won:
-		log.Printf("[deadline] task %s 收尾完成,终态=%s", t.ID, status)
+		log.Printf("[settle] task %s 收尾完成,终态=%s（%s）", t.ID, status, label)
+		e.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+			Summary: fmt.Sprintf("任务收尾完成：%s；终态 %s", label, status)})
 	default:
-		log.Printf("[deadline] task %s 收尾时已是终态,保留原状态", t.ID)
+		log.Printf("[settle] task %s 收尾时已是终态,保留原状态", t.ID)
 	}
 }
 
@@ -328,19 +388,24 @@ func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task, reason strin
 		}
 		planner, _ = e.snapshotFor(t)
 	}
-	// 独立 ctx(不挂 execCancel,避免 pause/硬 cancel 打断这最后一轮),带 Final 注入任务超时词。
-	fctx := e.clockCtx(ctx, t, true)
+	// 独立 ctx(不挂 execCancel,避免 pause/硬 cancel 打断这最后一轮),带 Final 注入
+	// 收尾词：timeout 用任务超时词，自动收尾用“按策略结束”词。
+	fctx := e.clockCtx(ctx, t, true, reason)
+	fctx = intercept.WithAutopilot(fctx, t.AutopilotEnabled) // 自主推进提示词尾巴（settle 轮）
 	if !e.beginTaskOperation(t.ID) {
 		return false
 	}
 	defer e.decInflight(t.ID)
 	emit := func(r db.Activity) { e.emitActivity(t, r) }
 	label := "任务超时收尾"
-	if reason == db.StopReasonNoResult {
+	switch {
+	case reason == db.StopReasonNoResult:
 		label = "无成果止损收尾"
+	case reason != "timeout":
+		label = fmt.Sprintf("自动收尾(原因 %s)", reason)
 	}
-	e.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
-		Summary: fmt.Sprintf("%s·终局判定(第 %d 轮)", label, e.nextPlannerRound(t.ID))})
+	summary := fmt.Sprintf("%s·终局判定(第 %d 轮)", label, e.nextPlannerRound(t.ID))
+	e.emitActivity(t, db.Activity{Worker: "planner", Kind: "round", Summary: summary})
 	tTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
 	// 终局轮与普通规划轮同款墙钟护栏：fctx 是无 deadline 的 server 根 ctx，而

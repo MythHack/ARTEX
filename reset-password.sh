@@ -8,7 +8,7 @@
 #
 # 两种部署：
 #   local （默认）—— 宿主机直接用 psql 连数据库。连接信息按以下优先级获取：
-#                    命令行参数 > --dsn/$POJUN_PG_DSN > config.json 的 database.*
+#                    命令行参数 > --dsn/$ARTEX_PG_DSN > config.json 的 database.*
 #   docker        —— 通过 `docker compose exec`（或 `docker exec`）在 postgres
 #                    容器内执行 psql（compose 默认不对宿主暴露 5432，故走容器内）。
 #
@@ -112,7 +112,7 @@ apply_config_fields() {
 
 # ---- 自动判定模式 ---------------------------------------------------------
 if [[ -z "$MODE" ]]; then
-  if [[ -n "$DSN$HOST$USER$DBNAME" || -n "${POJUN_PG_DSN:-}" || -f "${CONFIG:-config.json}" ]]; then
+  if [[ -n "$DSN$HOST$USER$DBNAME" || -n "${ARTEX_PG_DSN:-}" || -f "${CONFIG:-config.json}" ]]; then
     MODE="local"
   elif command -v docker >/dev/null 2>&1 && [[ -f docker-compose.yml ]]; then
     MODE="docker"
@@ -132,13 +132,13 @@ fi
 [[ -n "$NEWPASS" ]] || die "密码不能为空"
 
 # 通过环境变量把密码交给 psql（\getenv 读取，不进入 argv/ps）
-export POJUN_RESET_NEWPASS="$NEWPASS"
+export ARTEX_RESET_NEWPASS="$NEWPASS"
 
 # 库内生成 bcrypt 并 upsert；密码用 :'newpw' 自动转义。CREATE EXTENSION 幂等，
 # 若数据库角色无建扩展权限会在此报错（提示见下方 run 的失败分支）。
 SQL=$(cat <<SQL
 \\set ON_ERROR_STOP on
-\\getenv newpw POJUN_RESET_NEWPASS
+\\getenv newpw ARTEX_RESET_NEWPASS
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 INSERT INTO settings(key, value)
 VALUES ('$PASS_KEY', crypt(:'newpw', gen_salt('bf', $BCRYPT_COST)))
@@ -148,9 +148,9 @@ SQL
 
 # ---- 执行 -----------------------------------------------------------------
 if [[ "$MODE" == "local" ]]; then
-  # 连接信息优先级：命令行 > --dsn/$POJUN_PG_DSN > config.json
+  # 连接信息优先级：命令行 > --dsn/$ARTEX_PG_DSN > config.json
   if [[ -z "$DSN" && -z "$HOST$USER$DBNAME" ]]; then
-    [[ -n "${POJUN_PG_DSN:-}" ]] && DSN="$POJUN_PG_DSN"
+    [[ -n "${ARTEX_PG_DSN:-}" ]] && DSN="$ARTEX_PG_DSN"
   fi
   if [[ -z "$DSN" && -z "$HOST$USER$DBNAME" ]]; then
     cfg="${CONFIG:-config.json}"
@@ -219,10 +219,10 @@ else
   # -e 只带名字不带值 → 从当前环境继承，密码不出现在 docker 命令 argv 里。
   declare -a EXEC_CMD
   if [[ "$EXEC_KIND" == "compose" ]]; then
-    EXEC_CMD=(docker compose exec -T -e POJUN_RESET_NEWPASS -e PGPASSWORD "$CONTAINER"
+    EXEC_CMD=(docker compose exec -T -e ARTEX_RESET_NEWPASS -e PGPASSWORD "$CONTAINER"
               psql -U "$DUSER" -d "$DNAME" -v ON_ERROR_STOP=1 -q)
   else
-    EXEC_CMD=(docker exec -i -e POJUN_RESET_NEWPASS -e PGPASSWORD "$CONTAINER"
+    EXEC_CMD=(docker exec -i -e ARTEX_RESET_NEWPASS -e PGPASSWORD "$CONTAINER"
               psql -U "$DUSER" -d "$DNAME" -v ON_ERROR_STOP=1 -q)
   fi
 
@@ -231,5 +231,5 @@ else
   fi
 fi
 
-unset POJUN_RESET_NEWPASS
+unset ARTEX_RESET_NEWPASS
 echo "✓ 已重置 POJUN 管理员密码。请用用户名 POJUN + 新密码登录（无需重启服务）。"

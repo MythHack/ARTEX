@@ -8,9 +8,9 @@
 #     再撑大 1–2GB；装完写标记文件，重启不重复；
 #   - 「系统 → 宿主环境」页可随时查看/补装（走常驻 hostd）。
 # 环境变量：
-#   POJUN_PREINSTALL_TOOLS=0   关闭首次启动预装
-#   POJUN_PREINSTALL_TOOLS=1   默认：首次启动后台预装
-#   POJUN_PREINSTALL_TOOLS=force  强制重跑（升级 binary 后想重新核对工具时用）
+#   ARTEX_PREINSTALL_TOOLS=0   关闭首次启动预装
+#   ARTEX_PREINSTALL_TOOLS=1   默认：首次启动后台预装
+#   ARTEX_PREINSTALL_TOOLS=force  强制重跑（升级 binary 后想重新核对工具时用）
 set -u
 
 HOSTD_SOCK="/run/pojun/hostd.sock"
@@ -34,7 +34,7 @@ if [ -x /app/pojun-hostd ]; then
   fi
 
   # ── 首次启动后台预装 catalog 全量工具（幂等；失败项可在宿主环境页重试）──
-  mode="${POJUN_PREINSTALL_TOOLS:-1}"
+  mode="${ARTEX_PREINSTALL_TOOLS:-1}"
   if [ "$mode" != "0" ]; then
     if [ "$mode" = "force" ] || [ ! -f "$PREINSTALL_MARK" ]; then
       (

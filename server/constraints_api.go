@@ -6,8 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Autumn-27/artex/db"
-)
+	"github.com/Autumn-27/artex/db")
 
 // 总览「约束管理」的人工 CRUD 接口 + 注入范围开关的解析。操作约束(allow/deny)与 agent 侧的
 // set_constraints 工具写同一张 task_constraints 表;这里是人类在 UI 上直接增删改。约束仅是

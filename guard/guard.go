@@ -14,8 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/intercept"
-	"github.com/Autumn-27/norma/hook"
+	"github.com/Autumn-27/artex/intercept"	"github.com/Autumn-27/norma/hook"
 )
 
 // AuditEntry records one gated tool call.
@@ -32,9 +31,25 @@ type Guard struct {
 	mu          sync.Mutex
 	audit       []AuditEntry
 	attrib      map[string]int // failure attribution counts (Observer / G5)
+	attribSamps map[string][]AttribSample
 	reg         *hook.Registry
 	interceptor *intercept.Interceptor // optional; nil disables user-configured rules
 }
+
+// AttribSample 是一条 blocked/error 归因的最近样本（B6）：planner 只看计数时对不上
+// 「哪条命令被拦了」，复盘/换打法需要看实物。Command 截断到 attribSampleMax（防御
+// 超长命令刷爆态势块），TS 用 Unix 秒便于展示时间。
+type AttribSample struct {
+	Tool    string `json:"tool"`
+	Command string `json:"command,omitempty"`
+	TS      int64  `json:"ts"`
+}
+
+// attribSampleMax 每类保留的样本条数（最近）。计数仍是全量的；样本只是「最近3条」。
+const attribSampleMax = 3
+
+// attribSampleMaxBytes 单条 command 的截断长度（字节）。
+const attribSampleMaxBytes = 200
 
 // New creates a Guard without user-configured intercept rules (used for pentest
 // tasks where the Interceptor is not yet available).
@@ -44,7 +59,7 @@ func New() *Guard { return newGuard(nil) }
 func NewWithInterceptor(ic *intercept.Interceptor) *Guard { return newGuard(ic) }
 
 func newGuard(ic *intercept.Interceptor) *Guard {
-	g := &Guard{attrib: map[string]int{}, interceptor: ic}
+	g := &Guard{attrib: map[string]int{}, attribSamps: map[string][]AttribSample{}, interceptor: ic}
 	g.reg = hook.NewRegistry().
 		On(hook.PreToolUse, g.preToolUse).
 		On(hook.PostToolUse, g.postToolUse)
@@ -74,8 +89,13 @@ func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
 		_ = json.Unmarshal(ev.Input, &in)
 		cmd = in.Text
 	}
-	g.record(ev.ToolName, "allow", "", cmd)
-	return g.applyIntercept(ctx, ev)
+	// 审计只留一条：被拦截的调用由 block() 记 "block"，这里不再先记 "allow"，
+	// 否则同一次调用在审计里既像放行又像拦截，复盘时无法区分。
+	res := g.applyIntercept(ctx, ev)
+	if res.Decision != "block" {
+		g.record(ev.ToolName, "allow", "", cmd)
+	}
+	return res
 }
 
 // applyIntercept evaluates user-configured intercept rules against the tool call.
@@ -146,7 +166,7 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 	return hook.Result{}
 }
 
-// systemBlockMessage frames an intercept block as an ARTEX platform-governance
+// systemBlockMessage frames an intercept block as an POJUN platform-governance
 // decision so the agent does not mistake it for a target-side defense.
 //
 // The bare reasons ("禁止执行此工具" / "用户拒绝") read exactly like a WAF/403 on
@@ -159,7 +179,7 @@ func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
 // Audit/history rows keep the raw reason (see Interceptor.Log); only the
 // model-facing tool_result carries this framing.
 func systemBlockMessage(reason string) string {
-	return "【ARTEX 平台管控·非目标防御】此调用被平台拦截。" +
+	return "【POJUN 平台管控·非目标防御】此调用被平台拦截。" +
 		"原因：" + reason + "。此操作被禁止。"
 }
 
@@ -181,6 +201,22 @@ func (g *Guard) postToolUse(_ context.Context, ev hook.Event) hook.Result {
 	}
 	g.mu.Lock()
 	g.attrib[class]++
+	// B6:只留 blocked/error 的实物样本,ok 不占内存。每类环形保留最近 3 条。
+	if class != "ok" {
+		var input struct {
+			Command string `json:"command"`
+		}
+		_ = json.Unmarshal(ev.Input, &input)
+		cmd := input.Command
+		if len(cmd) > attribSampleMaxBytes {
+			cmd = cmd[:attribSampleMaxBytes]
+		}
+		samps := append(g.attribSamps[class], AttribSample{Tool: ev.ToolName, Command: cmd, TS: time.Now().Unix()})
+		if len(samps) > attribSampleMax {
+			samps = samps[len(samps)-attribSampleMax:]
+		}
+		g.attribSamps[class] = samps
+	}
 	g.mu.Unlock()
 	return hook.Result{}
 }
@@ -192,6 +228,29 @@ func (g *Guard) Attributions() map[string]int {
 	out := make(map[string]int, len(g.attrib))
 	for k, v := range g.attrib {
 		out[k] = v
+	}
+	return out
+}
+
+// AttributionStats (B6) 是 Attributions 的态势版：计数之外附每类最近样本
+// （samples."blocked"/"error" = [{tool,command,ts}...]，最多 3 条，command 截断）。
+// planner 看到「blocked×7 + 最近命令列表」就能对上号换打法，而不是只知道「被拦了」。
+// 供 graph_overview 的 guard_attributions 块直插使用。
+func (g *Guard) AttributionStats() map[string]any {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make(map[string]any, len(g.attrib)+1)
+	for k, v := range g.attrib {
+		out[k] = v
+	}
+	samps := make(map[string]any, len(g.attribSamps))
+	for k, v := range g.attribSamps {
+		if len(v) > 0 {
+			samps[k] = v
+		}
+	}
+	if len(samps) > 0 {
+		out["samples"] = samps
 	}
 	return out
 }

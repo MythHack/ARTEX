@@ -14,6 +14,11 @@ import (
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
+<<<<<<< ours
+=======
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/intercept"
+>>>>>>> theirs
 )
 
 // Planner is the event-driven LLM planner (docs §4.3): each time the asset or
@@ -21,6 +26,7 @@ import (
 // assets, judges whether the task goal is met, and emits 0..N exploration intents
 // into the frontier. It is the sole intent generator.
 type Planner struct {
+<<<<<<< ours
 	findingRecorder   FindingRecorder
 	prov              llm.Provider
 	model             string
@@ -41,6 +47,33 @@ type Planner struct {
 	noaEnabledFn      func() bool   // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn       func() int    // resolver: per-reply output cap (nil/0 = send no cap)
 	compactor         *Compactor    // cold-node compaction (§7); nil = disabled
+=======
+	// intentQueue 返回 (派发阈值, worker 数)；nil = 不限制。
+	intentQueue func() (int, int)
+	findingRecorder FindingRecorder
+	// 授权边界守卫开关（v0.4.63）：装配时从设置读取，传到 ToolSet。
+	scopeGuard           bool
+	scopeInheritWrites   bool
+	crossTaskNotifyDedup bool
+	prov                 llm.Provider
+	model                string
+	tx                   *transcript.Store                      // raw LLM conversation persistence (nil = off)
+	window               int                                    // context window in tokens (for compaction)
+	windowFn             func() int                             // optional dynamic task-chain minimum
+	maxTurns             int                                    // max agent turns per run (0 = unlimited)
+	killWork             func(intentID int64) error             // engine callback to terminate a running work (nil = off)
+	steerWork            func(intentID int64, msg string) error // engine callback to steer a running work mid-run (nil = off)
+	attributions         func() map[string]any                  // Guard 归因读取（nil = 概览不带 guard_attributions 块）
+	proxyAddr            string                                 // recording proxy for WebFetch (empty = direct)
+	proxyCACert          string                                 // recording proxy's CA cert path (HTTPS verify)
+	webSearch            WebSearchOpts                          // web_search tool backend selection (off by default)
+	workDir              string                                 // shared work dir (surfaced in prompt as artifact-output target)
+	injectConstraints    func() bool                            // resolver: inject task operation constraints into system prompt? (nil = yes)
+	nonStreamingFn       func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
+	noaEnabledFn         func() bool                            // resolver: use experimental noa compaction? (nil = off)
+	maxTokensFn          func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
+	compactor            *Compactor                             // cold-node compaction (§7); nil = disabled
+>>>>>>> theirs
 
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
 	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
@@ -52,6 +85,12 @@ type Planner struct {
 
 func NewPlanner(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int) *Planner {
 	return &Planner{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, todos: map[int64]*actool.TodoStore{}}
+}
+
+func (p *Planner) SetScopeFlags(scopeGuard, scopeInheritWrites, crossTaskNotifyDedup bool) {
+	p.scopeGuard = scopeGuard
+	p.scopeInheritWrites = scopeInheritWrites
+	p.crossTaskNotifyDedup = crossTaskNotifyDedup
 }
 
 func (p *Planner) SetCompactionWindowResolver(fn func() int) { p.windowFn = fn }
@@ -103,6 +142,9 @@ func (p *Planner) SetWebSearch(o WebSearchOpts) { p.webSearch = o }
 // settings toggle takes effect without rebuilding the agent. nil = inject (default).
 func (p *Planner) SetConstraintInject(fn func() bool) { p.injectConstraints = fn }
 
+// SetIntentQueueLimit 安装派发阈值 resolver（nil = 不限制）。
+func (p *Planner) SetIntentQueueLimit(fn func() (int, int)) { p.intentQueue = fn }
+
 // wantConstraints reports whether constraint injection is enabled (default yes).
 func (p *Planner) wantConstraints() bool { return p.injectConstraints == nil || p.injectConstraints() }
 
@@ -129,7 +171,7 @@ func (p *Planner) SetSteerWork(fn func(intentID int64, msg string) error) { p.st
 
 // SetAttributions wires the per-task Guard failure-attribution reader so
 // graph_overview can carry guard_attributions (blocked/error 计数 → planner 换打法).
-func (p *Planner) SetAttributions(fn func() map[string]int) { p.attributions = fn }
+func (p *Planner) SetAttributions(fn func() map[string]any) { p.attributions = fn }
 
 // renderPlannerTodos formats the persistent planning todo for injection into the
 // wake-up prompt (empty when there are no todos yet — first wake-up).
@@ -162,6 +204,8 @@ func renderPlannerTodos(items []actool.Todo) string {
 //	"goal_edited"  — the human edited a goal from 总览的目标管理 (OldGoal→NewGoal 文本).
 //	"cancelled" — the human deleted intent IntentID (Detail = 删除原因). The intent is
 //	            stopped (not deleted) and the reason is attached to it as a fact.
+//	"review"   — intent IntentID ended exhausted with ZERO write-back (B2:「烧了一整轮
+//	            却什么都没留下」). Detail = 该方向最近几步的实动作摘要，事件自带复盘指令。
 type TriggerEvent struct {
 	Kind     string
 	IntentID int64
@@ -203,6 +247,18 @@ func renderTriggers(ts *db.ExplorationStore, evs []TriggerEvent) string {
 			b.WriteString(fmt.Sprintf("\n- 人修改了目标，由「%s」变为「%s」—— 请据新目标调整探索方向（原方向若已不适用请停派）。", ev.OldGoal, ev.NewGoal))
 		case "finding":
 			b.WriteString(fmt.Sprintf("\n- 意图 #%d（%s）的 worker 报告了一个 finding：%s", ev.IntentID, intentSummary(ts, ev.IntentID), ev.Detail))
+		case "coverage_gap":
+			// 引擎侧覆盖矩阵提醒（server/coverage_nudge.go）：某一类漏洞至今没有
+			// 任何意图覆盖。不是模型自己的判断，是确定性检查的结果，优先级高。
+			b.WriteString("\n- " + ev.Detail)
+		case "depth_gap":
+			// 引擎侧纵深缺口提醒（server/depth_nudge.go）：资产已多、高危 finding 为 0，
+			// 要求停止铺面、把已验证线索打穿成 L3 证据。确定性检查，优先级高于普通观察。
+			b.WriteString("\n- " + ev.Detail)
+		case "autopilot_stall":
+			// 自主推进看门狗：只催促推进，不算「新方向」（不进 freshDirection，
+			// 因此不会重置 auto_finish 的 idle 计数）。
+			b.WriteString(fmt.Sprintf("\n- 自主推进：%s 本轮必须给出一个推进动作：派新意图、换方向重试、或补证据验证；不得以「探索完毕/信息不足」收场。", ev.Detail))
 		case "cancelled":
 			// 意图内容优先用删除时捕获的 Summary（真删除后节点已不存在，intentSummary 查不到）。
 			sm := ev.Summary
@@ -210,6 +266,14 @@ func renderTriggers(ts *db.ExplorationStore, evs []TriggerEvent) string {
 				sm = intentSummary(ts, ev.IntentID)
 			}
 			b.WriteString(fmt.Sprintf("\n- 意图 #%d 由用户删除，意图内容是：%s、删除原因是：%s。该意图已删除（不再执行）；请据此重新规划。", ev.IntentID, sm, ev.Detail))
+		case "review":
+			// B2：exhausted 且零写回。指令内嵌在事件文本里（不为此加长 planner 种子提示词）；
+			// 步骤摘要缺失时给出主动复盘的替代路径，不让指令变得空手。
+			tail := strings.TrimSpace(ev.Detail)
+			if tail == "" {
+				tail = "（步骤摘要缺失，可用 get_worker_trace 拉取该意图的执行轨迹）"
+			}
+			b.WriteString(fmt.Sprintf("\n- 意图 #%d（%s）撞上限收场，但这轮没有写回任何东西（事实 0 / 资产 0 / 漏报 0）。它最近几步的实际动作是：%s。请勿直接丢弃这段尝试：把「试过什么、为何无效」写进后续意图的 hypothesis（值得接续时），或派一条复盘/换向量的意图让 worker 落成 fact；你是只读规划者，不要自己找写类工具。然后再判断这个方向还值不值得派。", ev.IntentID, intentSummary(ts, ev.IntentID), tail))
 		default: // "done"
 			b.WriteString(fmt.Sprintf("\n- 意图 #%d（%s）的 worker 结束，输出结论：%s", ev.IntentID, intentSummary(ts, ev.IntentID), workerOutput(ts, ev.IntentID)))
 			// stop_reason 同步带出（B1）：exhausted=手段穷尽可接续、blocked=传输故障可重试、
@@ -321,7 +385,12 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 1. **完整态势已附在本提示下方**（就是 graph_overview 的返回，无需再调它）：task（原始标题+目标/根节点）、资产计数、goals+状态、open/running/recent_done 意图、frontier_open、sites_without_endpoints（无端点的站点，提示可能待探的方向）、facts（探索事实数，与漏洞是两类）、findings_total、recent_facts（{id,summary,confidence?}）、finding_list、recent_done_intents、coverage（有覆盖度统计时）、stall（收官态势）、cold_digests（冷区折叠摘要，expand_digest 展开）、guard_attributions（工具调用归因计数：blocked 高=目标在防——WAF/拦截规则在打回，继续同款打法是烧 token，换向量/换手段/先写意图明确绕行思路；error 高=工具或环境在坏，先诊断再派）。
    - **范围**：探索节点（goals/意图/facts/findings）只含本任务；**资产默认按任务隔离**（仅本任务及明确关联任务；用户开启「共享全局资产」后可查询全库，资产计数也随之反映共享范围）——出现非本任务相关的资产时忽略。
 2. **判目标（核心职责）**：goals 字段已含目标与状态；对已被某发现/事实证明的未达成目标，调 prove_goal(goal_id, evidence_id, reason) 标 met。**当你标记的恰是最后一个未完成目标时，系统自动判定整个任务完成**——收官只由逐个 prove_goal 驱动，没有别的"一键完成"手段。
+<<<<<<< ours
    - ⚠️ **量化验收核对（严禁提前盖章）**：目标含可量化条件（覆盖度达 X%、达到指定数量/拿 N 个 flag、获得某权限）时，prove_goal 前【必须】核对上方 graph_overview 的实测值（coverage.pct、findings_total 计数等）：未达标就【禁止】prove_goal，改派意图补差；不得以"大体达成/核心已拿下"为由提前标 met。例：要求覆盖度 100% 而实测 coverage.pct=40% → 未达成，继续派补测意图。
+=======
+   - ⚠️ **量化验收核对（严禁提前盖章）**：目标含可量化条件（覆盖度达 X%、拿 N 个 flag、获得某权限）时，prove_goal 前【必须】核对上方 graph_overview 的实测值（coverage.pct、findings_total 计数等）：未达标就【禁止】prove_goal，改派意图补差；不得以"大体达成/核心已拿下"为由提前标 met。例：要求覆盖度 100% 而实测 coverage.pct=40% → 未达成，继续派补测意图。
+   - **独立复现（critical/high 必配，借鉴 pentest-ai 的 machine oracle）**：recent_facts/漏洞里出现 critical/high、但证据仅来自单一 worker、**没有独立复验事实**（换入口/换参数/换会话/换身份重新触发一次并写回 fact）时，派一条**只做复现、不扩大**的验证意图；已有独立复验事实的不重复派。复现失败 → 把严重性降级并写清原因，不许保留 critical/high。
+>>>>>>> theirs
    - **边际收益收官(目标模糊型任务)**：态势里 stall.hint 出现（连续多轮零新产出、无 open 意图）且目标描述中没有更多可量化缺口——用 goal_met 收官，reason 写「边际收益已耗尽：最近 6 小时无新 fact/finding,已覆盖 <列已测的主要面>」这类诚实小结,【不许】编造达成证据。收官比无产出空转更负责——空转每轮都在烧 token。
 
 3. **（可选，仅开局、极轻量）探测理解**：仅当图里几乎还没有 fact（recent_facts 基本为空、任务刚开始）、仅凭态势无法把初始意图说具体时，才用 Bash 等对目标做极少量、只读的探测（如 1–2 次 curl 看首页/指纹）。**唯一合法产物是一句更精准的意图描述**——绝不是漏洞的发现/验证/利用，也不是端点/目录/参数的枚举结果（那些是 worker 的活，写成意图派下去）。三条硬边界：
@@ -348,15 +417,32 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
    - **深度优先于覆盖度（把原语打穿成实质危害，不刷同源重复项）**：coverage 是下限/验收项、不是探索目标本身；发现高价值入口或未闭环原语（如盲上传但尚无读回链、伪造回调返回 success 但未验证订单状态翻转、投诉工单存在性 Oracle 但尚未读出内容）后，优先派意图把那条路【往深打穿】验证真实危害，而不是为拉平覆盖度去给同一根因（如同源站 catch-all 的 /metrics）找新宿主重复刷数量。若规划者自身直接调 report_finding，同样必须传 cwe_id 与按已实证危害填写的 cvss_vector。
    - **深度与广度的仲裁（别摇摆）**：发现高价值入口后，允许把该入口的纵深派到 2 条以内（主线+绕行），此时新覆盖面意图暂停一轮；若该入口两轮无增量（stall 口径），恢复铺广铺覆盖。以「两轮无增量」为切换信号，不是凭感觉切换。
    - **【已知面】与【未知面】是两条不同的线，别只打一条**：「已知面」= 查情报库拿现成 CVE（search_vulns / search_recent_critical）——快、收益确定；「未知面」= 从目标自身行为里挖没公开过的漏洞（越权、逻辑缺陷、竞态、状态机绕过、资源假设错误）——慢、但常常是唯一能拿高价值的那条。当目标是「拿到高危漏洞/权限」这类、且已知面已经挖不动时，**应该往未知面派一条意图**。派这类意图前先看 vuln-hunting skill（有七个维度的挖掘方法论与每类手法的验证要点）——不要自己现编一个「试试越权」的模糊意图，那多半挖不到东西。
+   - **【数据面扩展】意图族（v0.4.34）**：发现一个未授权/越权数据端点后，不要急着换目标——先派 1–2 条意图把它所在前缀的兄弟只读端点、分页全量、导出接口取干净（summary 写清端点族与时间窗/上限，例如"把 /mgr/test/* 全部只读端点按时间窗取全量并登记证据"）；报告/fact 里写了"具备某能力面但本轮未取到数据"的（如 akRegisterRecord 类），下一轮应优先派意图补取。非破坏铁律不变：写/删/改/发消息类端点只验证存在性、不触发；大批量取数要限速。
+   - **【异常是线索，不是机制】**（v0.4.30，借鉴 PentestGPT supervisor 纪律重写）：某个异常响应、可疑参数、版本差异只是【线索】——最多派 1 条【有界】验证意图（summary 写清"只验证 X，看到 Y 算成立"），在同一条假设未决前，不要按"每个可疑点各派一条"铺开；同一目标面最多再加 2 个判别对照（换参数位 / 换身份 / 换方法），照不出差异就记 fact 收手、把线索交下轮。
+   - **失败不原样重派**（借鉴 hackingBuddyGPT AD planner 纪律）：同一方向连续 2 次以**相同错误特征** blocked（同一 403/同一超时/同一 WAF 拦截），第三条不再原样重派——必须换实现路径（换工具/换协议/换入口/换身份），或在 summary 里写明与上次的本质差异；写不出差异就不要派。
+   - **时间军规 / 升级阶梯（v0.4.35，借鉴 sapper-v2 竞赛军规）**：每条意图的 wall_ms 已在态势里。单条方向**累计 > 25 分钟且连续两轮零新增** → 不再接续，必须换本质不同的打法或换目标面；**> 45 分钟**仍未突破 → 直接放弃该方向并在 fact 里记录"已试穷尽+失败特征"，把资源转给未覆盖面；同一目标面被 park 后，除非有新证据（新 fact/凭据/入口），否则不再重开。**最后 1/4 时间预算**（任务带 deadline 时）优先收官：补齐已确认漏洞的证据与报告，不再开新长链。
+   - **同族迁移（variant hunting，v0.4.35，借鉴 sapper-v2 情报广播）**：确认一个漏洞后 30 秒内自问——**同一产品/同版本/同框架/同资产族的其他地方是否同款？** 同族线索（同厂商组件、同网关后的 mib-*/同类测试控制器前缀、同 CMS 的其他站点、同批子域）优先派 1–2 条 variant 意图去验证同一机理；把已确认的 PoC/路径/参数写进 summary 作为可复用线索。variant 意图必须锚定 task_scope 内资产，不得借同族迁移越界。
    - **保持路线多样、别过早收敛**：目标未达成时，若现有意图都挤在同一条路线/入口，而存在【本质不同】的未覆盖方向（另一入口面/另一类资产/另一条利用链），优先补那条分歧方向，而不是在同一线上加同义意图（看实质差异，不看措辞）；若该分歧方向已被现有意图覆盖，仍不生成。理想是 2–3 条机理不同的路线并存（如"从上传链打"与"从认证绕过打"），某条交出【目标逼近】的证据后才把资源集中过去。**但多样性永远服从顶部【操作约束】**：被约束排除的入口面/端口/主机/操作，即使本质不同也绝不生成意图。
 
    **串行利用链：分步派，别拆成并行。** 强依赖串行链（①→②→③，后一步依赖前一步的实际产出）：不要一次性并行下发（下游拿不到还不存在的前置只会重复/空转）；用 TodoWrite 把整条链记成待办（每步一条），本轮只派"前置已满足"的那步（通常第一步），待它产出 fact 后下次唤醒（提示会带上待办清单）再派下一步并把已满足的标 completed。"同一件事"别拆两条（"确认触发点"和"触发触发点"是同一步）；只有【平行、互不依赖】的维度（如枚举多个不相关端点）才用多意图并行。
+
+   - **⚠️ 意图粒度硬规则（v0.4.44）**：
+     · 每条意图的 summary **必须是一个具体的、可执行的子步骤**——worker 拿到后知道第一步做什么。
+     · **严禁**把任务 description / goal / 总目标文本原封不动或稍作包装后当作意图 summary——add_intent 会拒绝这类复读，即使绕过闸门，worker 收到也等于收到整个任务、不知道做什么。
+     · **开局（无 fact）第一轮必须产出 3–5 条具体意图**，覆盖初始阶段的不同维度（如「DNS 解析+子域名枚举」「端口扫描+服务识别」「HTTP 指纹+未授权探测」「已知组件 CVE 匹配」），每条写清对哪个目标做什么。
+     · 反面示例：「完成任务目标：对 XX 进行完整渗透测试…」 ← 这是复读不是意图。
+     · 正面示例：「对 sxxyxyy.com 做子域名枚举（字典+证书透明度），产出子域名清单写回资产」 ← 这才是可执行的具体步骤。
 
 5. **提交**：用【一次】add_intent 批量提交筛出的新方向（intents 数组，最多 4 个最高价值的，不要逐条多次调）：
    - **summary**：一句话自然语言描述该方向（测试目标完整地址 + 做什么 + 为什么），不套固定分类；去重主要靠它与已有意图比对。
    - **asset_ids**：本方向要测试/攻击的目标资产 id（尽量传，0/1/多个，来自 list_assets）——只要方向围绕具体资产（站点/接口/参数/主机）就务必传，用于覆盖去重、连入资产链路，跨多资产就都传；纯全局侦察无具体资产才留空。
    - **parent_ids**：本方向由哪些上游节点综合得出（可选，0/1/多个）——多个事实结合产生一个意图就都传，派生自某上游意图/发现也传其 id，顶层全新方向留空。
-   - **priority**（0-10，决定 worker 领单顺序，frontier 按它降序）：**别全默认 5**——直接逼近目标的利用链步=8-10；新入口面的首次探明=6-7；补覆盖/复核=3-4；纯情报/背景=1-2。同轮多意图按价值区分，高价值链不与补测意图同权排队。
+   - **priority**（0-10，决定 worker 领单顺序，frontier 按它降序）：**别全默认 5**。评分按四个可核对维度加权（v0.4.30，TDA 难度感知评分，借鉴 Excalibur 论文四维、自译）：
+     ① **视野**（离目标还差几步）：已是最后一步=9-10；还需两步=7-8；方向未定=≤5；
+     ② **证据置信**（依据的 fact 可靠度）：observed=高分、inferred=中、纯猜测=低（降 2-3 分）；
+     ③ **历史成功率**：同类方向/同类资产在本任务里 done 且零产出的占比高 → 降 2-3 分（别把资源再倒进已证明没东西的面）；
+     ④ **上下文负载**：需要大量既有事实才能起步的长链方向适当降分，优先短链快验。
+     同轮多意图按价值区分，高价值链不与补测意图同权排队。
    - **hypothesis / success_criteria**（可选但强烈建议）：hypothesis=本方向的假设（依据哪条 fact 的什么推测，引用 fact id）；success_criteria=怎么算成了/没成（期望拿到的 fact/finding 形态）。写得出来，worker 就有了 definition of done，你下轮判「有没有产出」也有了对照锚。
    - **坏意图示例（对照着别这么写）**：①「再深入探测 admin 面看看有什么」——无地址、无依据、无产出承诺，worker 拿到只能盲扫；②「针对 #14 的 SQL 注入复核」——与 done 意图同措辞、零增量承诺，换措辞不算新方向。
 
@@ -364,7 +450,8 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 
 func plannerSystem(goal, dataDir, workDir string) string {
 	body := renderSystem("planner", plannerDefaultTmpl, PlannerVars{Goal: goal, DataDir: dataDir, Now: nowStr()})
-	return body + artifactSpec(workDir)
+	// 作业硬尾巴（v0.4.63）：漏洞覆盖矩阵/纵深优先 + 授权边界复核。
+	return body + artifactSpec(workDir) + coverageMatrixPlannerGuidance + scopeVerifyPlannerGuidance + execFacePlannerGuidance
 }
 
 // Plan runs one planning round. emit, if non-nil, receives the planner's execution
@@ -383,6 +470,10 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	p.compactor.OnPlannerRound(ctx, ts)
 	tsx := NewToolSet(ts, "planner")
 	tsx.SetFindingRecorder(p.findingRecorder)
+	tsx.SetScopeFlags(p.scopeGuard, p.scopeInheritWrites, p.crossTaskNotifyDedup)
+	if p.intentQueue != nil {
+		tsx.SetIntentQueueLimit(p.intentQueue)
+	}
 	if as != nil {
 		tsx.SetAssetStore(as, as.Companies())
 	}
@@ -404,12 +495,19 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// 只留静态规划正文。move-out 让 system 每轮稳定、更利于缓存；代价是若单轮变长，态势可能
 	// 被 compaction 压缩（planner 单轮通常短，风险低）。situational 会拼进下方 input。
 	situational := renderTriggers(ts, triggers) + renderGraphOverview(tsx.graphOverviewData())
+	// 积压治理（v0.4.68）：把排太久/前提疑似失效的 open 意图摆到本轮输入，要求裁决。
+	// 只提示不自动杀——退役要由模型写原因，保留可追溯性。
+	situational += renderBacklogHygiene(ts)
 	// 任务级 deadline / 终局模式(经 ctx 注入,见 taskclock.go)。终局那一轮把任务超时
 	// planner 收尾词作为【本轮操作指令】拼进本轮 user 输入(随 situational),让它只做最后
 	// 目标判定、不产新意图。
 	tc := taskClockFrom(ctx)
 	if tc.Final {
-		situational += "\n\n【任务终局收尾（本轮特殊指令，覆盖上面的常规规划流程）】：" + resolveTaskTimeoutWrapup("planner")
+		words := resolveTaskTimeoutWrapup("planner")
+		if tc.FinalReason != "" && tc.FinalReason != "timeout" {
+			words = AutoFinishWrapup("planner", tc.FinalReason)
+		}
+		situational += "\n\n【任务终局收尾（本轮特殊指令，覆盖上面的常规规划流程）】：" + words
 	}
 	// 本任务的工作目录 <workDir>/tasks/<taskID>，先建好。
 	taskDir := ensureRunDir(p.workDir, taskID, 0)
@@ -417,6 +515,14 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	sysBody := plannerSystem(goal, p.workDir, taskDir)
 	if p.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,框定探索边界
+	}
+	// 自主推进：完成优先（目标未达成不得以「边际收益」收场）。
+	sysBody += autopilotTail(ctx, autopilotPlannerGuidance)
+	// 派发节奏（v0.4.68）：本轮新增上限 + 退役护栏说明。
+	if p.intentQueue != nil {
+		limit, workers := p.intentQueue()
+		active, _ := ts.CountActiveIntents()
+		sysBody += pacingPlannerGuidance(limit, workers, active)
 	}
 	system, boundary := deferredSystem(sysBody, def)
 	// planner 无自身墙钟预算;有 deadline 时把 MaxDuration 夹逼到剩余,让在跑的规划轮在

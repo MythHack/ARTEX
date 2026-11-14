@@ -30,6 +30,10 @@ func TemplatesDir(dataDir string) string {
 // proxy 是可选出网代理(http/https/socks5，空=直连)。模板树在 github.com，
 // 国内/校园网直连必然超时——不传代理时这里只能报 clone failed，所以调用方要用
 // 平台配置的「装机代理/全局代理」喂进来，跟拉更新走同一条出口。
+//
+// 自愈语义（v0.3.96）：clone/pull 失败时清理半成品目录——git 中断残留的 .git
+// 空壳会让目录「存在但没有模板」，状态页永远显示 0 个模板且无法自愈（Kali 实测）。
+// 成功后校验 yaml 模板数 >0，空树同样按失败清理，下一轮重clone。
 func EnsureTemplates(ctx context.Context, dir, proxy string) error {
 	env := append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_HTTP_LOW_SPEED_LIMIT=1000", "GIT_HTTP_LOW_SPEED_TIME=30")
 	if proxy != "" {
@@ -45,9 +49,17 @@ func EnsureTemplates(ctx context.Context, dir, proxy string) error {
 		cmd.Env = env
 		out, err := cmd.CombinedOutput()
 		if err != nil {
+			// 拉取失败分两类：网络/超时（目录留着下次再 pull）；仓库本身损坏
+			// （pull 反复失败永远修不好，删掉重 clone 才是自愈）。这里保守处理：
+			// 只有目录里一个 yaml 都没有时才视为损坏并清理。
+			if CountTemplates(dir) == 0 {
+				os.RemoveAll(dir)
+				return fmt.Errorf("nuclei templates pull 失败且目录无模板（已清理残留，等下轮重 clone）: %v: %s",
+					err, strings.TrimSpace(string(out)))
+			}
 			return fmt.Errorf("nuclei templates pull: %v: %s", err, strings.TrimSpace(string(out)))
 		}
-		return nil
+		return verifyTemplates(dir)
 	}
 	// Directory already exists without .git (e.g. extracted from zip or nuclei -ut):
 	// initialize git in-place and fast-forward to origin/main so it becomes a true
@@ -71,16 +83,30 @@ func EnsureTemplates(ctx context.Context, dir, proxy string) error {
 	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "git", "clone", "--depth", "1", "--quiet",
+	cmd := exec.CommandContext(ctx, "git", "clone", "--depth", "1", "--single-branch", "--quiet",
 		"https://github.com/projectdiscovery/nuclei-templates.git", dir)
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("nuclei templates clone: %v: %s", err, strings.TrimSpace(string(out)))
+		// clone 失败必留半成品（.git 或部分工作树）——不清理的话下一轮看到 .git
+		// 就走 pull 分支，对着残缺仓库 pull，永远修不好（Kali 实测挂了 14 小时）。
+		os.RemoveAll(dir)
+		return fmt.Errorf("nuclei templates clone（残留已清理，等下轮重试）: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return verifyTemplates(dir)
+}
+
+// verifyTemplates 克隆/拉取成功后的内容校验：模板树一个 yaml 都没有 = 无效
+// （网络代理返回了错误页、磁盘满等场景产出过空工作树），按失败清理。
+func verifyTemplates(dir string) error {
+	if n := CountTemplates(dir); n == 0 {
+		os.RemoveAll(dir)
+		return fmt.Errorf("nuclei templates 校验失败：目录无 yaml 模板（已清理残留，等下轮重试）")
 	}
 	return nil
 }
 
+<<<<<<< ours
 func hasAnyYAMLTemplate(dir string) bool {
 	if _, err := os.Stat(filepath.Join(dir, ".templates-index")); err == nil {
 		return true
@@ -97,6 +123,22 @@ func hasAnyYAMLTemplate(dir string) bool {
 		return nil
 	})
 	return found
+=======
+// CountTemplates 递归统计目录下的 .yaml 模板文件数（.yaml，不含 .yml——
+// nuclei-templates 仓库全部用 .yaml）。
+func CountTemplates(dir string) int {
+	n := 0
+	filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil // 不可读的子树跳过，不中断统计
+		}
+		if !d.IsDir() && strings.EqualFold(filepath.Ext(path), ".yaml") {
+			n++
+		}
+		return nil
+	})
+	return n
+>>>>>>> theirs
 }
 
 // NucleiInstalled reports whether the nuclei binary is on PATH.

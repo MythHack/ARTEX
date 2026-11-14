@@ -9,8 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-)
+	"github.com/Autumn-27/artex/db")
 
 // LogLine is one captured backend log entry exposed by the /api/logs endpoints.
 type LogLine struct {

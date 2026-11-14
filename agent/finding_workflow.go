@@ -4,11 +4,37 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/Autumn-27/artex/db"
 	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Autumn-27/artex/db"
 )
 
 const findingIDGuidance = "\n\n**漏洞编号约定**：finding_id 是独立漏洞记录 ID；finding_node_id 是探索节点 ID。list_findings / list_task_findings / node_detail / get_task_node_detail 的 id 保留为探索节点 ID，应从同一返回的 finding_id 读取独立编号。get_finding_traffic / bind_finding_traffic 用独立 finding_id。旧 update_finding_report 的 finding_id 参数仍传 finding_node_id。不要把 report_finding 第一行的数字用于证据工具，也不要遇到编号错误后猜测其他数字。"
+
+// evidenceDisciplineGuidance 证据分级与上报门槛（借鉴 Shannon 的 L1–L4 证据
+// 阶梯与"安全机制 vs 外部约束"判定问句，v0.4.5）。放在 tool guidance 里而不是
+// DB prompt：升级即生效，且不覆盖用户自己编辑过的 agent prompt。
+const evidenceDisciplineGuidance = `
+
+**证据分级与上报门槛（report_finding 之前先自查）**：
+- 证据分四级：L1 接口有响应、参数被后端处理；L2 证明输入真实影响了后端逻辑（引号闭合、条件差异、报错差异）；L3 真实影响达成（数据外带、越权读到他人数据、命令执行回显、登录绕过）；L4 关键影响（全量数据、系统接管）。
+- **只有达到 L3 才允许报 critical / high**；L2 最多报 medium，并在 evidence 写明利用条件；L1 不报漏洞，记进 TodoWrite 存疑项。
+- 被挡住时先问一句：**挡住你的是"安全机制"（输入校验、权限判定、框架/ORM 防护、参数化查询），还是"外部运维约束"（网关、WAF、IP 白名单、组件未部署、网络隔离）？** 安全机制挡住 = 不是漏洞（顶多写加固建议），不要上报；外部约束挡住 = 可以上报，但 evidence 必须写明该前置条件，severity 按"绕过该约束后实际能拿到什么"评估并注明。
+- 观察 ≠ 推断：evidence 只写你**亲眼看到的**请求/响应原文与命令输出；从响应里"推断出"的结论写进 summary 或分析，不能当作证据。
+- severity 自查：给 critical / high 之前自问"最终谁受损、攻击者拿到了什么本不该拿的东西？"如果理由里出现"需要管理员配合 / 影响有限 / 本来就能看到"，那就不该评高危——**你的理由不能反驳你的定级**。critical 只留给：无权限或零前置，直接拿到敏感数据或执行命令。`
+
+// reporterEvidenceAnnex 报告结构补充（只在 reporter 上注入，v0.4.5 起）。
+const reporterEvidenceAnnex = `
+
+**报告结构补充**：
+- 在「复现步骤」之后加 ` + "`## 前置条件`" + `：复现所需账号/权限/网络位置/特殊配置；确实没有写“无”。
+- 加 ` + "`## 影响证明`" + `：用编号逐条列出“已实际达成的可验证影响”（例：读出 2731 条用户数据含身份证号、接管 admin 会话），每条对应证据出处；这是严重度的依据，不写推测。
+- ` + "`## 证据`" + ` 只放亲眼看到的原文（请求/响应/命令输出）；推断写进 ` + "`## 根因分析`" + `，不得混入证据。
+- 小节标题只写“缺陷是什么、在哪”，**不写后果**，不用“可能存在 / 疑似 / 理论上”等措辞。
+- 某些验证因环境限制未执行（无内网、无账号、组件不可达）时，在报告末尾加 ` + "`## 未验证范围`" + ` 如实说明；无法验证的部分不得写成已确认。
+- 登记的 severity 与你的判断不一致时，在「影响与危害」中写“建议复核为 X 级”并说明理由，**不得擅自改写登记值**。
+- 现场截图：先用 ` + "`list_artifacts`" + ` 查本任务证据附件（reporter 没有任务上下文，调用时**必须带上当前 finding_id**，例如 ` + "`list_artifacts {\"finding_id\": 123}`" + `，工具会反查所属任务）；把与本漏洞相关（finding_id 匹配）的图片用 ` + "`![具体说明](artifact:<id>)`" + ` 插进「证据」小节。图注写清“什么系统的什么页面、证明了什么”；不要引用无关图片，也不要在没有图片时编造。
+- **存储桶 / 文件读取 / 上传类漏洞必须有图**：如果附件里有从 bucket/接口下载的文件样本（尤其照片），「证据」小节必须嵌入（拼图或单图）；图注写明 bucket/路径、样本数量与文件名（拼图以水印为准）。只有文字描述、没有样本图片时，在「未验证范围」里如实说明“未留存文件样本证据”，不得把“能读/能访问”写成“已获取数据”。
+- **SQL 注入必须有「复测命令」小节**：给出本次 worker 实测跑通的完整 sqlmap 命令（代码块，含 --batch --flush-session、真实 URL/参数/--data/--cookie），注明预期输出（Parameter/Type/DBMS）。命令只能取自证据或执行记录，不得编造；worker 未跑 sqlmap 时，如实写“未取得 sqlmap 复测命令”，不得虚构命令。`
 
 // The server supplies the persisted setting. A missing setting/host is off.
 // Consulted at assembly and again on writes so an already-running session
@@ -44,7 +70,8 @@ func findingWorkflowTools(agentKey string, tools []actool.CoreTool) ([]actool.Co
 			}
 			out = append(out, tool)
 		}
-		return out, ""
+		// 证据纪律与流量绑定开关无关：关闭自动绑定时上报者照样要过证据门槛。
+		return out, evidenceGuidanceFor(agentKey, out)
 	}
 	out := append([]actool.CoreTool(nil), tools...)
 	has := map[string]bool{}
@@ -77,9 +104,29 @@ func findingWorkflowTools(agentKey string, tools []actool.CoreTool) ([]actool.Co
 		guidance += "\n\n**报告前自动关联流量（已开启）**：你负责为本次触发的漏洞核对并绑定流量，再撰写报告。先从 report_finding 返回 JSON 或 get_task_node_detail / list_task_findings 取得明确的 finding_id 与 finding_node_id。读取漏洞详情、对应意图的执行记录及已有证据清单，优先使用上报者交接的真实 ID。若本次验证为 HTTP 且流量工具可用，用 traffic_search 筛选候选，再用 traffic_get 逐条核实请求/响应确实支持该漏洞；域名和时间只用于筛选，不证明归属。将确认的证据按复现顺序用 bind_finding_traffic(finding_id, traffic_refs) 关联，选择 baseline / proof / verification / supporting 并说明用途。只能操作本次漏洞，不重复创建漏洞或重新探测目标。绑定成功后重新调用 get_finding_traffic 获取最新 version，读取所需正文，再将实际读取的 version 作为 evidence_version 传给 update_finding_report（其 finding_id 参数仍用 finding_node_id）。已有绑定不必重复追加。TCP、未采集、工具不可用或没有确切匹配时，跳过自动绑定，依据文字/命令证据正常写报告并说明原因，不得为凑齐流量而猜测。绑定失败不宣称成功；保留已有证据并在报告说明未绑定原因。"
 	}
 	if guidance != "" || has["get_finding_traffic"] || has["update_finding_report"] {
-		guidance += "\n\n**流量 ID 约定**：流量页面展示/复制的流量 ID 就是 traffic_search 返回的 id，也是 traffic_get(id) 和 traffic_refs[].traffic_id 使用的原始字符串。它不是列表行号，不随分页、排序或筛选变化。用户交接完整 ID 时优先直接用 traffic_get 读取并核实，不要改写、截短或猜测 ID；报告引用流量证据时保留对应完整 ID，方便从流量页面检索。" + findingIDGuidance
+		guidance += findingIDGuidance
 	}
-	return out, guidance
+	return out, guidance + evidenceGuidanceFor(agentKey, out)
+}
+
+// evidenceGuidanceFor 按 agent 实际可见的工具集拼证据纪律（上报者）与报告结构
+// 补充（reporter）。独立成函数是为了让"关闭自动流量绑定"的分支也带上纪律段。
+func evidenceGuidanceFor(agentKey string, tools []actool.CoreTool) string {
+	has := map[string]bool{}
+	for _, t := range tools {
+		has[t.Name()] = true
+	}
+	var g string
+	if has["report_finding"] || has["add_task_hint"] || has["add_hint"] {
+		g += evidenceDisciplineGuidance
+	}
+	// reporter 的报告结构补充只在它真的有写报告工具时注入：没有
+	// update_finding_report 的装配（如自动绑定关闭的测试场景）不注入，
+	// 保持"无报告工具 → 无报告指导"的契约。
+	if agentKey == "reporter" && has["update_finding_report"] {
+		g += reporterEvidenceAnnex
+	}
+	return g
 }
 
 func stripTrafficParameters(schema map[string]any) {

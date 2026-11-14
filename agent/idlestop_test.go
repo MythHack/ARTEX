@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -124,10 +125,15 @@ func TestIdleStopNudgesBeforeStopping(t *testing.T) {
 	if !strings.Contains(blocking[0], "写回") {
 		t.Errorf("提示语应说明要写回: %q", blocking[0])
 	}
-	// 提示之后还不停 → 真的收场。
-	prevent, _, msg := h.Stop(ctx, nil)
-	if !prevent {
-		t.Fatal("提示之后仍不收场，应真的终止")
+	// 提示之后还不停：再给 idleStopPreventRounds-idleStopRounds 轮写回机会，
+	// 到 prevent 轮才真的收场（v0.4.62：不再「提示后立即终止」，也不无限 block）。
+	p := false
+	var msg string
+	for i := 0; i < idleStopPreventRounds-idleStopRounds; i++ {
+		p, _, msg = h.Stop(ctx, nil)
+	}
+	if !p {
+		t.Fatalf("到 prevent 轮(%d)应真的终止", idleStopPreventRounds)
 	}
 	if msg == "" {
 		t.Error("终止时应带收场原因")
@@ -263,7 +269,7 @@ func TestIdleStopReasonExplainsWhy(t *testing.T) {
 // 措辞直接影响模型的行为：说「预算耗尽被终止」会让模型以为被惩罚，
 // 于是倾向于把没验证的猜测也写成结论。
 func TestIdleStopMessageContent(t *testing.T) {
-	for _, want := range []string{"新发现", "insert_assets", "record_fact", "不要"} {
+	for _, want := range []string{"写回", "insert_assets", "record_fact", "save_evidence", "负结果", "不要"} {
 		if !strings.Contains(idleStopMessage, want) {
 			t.Errorf("收场提示缺少 %q: %s", want, idleStopMessage)
 		}
@@ -282,3 +288,62 @@ func TestIdleStopMessageDoesNotSayBudget(t *testing.T) {
 
 // 确认 idleStopHooks 满足 harness.HookRunner 接口。
 var _ = func(h *idleStopHooks) harness.HookRunner { return h }
+
+// v0.4.62（issue #2）：提示后仍无写回，到 prevent 轮必须 cancel run context——
+// 只 block 工具调用的话模型会逐轮跟 hook 辩论烧 token（线上实测单意图被拦到
+// 「连续 20 轮」，journal 2583 条收场日志）。
+func TestIdleStopCancelsRunAfterPreventRounds(t *testing.T) {
+	fw := &fakeWrites{}
+
+	var cancelled []error
+	h := wrapIdleStop(nil, fw.get, func(string) {}, func(err error) { cancelled = append(cancelled, err) })
+	ageStopper(h.stop, time.Hour) // 越过起跑宽限期（age 必须作用在 hooks 实际用的 stopper 上）
+
+	// 推进到 nudge 轮（rounds==idleStopRounds）：第一次 PreToolUse 应 block 并提示。
+	for i := 0; i < idleStopRounds; i++ {
+		h.PostToolUse(context.Background(), "Bash", nil, nil, false)
+	}
+	block, msg, _ := h.PreToolUse(context.Background(), "Bash", nil)
+	if !block || !strings.Contains(msg, "写回") {
+		t.Fatalf("nudge 轮应提示写回: block=%v msg=%q", block, msg)
+	}
+	if len(cancelled) != 0 {
+		t.Fatalf("nudge 轮不应 cancel")
+	}
+
+	// 提示后再无写回，推进到 prevent 轮：应 cancel(AbortIdleStop)。
+	for i := idleStopRounds; i < idleStopPreventRounds; i++ {
+		h.PostToolUse(context.Background(), "Bash", nil, nil, false)
+	}
+	_, _, _ = h.PreToolUse(context.Background(), "Bash", nil)
+	if len(cancelled) == 0 {
+		t.Fatalf("到 prevent 轮(%d)应 cancel run context", idleStopPreventRounds)
+	}
+	if !errors.Is(cancelled[0], AbortIdleStop) {
+		t.Fatalf("cancel cause 应为 AbortIdleStop，实际 %v", cancelled[0])
+	}
+}
+
+// 提示后写回 → 计数重置，不再 cancel（给模型留写回机会）。
+func TestIdleStopWriteAfterNudgeResets(t *testing.T) {
+	fw := &fakeWrites{}
+	s := newIdleStopper(fw.get)
+	ageStopper(s, time.Hour)
+
+	var cancelled []error
+	h := wrapIdleStop(nil, fw.get, func(string) {}, func(err error) { cancelled = append(cancelled, err) })
+
+	for i := 0; i < idleStopRounds-1; i++ {
+		h.PostToolUse(context.Background(), "Bash", nil, nil, false)
+	}
+	h.PreToolUse(context.Background(), "Bash", nil) // nudge
+	fw.addFacts(1)                                   // 模型写回了
+	h.PostToolUse(context.Background(), "record_fact", nil, nil, false)
+	// 再推进多轮也不该 cancel（计数已重置）。
+	for i := 0; i < idleStopPreventRounds+2; i++ {
+		h.PostToolUse(context.Background(), "Bash", nil, nil, false)
+	}
+	if len(cancelled) != 0 {
+		t.Fatalf("写回后不应再 cancel: %v", cancelled)
+	}
+}

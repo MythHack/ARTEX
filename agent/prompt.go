@@ -12,21 +12,6 @@ import (
 // behavior is identical until a user edits a prompt in the UI.
 var PromptOverride func(agentKey string) (string, bool)
 
-// OpsecEnabled is wired by the server to the persisted global setting. Keeping
-// the block here makes it a code-owned runtime tail: database-edited prompts
-// cannot accidentally remove the operational safety guidance.
-var OpsecEnabled func() bool
-
-const opsecPromptBlock = `【OPSEC 准则（硬约束，仅次于授权范围和任务操作约束）】
-
-- 先复用已有流量、浏览器会话和已验证证据；能通过 traffic_search/traffic_get 或浏览器完成时，不要重复直接请求。
-- 所有目标交互必须经过平台配置的记录代理或浏览器工具，确保请求可追溯。
-- 不得使用裸 curl、urllib、requests 等工具的默认请求头直接访问目标。命令行请求必须尽量复用目标已有流量中的 User-Agent、Accept、Referer、Cookie 等请求特征；没有真实依据时不要伪造身份、设备或浏览器指纹。
-- 不得使用 -k、--ignore-https-errors、verify=False 等方式绕过证书校验；平台代理 CA 已配置时应正常验证。
-- 不得随机轮换 User-Agent、批量并发、快速循环、无节制重试、端口横扫、目录爆破或大规模扫描；遇到限速、验证码、WAF 或异常响应时立即停止当前方向。
-- OPSEC 不扩大授权范围；目标、主机、端口、路径或账号不在授权范围内时不得访问。
-- 请求和响应是否留痕由平台代理和浏览器负责；不要额外复制完整请求头、Cookie 或响应正文。`
-
 // Prompt-variable structs — fields mirror each agent's catalog (docs §5a) so a
 // user template referencing a catalog variable renders; referencing anything else
 // fails template execution and falls back to the built-in default.
@@ -50,6 +35,13 @@ func nowStr() string { return time.Now().Format("2006-01-02 15:04:05 MST") }
 // default template, then to the raw default string — an agent never starts with a
 // half-rendered prompt. Callers append the code-owned tail (trafficTool / 中间产物
 // 输出规约) AFTER this, so those can't be edited away via the DB body.
+// SkillIndexBlock（v0.4.60，宿主注入）：把该 agent 已绑定的 skill 索引块追加进
+// system prompt。为什么必须进 prompt 而不只是工具描述：Skill 是元工具，模型不
+// 被显式提醒就几乎不会主动调（实测 56k 次调用里 Skill 触发 8 次，任务 18 零次
+// ——与当年宿主工具"装了没用起来"同一病根，解法也同款：清单进 system prompt）。
+// 返回空串 = 该 agent 没绑技能，不加块。
+var SkillIndexBlock func(agentKey string) string
+
 func renderSystem(agentKey, def string, vars any) string {
 	tmpl := def
 	if PromptOverride != nil {
@@ -57,23 +49,18 @@ func renderSystem(agentKey, def string, vars any) string {
 			tmpl = t
 		}
 	}
+	body := def
 	if out, err := renderTmpl(tmpl, vars); err == nil {
-		if OpsecEnabled != nil && OpsecEnabled() {
-			return out + "\n\n" + opsecPromptBlock
+		body = out
+	} else if out, err := renderTmpl(def, vars); err == nil {
+		body = out
+	}
+	if SkillIndexBlock != nil {
+		if blk := SkillIndexBlock(agentKey); blk != "" {
+			body += "\n\n" + blk
 		}
-		return out
 	}
-	// DB template broke (e.g. references an out-of-catalog var) → code default.
-	if out, err := renderTmpl(def, vars); err == nil {
-		if OpsecEnabled != nil && OpsecEnabled() {
-			return out + "\n\n" + opsecPromptBlock
-		}
-		return out
-	}
-	if OpsecEnabled != nil && OpsecEnabled() {
-		return def + "\n\n" + opsecPromptBlock
-	}
-	return def
+	return body
 }
 
 func renderTmpl(tmpl string, vars any) (string, error) {

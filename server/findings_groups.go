@@ -33,13 +33,10 @@ func findingFilterFromQuery(q url.Values) db.FindingFilter {
 		Status:    normFilter(q.Get("status")),
 		VulnClass: normFilter(q.Get("vulnclass")),
 		// task_id(独立于会切到「按任务节点」分支的 task 参数):全局表按任务筛选。
-		TaskID:        normFilter(q.Get("task_id")),
-		Query:         q.Get("q"),
-		Sort:          q.Get("sort"),
-		TimeDirection: q.Get("time_direction"),
-		From:          strings.TrimSpace(q.Get("from")),
-		To:            strings.TrimSpace(q.Get("to")),
-		AssetScope:    strings.TrimSpace(q.Get("asset_scope")),
+		TaskID:     normFilter(q.Get("task_id")),
+		Query:      q.Get("q"),
+		Sort:       q.Get("sort"),
+		AssetScope: strings.TrimSpace(q.Get("asset_scope")),
 	}
 }
 
@@ -48,7 +45,7 @@ func findingFilterFromQuery(q url.Values) db.FindingFilter {
 func (s *Server) findingAssetTree(w http.ResponseWriter, r *http.Request) {
 	tree, err := s.m.pg.BuildFindingAssetTree(findingFilterFromQuery(r.URL.Query()))
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalError(w, "findings."+r.URL.Path, err)
 		return
 	}
 	writeJSON(w, 200, tree)
@@ -64,7 +61,7 @@ func (s *Server) findingGroups(w http.ResponseWriter, r *http.Request) {
 	limit := findingPaginationParam(q.Get("limit"), 10, 100)
 	groups, total, findingTotal, err := s.m.pg.ListFindingGroups(findingFilterFromQuery(q), page, limit)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalError(w, "findings."+r.URL.Path, err)
 		return
 	}
 	// PostgreSQL owns paused/queued persistence. The live engine adds the same
@@ -76,9 +73,7 @@ func (s *Server) findingGroups(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if task, ok := s.m.Task(i64s(*groups[i].TaskID)); ok {
-				state := task.lifecycleSnapshot()
-				groups[i].TaskStatus = s.resolvedTaskStatusFromSnapshot(task, state)
-				groups[i].TaskStopReason = state.StopReason
+				groups[i].TaskStatus = s.resolvedTaskStatus(task)
 			}
 		}
 	}
@@ -125,7 +120,7 @@ func (s *Server) deepenFinding(w http.ResponseWriter, r *http.Request) {
 
 	finding, err := s.m.pg.GetFinding(id)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalError(w, "findings."+r.URL.Path, err)
 		return
 	}
 	if finding == nil {
@@ -159,7 +154,7 @@ func (s *Server) deepenFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalError(w, "findings."+r.URL.Path, err)
 		return
 	}
 	queued, err := s.admitTask(t, "resume")
@@ -167,7 +162,7 @@ func (s *Server) deepenFinding(w http.ResponseWriter, r *http.Request) {
 		if rollbackErr := t.Store.DiscardOpenIntent(intentID); rollbackErr != nil {
 			err = errors.Join(err, fmt.Errorf("discard follow-up intent %d: %w", intentID, rollbackErr))
 		}
-		writeErr(w, 500, err.Error())
+		writeInternalError(w, "findings."+r.URL.Path, err)
 		return
 	}
 	// The audit row committed atomically with the intent. Publish that exact row;

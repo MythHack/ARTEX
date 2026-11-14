@@ -42,6 +42,27 @@ func assetInterceptCandidates(item assetInputItem) (domains, ips, urls []string)
 	return domains, ips, urls
 }
 
+// identityHint 把候选串压成给模型看的一行身份提示（最多 3 个）。
+func identityHint(domains, ips, urls []string) string {
+	parts := make([]string, 0, 3)
+	for _, d := range domains {
+		if len(parts) < 3 {
+			parts = append(parts, d)
+		}
+	}
+	for _, u := range urls {
+		if len(parts) < 3 {
+			parts = append(parts, u)
+		}
+	}
+	for _, ip := range ips {
+		if len(parts) < 3 {
+			parts = append(parts, ip)
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
 // assetInputLabel 返回一条待插入资产的简短标识，用于拦截说明消息。
 func assetInputLabel(item assetInputItem) string {
 	typ := strings.TrimSpace(item.Type)
@@ -200,7 +221,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 				}, "type"),
 			},
 		}, "assets"),
-		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			if t.as == nil {
 				return actool.Errorf("insert_assets 未启用: AssetStore 未初始化"), nil
 			}
@@ -252,6 +273,22 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 				typ := strings.TrimSpace(item.Type)
 				var id int64
 				var err error
+
+				// 授权边界守卫（v0.4.63）：插入/认领前先查身份——
+				// 若该资产已存在、由其他任务登记、且不在本任务自有 scope，则跳过，
+				// 防止「碰到就自动认领」把别的任务的资产悄悄拉进本任务。
+				if t.ScopeWriteGuard && taskID > 0 {
+					gd, gi, gu := assetInterceptCandidates(item)
+					if fid, owners, ferr := t.as.FindForeignAssetForTask(taskID, gd, gi, gu); ferr == nil && fid > 0 {
+						errs = append(errs, errEntry{
+							Index: i,
+							Error: fmt.Sprintf("资产 %s %s 已归属其他任务(任务 %s)且不在本任务自有范围，已跳过登记——"+
+								"防止跨任务串资产。如确属本任务授权，请先用 add_task_scope 显式纳入本任务范围后重试。",
+								assetInputLabel(item), identityHint(gd, gi, gu), owners),
+						})
+						continue
+					}
+				}
 
 				switch typ {
 				case "root_domain":
@@ -336,15 +373,6 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 				if err != nil {
 					errs = append(errs, errEntry{Index: i, Error: err.Error()})
 					continue
-				}
-				if intelligenceEnabled() && typ == "service" && taskID > 0 {
-					for _, auth := range item.Auth {
-						raw, _ := json.Marshal(auth)
-						input := db.IntelligenceInput{Kind: "credential", Title: fmt.Sprintf("服务 #%d 的认证信息", id), Content: string(raw), Evidence: fmt.Sprintf("insert_assets 上报，服务资产 #%d，来源意图 #%d", id, t.ownerNode), Confidence: "observed", Status: "unverified", AssetIDs: []int64{id}}
-						if _, err := t.saveIntelligence(ctx, 0, input); err != nil {
-							errs = append(errs, errEntry{Index: i, Error: "资产已保存，凭据情报未保存：" + err.Error()})
-						}
-					}
 				}
 				results = append(results, result{Index: i, ID: id, Type: typ})
 				t.writes.Assets++
@@ -562,7 +590,7 @@ func dslHint(errMsg string) string {
 func (t *ToolSet) listAssets() actool.CoreTool {
 	return readTool(
 		"list_assets",
-		"查询资产库：DSL 表达式搜索，或按 id/ids 直取；支持分页。默认只返回本任务及直接关联任务的资产；用户开启「共享全局资产」后可查询全局资产。\n"+
+		"查询资产库：DSL 表达式搜索，或按 id/ids 直取；支持分页。只返回【本任务及直接关联任务】测试范围内的资产。\n"+
 			"DSL：field=value 模糊(ILIKE) | field==value 精确 | field!=value 排除 | 数字字段支持 > >= < <= | 裸词=全文模糊；AND/OR 组合(AND 优先级高)，可用括号分组。资产类型用独立 type 参数，不写进 DSL。\n"+
 			"未传 id/ids 时 dsl 必须非空（不允许无条件全量查询）。\n"+
 			"可用字段：domain(根/子/服务域名)、root_domain、ip、cidr(网段，如 10.10.0.0/16)、url、page_title、icp、service_name、app_name、method(如 GET/POST)、service_type(http|other)、record_type(如 A/CNAME)、technology(数组，=模糊 ==精确)、port/status_code/company_id(整数)。\n"+
@@ -625,7 +653,7 @@ func (t *ToolSet) listAssets() actool.CoreTool {
 func (t *ToolSet) listCompanies() actool.CoreTool {
 	return readTool(
 		"list_companies",
-		"列出当前任务可见的【企业/公司】及其资产范围(scope)与可见资产数；开启共享全局资产后可查询全局企业。用于查看有哪些公司、"+
+		"列出资产库中的【企业/公司】及其资产范围(scope)与已归属资产数。用于查看有哪些公司、"+
 			"拿到 company_id（insert_assets 关联 app、list_assets 按 company_id 过滤时用）。"+
 			"可选 search 按公司名模糊过滤(不区分大小写)，留空返回全部。",
 		obj(map[string]any{
@@ -639,7 +667,7 @@ func (t *ToolSet) listCompanies() actool.CoreTool {
 				Search string `json:"search"`
 			}
 			_ = json.Unmarshal(in, &a)
-			cos, err := t.cs.ListCompaniesForTask(t.taskID)
+			cos, err := t.cs.ListCompanies()
 			if err != nil {
 				return actool.Errorf("查询公司失败: " + err.Error()), nil
 			}
@@ -683,7 +711,7 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 	return []actool.CoreTool{
 		// list_findings 保留：报漏洞前先查本任务已确认漏洞，避免重复上报同一漏洞。
 		t.listFindings(),
-		t.addFinding(), t.recordFact(), t.recordIntelligence(),
+		t.addFinding(), t.recordFact(),
 		// asset management (handlers guard nil store internally)。
 		// add_company_scope 不给 worker：定义企业资产范围属规划/主控/Auto 的职责，worker 只执行探索。
 		t.insertAssets(), t.listAssets(),
@@ -693,19 +721,45 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		t.searchAllWorkerTraces(), t.getWorkerTrace(),
 		// node_detail：worker 拿到 intent_id/节点 id 后可查该节点完整详情（配合上面的回看）。
 		t.nodeDetail(),
+		// expand_digest（v0.4.50）：worker 可以展开冷区折叠的节点完整内容——
+		// 之前 worker 只能看到 title/summary 摘要，折叠内容对 worker 不可见。
+		t.expandDigest(),
+		// list_untested_assets（v0.4.50）：worker 也应该知道哪些资产还没测——
+		// 在执行涉及资产遍历的意图时能自行补漏。
+		t.listUntestedAssets(),
+		// list_goals（v0.4.50）：worker 知道目标完成进度，有助于判断该方向值不值得继续深挖。
+		t.listGoals(),
 		// search_vulns / get_vuln：worker 识别出目标组件与版本后直接查已知漏洞与
 		// 影响区间——公开情报优先于模型现想 payload。
 		t.searchVulns(), t.getVuln(), t.getPoc(), t.scanWithNuclei(), t.netContext(),
 		// listener_*：回连接收器（红队 C2 前置）——start/stop 走 ask 审批，sessions 只读。
 		t.listenerStart(), t.listenerStop(), t.listenerSessions(),
+		// http_probe（v0.4.27）：批量探活领域工具——替代逐条手写 curl（任务 5 实测
+		// Bash 占 tool_use 57%、curl 2750 次），一次往返拿整批紧凑摘要。
+		t.httpProbe(),
+		// js_audit（v0.4.59）：SPA/webpack 前端源码泄露审计——任务 18（Vue 站点）
+		// 实测对 .js.map 泄漏完全漏检；sourcemap 还原=原始源码+密钥+接口清单。
+		t.jsAudit(),
 		// auth_request：用资产上已登记的凭据组装带认证的请求（横向/越权验证的前提）。
 		t.authRequest(),
+		// 原生 HTTP 执行器 + 会话复用（红队版 v0.7.0 下放）：直接发请求拿结构化结果，
+		// 登录态进任务级 cookie jar 跨意图复用——「登录→越权→回读」成为基本能力。
+		t.httpRequest(), t.sessionLogin(),
+		// PoC 脚手架（红队版 v0.7.0 下放）：按类别生成可运行的验证骨架。
+		t.pocScaffold(),
+		// 任务级后台作业（红队版 v0.7.0 下放）：长扫描跨意图存活。
+		t.jobStart(), t.jobStatus(), t.jobOutput(), t.jobStop(),
+		// 任务级共享脚本（红队版 v0.7.0 下放）：登录脚本/PoC 跨意图复用。
+		t.saveScript(), t.runScript(),
 		// diff_responses：对比两个响应的结构性差异（越权/可枚举/状态机三类的共同基础）。
 		t.diffResponses(),
 		// api_contract：读目标暴露的 API 契约文件，拿到比爬虫更准的接口清单。
 		t.apiContractTool(),
 		// search_recent_critical：按【时间】查最近披露的高危漏洞（不需先知道组件名/CVE 号）。
 		t.searchRecentCritical(),
+		// save_evidence / list_artifacts：证据附件（v0.5.0）——截图/数据样本/日志
+		// 落盘登记，随报告导出证据包；报告里用 ![说明](artifact:<id>) 引用。
+		t.saveEvidence(), t.listArtifacts(),
 		// 以下工具仍【不给】worker，只留给 planner/main（读上下文、跨 work 复盘是规划职责，
 		// worker 只做单条意图的执行与写回）：list_facts / list_companies / list_worker_traces。
 	}
@@ -728,18 +782,22 @@ func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 		t.setConstraints(),
 		// asset management (handlers guard nil store internally)
 		t.insertAssets(), t.addCompanyScope(), t.listAssets(),
-		t.addFinding(), t.recordFact(), t.recordIntelligence(),
+		t.addFinding(), t.recordFact(),
 		t.addTaskScope(),
 		// list_untested_assets：按需查本任务范围内未测资产(类型+分页)，自行决定补测。
 		t.listUntestedAssets(),
 		// search_vulns / get_vuln：人在环路上也可直接查公开已知漏洞情报。
 		t.searchVulns(), t.getVuln(), t.getPoc(), t.scanWithNuclei(), t.netContext(),
+		// http_probe（v0.4.27）：批量探活领域工具（mainagent 与 worker 同款）。
+		t.httpProbe(),
+		// js_audit（v0.4.59）：SPA/webpack 源码泄露审计（mainagent 与 worker 同款）。
+		t.jsAudit(),
 		// listener_*：回连接收器（红队 C2 前置）——start/stop 走 ask 审批，sessions 只读。
 		t.listenerStart(), t.listenerStop(), t.listenerSessions(),
 		// auth_request：用资产上已登记的凭据组装带认证的请求（横向/越权验证的前提）。
 		t.authRequest(),
-		// diff_responses：对比两个响应的结构性差异（越权/可枚举/状态机三类的共同基础）。
-		t.diffResponses(),
+		t.httpRequest(), t.sessionLogin(),
+		t.diffResponses(), t.diffResponses(),
 		// api_contract：读目标暴露的 API 契约文件，拿到比爬虫更准的接口清单。
 		t.apiContractTool(),
 		// search_recent_critical：按【时间】查最近披露的高危漏洞（不需先知道组件名/CVE 号）。

@@ -80,16 +80,63 @@ func (m *Manager) SyncVulnIntelNow() bool {
 	}
 	m.vulnSyncRunning.Store(true)
 	m.vulnSyncStartedAt.Store(time.Now().Unix())
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+	m.storeSyncCancel(cancel)
 	go func() {
 		defer m.vulnSyncMu.Unlock()
 		defer m.vulnSyncRunning.Store(false)
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
-		defer cancel()
+		defer m.clearSyncCancel()
 		if err := m.vulnIntelPassLocked(ctx); err != nil {
 			log.Printf("[vulnintel] 手动同步未完整完成: %v", err)
 		}
 	}()
 	return true
+}
+
+// storeSyncCancel / clearSyncCancel / CancelVulnIntelSync / SyncPhase：
+// 「可中断的同步」三件套（v0.3.96）。此前一轮最长跑 45 分钟且零中断路径，
+// 卡住时用户既停不了也开不了新一轮（TryLock 拒绝），只能干等——UI 上就是
+// 「一直同步中」。
+func (m *Manager) storeSyncCancel(cancel context.CancelFunc) {
+	m.vulnSyncCancel.Store(cancel)
+}
+
+func (m *Manager) clearSyncCancel() {
+	m.vulnSyncCancel.Store(context.CancelFunc(func() {}))
+}
+
+// CancelVulnIntelSync 中断当前那轮同步（若有）。返回 false = 当前没有在跑的轮。
+// 取消是协作式的：ctx 到达 vulnintel.Run / EnsureTemplates 的 exec.CommandContext，
+// 子进程（git/curl）被杀、本轮带着「已取消」错误退出，锁与状态由 defer 复位。
+func (m *Manager) CancelVulnIntelSync() bool {
+	if !m.vulnSyncRunning.Load() {
+		return false
+	}
+	if cancel, ok := m.vulnSyncCancel.Load().(context.CancelFunc); ok {
+		cancel()
+		log.Printf("[vulnintel] 收到中断请求，当前同步轮将被取消")
+		return true
+	}
+	return false
+}
+
+// SetVulnSyncPhase 更新当前轮的阶段描述（状态页展示）。f = "漏洞情报同步中（CVE/KEV/GHSA/PoC）" 等。
+func (m *Manager) SetVulnSyncPhase(f string) {
+	if m == nil {
+		return
+	}
+	m.vulnSyncPhase.Store(f)
+}
+
+// SyncPhase 返回当前阶段描述（空串 = 未在跑或尚未设置）。
+func (m *Manager) SyncPhase() string {
+	if m == nil {
+		return ""
+	}
+	if v, ok := m.vulnSyncPhase.Load().(string); ok {
+		return v
+	}
+	return ""
 }
 
 // VulnIntelSyncState reports whether a pass is running and when it started
@@ -110,8 +157,11 @@ func (m *Manager) runVulnIntelPass(ctx context.Context) error {
 	defer m.vulnSyncMu.Unlock()
 	m.vulnSyncRunning.Store(true)
 	m.vulnSyncStartedAt.Store(time.Now().Unix())
+	runCtx, runCancel := context.WithCancel(ctx)
+	m.storeSyncCancel(runCancel)
 	defer m.vulnSyncRunning.Store(false)
-	return m.vulnIntelPassLocked(ctx)
+	defer m.clearSyncCancel()
+	return m.vulnIntelPassLocked(runCtx)
 }
 
 // ── 近期高危快通道 ──────────────────────────────────────────────────────
@@ -371,13 +421,23 @@ func (m *Manager) latestGhsaUpdated(ctx context.Context) time.Time {
 // nuclei template tree. The caller holds vulnSyncMu.
 func (m *Manager) vulnIntelPassLocked(ctx context.Context) error {
 	cfg := m.vulnIntelConfig()
-	if err := vulnintel.Run(ctx, m.vulnintel, cfg); err != nil {
+	m.SetVulnSyncPhase("漏洞情报同步中（CVE / KEV / GHSA / PoC）")
+	err := vulnintel.Run(ctx, m.vulnintel, cfg)
+	if ctx.Err() != nil {
+		m.SetVulnSyncPhase("已中断")
+		log.Printf("[vulnintel] 本轮同步被中断（进度保留，可重新发起）")
+		return ctx.Err()
+	}
+	if err != nil {
 		log.Printf("[vulnintel] 本轮同步未完整完成: %v（游标已保留，下轮续跑）", err)
 	}
 	// 资产联动：新同步的 CVE 反向匹配 service 资产指纹，受影响任务挂 hint。
 	// 同步没完整完成也照跑——KEV stub 与已 upsert 的记录都已可查。
+	m.SetVulnSyncPhase("资产指纹联动")
 	m.linkVulnIntelAssets()
+	m.SetVulnSyncPhase("nuclei 模板树更新")
 	m.refreshNucleiTemplates(cfg.ProxyURL)
+	m.SetVulnSyncPhase("")
 	return nil
 }
 
@@ -386,7 +446,9 @@ func (m *Manager) vulnIntelPassLocked(ctx context.Context) error {
 // and the tree must not rot when intel sync is switched off. Caller owns
 // vulnSyncMu.
 func (m *Manager) refreshNucleiTemplates(proxyURL string) {
-	tplCtx, tplCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// 15 分钟：nuclei-templates depth-1 约 100-200MB，经慢代理 5 分钟必然超时——
+	// 超时杀掉的 clone 留下半成品目录，正是 Kali「0 个模板」事故的根因（v0.3.96）。
+	tplCtx, tplCancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer tplCancel()
 	if err := vulnintel.EnsureTemplates(tplCtx, m.nucleiDir, proxyURL); err != nil {
 		log.Printf("[vulnintel] nuclei 模板树更新失败: %v", err)

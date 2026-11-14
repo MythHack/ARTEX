@@ -4,20 +4,29 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	acperm "github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
+<<<<<<< ours
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/hosttools"
+=======
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/hosttools"
+>>>>>>> theirs
 )
 
 // compactIntents distills intents to {id, summary, state, asset_ids, parents,
 // yields} so the planner sees both the direction and its LINEAGE — parents (the
 // upstream nodes it derived from: facts/intents/findings) and yields (the facts/
 // findings it produced) — without pulling full payloads. parentsOf/yieldsOf are
+<<<<<<< ours
 // built from the exploration edges in graph_overview.
 const (
 	overviewIntentSummaryMax  = 220
@@ -40,16 +49,35 @@ func clipOverviewRunes(v any, maxRunes int) any {
 }
 
 func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[string]any {
+=======
+// built from the exploration edges in graph_overview. tokens (B7, optional) maps
+// intent id → llm_usage 总 token, 给每条意图标「这个方向烧了多少」; nil = 不标。
+func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64, tokens map[int64]int64) []map[string]any {
+>>>>>>> theirs
 	out := make([]map[string]any, 0, len(ns))
 	for _, n := range ns {
 		var p map[string]any
 		_ = json.Unmarshal(n.Payload, &p)
+<<<<<<< ours
 		m := map[string]any{"id": n.ID, "summary": clipOverviewRunes(p["summary"], overviewIntentSummaryMax), "state": n.State}
+=======
+		m := map[string]any{"id": n.ID, "summary": p["summary"], "state": n.State}
+		if len(tokens) > 0 {
+			if tok, ok := tokens[n.ID]; ok && tok > 0 {
+				m["tokens"] = tok
+			}
+		}
+>>>>>>> theirs
 		// stop_reason（B1）：终态意图「为什么停」。planner 提示词要求用它区分
 		// 「接续 vs 换方向」（exhausted=手段穷尽可接续 / blocked=传输故障可重试 /
 		// stopped=被 kill），此前该字段在 DB 列里但态势从不携带。
 		if n.BlockedReason != "" {
 			m["stop_reason"] = n.BlockedReason
+		}
+		// wall_ms（v0.4.27）：意图墙钟（runIntent 结算时落 payload），planner 直接看到
+		// 「这条方向烧了多久」，配合 tokens 判断该不该续派。
+		if wm, ok := p["wall_ms"].(float64); ok && wm > 0 {
+			m["wall_ms"] = int64(wm)
 		}
 		if n.Inherited {
 			m["source_task_id"] = n.SourceTaskID
@@ -83,11 +111,32 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 // One ToolSet is created per planner/worker run; per-run signals live here.
 type ToolSet struct {
 	findingRecorder FindingRecorder
-	as              *db.AssetStore   // asset store (optional; nil = asset tools not available)
-	cs              *db.CompanyStore // company store (optional)
-	ts              *db.ExplorationStore
-	worker          string
-	taskID          int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
+	// artifactRecorder 由 host 注入（v0.5.0 证据附件）；nil=当前环境不支持存档。
+	artifactRecorder ArtifactRecorder
+	// ── 授权边界守卫（v0.4.63）──
+	// 三个开关由 server 在装配时从设置读取（scope_write_guard / scope_inherit_writes /
+	// notify_cross_task_dedup），改动下一条意图生效。全部关闭=回到软约束旧行为。
+	ScopeWriteGuard      bool // 写回锚定守卫：fact/finding 只能锚定自有范围资产（默认开）
+	ScopeInheritWrites   bool // 继承/来源任务范围资产也可写（默认关；串资产根因开关）
+	CrossTaskNotifyDedup bool // 跨任务同指纹漏洞不再重复推送（默认开）
+	// egressProxy / egressCA 是原生 HTTP 执行器（http_request/session_login）的出口：
+	// 与 Bash 的 HTTP_PROXY 同源（记录 MITM 或全局代理），保证流量留痕一致。
+	egressProxy string
+	egressCA    string
+	// lastScopeWarnings 是最近一次 record_fact 中 source/foreign 资产的提示，
+	// 只回传、不阻断写入。
+	lastScopeWarnings []string
+	// lastLowNovelty 是本轮 record_fact 中「低新颖度」条数（与最近事实高度相似或
+	// 没有任何 evidence）。这类写回仍会入库，但不会重置意图租约的零写回计时。
+	lastLowNovelty int
+	// runDir 是本次运行的专属工作目录（worker 在这里产生截图/样本），
+	// save_evidence 的相对路径基准；由 Worker.Execute 注入。
+	runDir string
+	as     *db.AssetStore   // asset store (optional; nil = asset tools not available)
+	cs     *db.CompanyStore // company store (optional)
+	ts     *db.ExplorationStore
+	worker string
+	taskID int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
 	// coverageDisabled mirrors tasks.coverage_enabled=false. Stored inverted so the
 	// zero value (all existing ToolSet constructions) means ENABLED — matching the
 	// DB default (true). When true: graphOverviewData drops the coverage block, the
@@ -105,6 +154,15 @@ type ToolSet struct {
 	// record_fact call that do NOT exist in the asset table. The tool result
 	// reports them back so the model stops reusing a fabricated id.
 	lastMissingAssets []int64
+	// ── 派发节流（v0.4.68）──
+	// intentQueue 返回 (阈值, worker 数)；nil = 不限制（测试/主 agent 场景）。
+	intentQueue func() (int, int)
+	// intentAdded 是本次 ToolSet 生命周期内新增的意图数（每轮规划一个新 ToolSet）。
+	intentAdded int
+	// retiredThisRun 是本轮规划已退役的意图数（护栏：每轮 6 条）。
+	retiredThisRun int
+	// intentRequiresGate 控制 requires_intents 串行闸门是否生效（默认关）。
+	intentRequiresGate bool
 	// killWork, if set, terminates a running work by intent id (engine callback,
 	// wired by the planner). nil = the kill_work tool reports unavailable.
 	killWork func(intentID int64) error
@@ -142,15 +200,15 @@ type ToolSet struct {
 	// the planner having to spot it folded into the graph overview. Wired for the main
 	// agent + cross-task orchestration; nil elsewhere → falls back to the bare notify.
 	notifyHint func(texts []string)
-	// attributions, if set, returns Guard failure-attribution counts (ok/blocked/error,
-	// guard/guard.go Attributions) for graph_overview 的 guard_attributions 块——planner
-	// 由此看到「这个任务被 WAF/拦截打回了 N 次」并换打法（v0.3.88 体检 N5，Observer
-	// 半成品的最后一公里）。Wired for planner/mainagent（engine per-task Guard）；nil = 块省略。
-	attributions func() map[string]int
+	// attributions, if set, returns Guard failure-attribution stats (ok/blocked/error
+	// counts + B6 recent samples, guard/guard.go AttributionStats) for graph_overview
+	// 的 guard_attributions 块——planner 由此看到「这个任务被 WAF/拦截打回了 N 次、
+	// 最近被拦的是哪几条命令」并换打法（v0.3.88 体检 N5 + B6 样本补完）。nil = 块省略。
+	attributions func() map[string]any
 }
 
 // SetAttributions wires the Guard failure-attribution reader (see ToolSet.attributions).
-func (t *ToolSet) SetAttributions(fn func() map[string]int) { t.attributions = fn }
+func (t *ToolSet) SetAttributions(fn func() map[string]any) { t.attributions = fn }
 
 // SetNotifyGoal wires the goal-add trigger callback (see ToolSet.notifyGoal). Set only
 // by the main-agent chat, so runtime-added goals are announced to the planner by name.
@@ -215,6 +273,20 @@ func NewToolSet(ts *db.ExplorationStore, worker string) *ToolSet {
 // SetTaskID sets the PG task id on this ToolSet so that report_finding can
 // dual-write to the standalone findings table (which survives task deletion).
 func (t *ToolSet) SetTaskID(id int64) { t.taskID = id }
+
+// SetArtifactRecorder 注入证据附件存储（host 实现）。
+func (t *ToolSet) SetArtifactRecorder(r ArtifactRecorder) { t.artifactRecorder = r }
+
+// SetRunDir 注入本次运行的工作目录（save_evidence 的相对路径基准）。
+func (t *ToolSet) SetRunDir(dir string) { t.runDir = dir }
+
+// SetScopeFlags（v0.4.63）：授权边界守卫与跨任务去重的三个开关，
+// 由 server 在装配时从设置读取；改动下一条意图生效。全部关=回到软约束旧行为。
+func (t *ToolSet) SetScopeFlags(scopeGuard, scopeInheritWrites, crossTaskNotifyDedup bool) {
+	t.ScopeWriteGuard = scopeGuard
+	t.ScopeInheritWrites = scopeInheritWrites
+	t.CrossTaskNotifyDedup = crossTaskNotifyDedup
+}
 
 // SetCoverageEnabled records whether this task has the asset-coverage feature on
 // (default enabled). Passing false makes graphOverviewData omit the coverage block
@@ -532,9 +604,17 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		hotAtRender = cg.hotSet()
 	}
 	hidden := func(id int64) bool { _, c := covered[id]; return c && !hotAtRender[id] }
+	// B7:意图级 token（llm_usage 按 session 后缀 i<n> 记账）。一次拉全图,给
+	// open/running/recent_done 的每条意图标 tokens —— planner/人在环路直接看到
+	// 「哪个方向烧了多少」,是判断该不该续派最直接的账。
+	tokByIntent, _ := t.ts.TokenByIntent()
+	tokens := make(map[int64]int64, len(tokByIntent))
+	for _, it := range tokByIntent {
+		tokens[it.IntentID] = it.InputTokens + it.OutputTokens
+	}
 	const openIntentsCap = 30
 	fr, _ := t.ts.Frontier(openIntentsCap) // priority DESC, id ASC —— 优先级最高的前 N 条；真实总数见 frontier_open
-	out["open_intents"] = compactIntents(fr, parentsOf, yieldsOf)
+	out["open_intents"] = compactIntents(fr, parentsOf, yieldsOf, tokens)
 	all, _ := t.ts.ListByKind(db.KindIntent, 300)
 	var running, recentDone []*db.Node
 	for _, n := range all {
@@ -548,7 +628,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 			recentDone = append(recentDone, n) // 最新在前（all 按 id 降序）；折叠的已剔除，输出时截最新 N
 		}
 	}
-	out["running_intents"] = compactIntents(running, parentsOf, yieldsOf)
+	out["running_intents"] = compactIntents(running, parentsOf, yieldsOf, tokens)
 	// done_intents_total：已结束意图（done/blocked/exhausted）总数，与 recent_done_intents
 	// 平行命名——后者只是它的最新窗口截断视图。两键并排即自描述："看到的是 N/总数"，
 	// 让 planner 去重时别把"没显示"当成"没派过"，无需在提示词里另行解释。
@@ -622,7 +702,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	if len(recentDone) > recentDoneCap {
 		recentDone = recentDone[:recentDoneCap]
 	}
-	out["recent_done_intents"] = compactIntents(recentDone, parentsOf, yieldsOf)
+	out["recent_done_intents"] = compactIntents(recentDone, parentsOf, yieldsOf, tokens)
 	// 收官态势(边际收益):最近 N 轮规划后,全任务有没有新的 fact/finding 产出。
 	// 连续 ≥3 轮零新产出且 frontier 空 → 提示用 goal_met 收官(预算保护:
 	// 这时候继续派大概率烧 token 无产出)。程序算好放在这里,planner 不用自己数。
@@ -688,6 +768,75 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 				out["coverage"] = m
 			}
 		}
+	}
+	return out
+}
+
+// workerOverviewData is the worker-start lean situational snapshot. 任务 5 实测
+// worker 占全部 token 的 76.8%、单意图均 ≈300 万 input——每个 worker 启动都全量
+// 重建 planner 级态势（冷图×2、全血缘 edges、意图 token 台账、覆盖 CTE 算完即删、
+// cold_digests 整 body），再原样注入启动消息，是最大的固定浪费。worker 只需要
+// 「别人发现了什么」做去重与联想：goals/hints/计数/最新 findings/facts/根任务/
+// host 工具家底。规划专用字段（frontier、running/recent_done intents、cold 折叠、
+// stall、guard 归因、related_tasks、lineage、TokenByIntent、coverage）全部不进
+// worker 视图——既省每次启动的重建计算，也把注入前缀压到最短。
+func (t *ToolSet) workerOverviewData() map[string]any {
+	out := map[string]any{}
+	goals, _ := t.ts.ListByKind(db.KindGoal, 100)
+	gsum := make([]map[string]any, 0, len(goals))
+	for _, g := range goals {
+		var p map[string]any
+		_ = json.Unmarshal(g.Payload, &p)
+		gsum = append(gsum, map[string]any{"id": g.ID, "state": g.State, "text": p["text"]})
+	}
+	out["goals"] = gsum
+	hints, _ := t.ts.ListByKind(db.KindHint, 20)
+	hsum := make([]map[string]any, 0, len(hints))
+	for _, h := range hints {
+		var p map[string]any
+		_ = json.Unmarshal(h.Payload, &p)
+		hsum = append(hsum, map[string]any{"id": h.ID, "state": h.State, "text": p["text"]})
+	}
+	out["hints"] = hsum
+	vulnNodes, _ := t.ts.ListByKind(db.KindFinding, 1000)
+	factNodes, _ := t.ts.ListByKind(db.KindFact, 1000)
+	out["findings_total"] = len(vulnNodes)
+	out["facts"] = len(factNodes)
+	const findingListCap = 10
+	findingList := make([]map[string]any, 0, findingListCap)
+	for _, n := range vulnNodes {
+		if len(findingList) >= findingListCap {
+			break
+		}
+		var fp map[string]any
+		_ = json.Unmarshal(n.Payload, &fp)
+		findingList = append(findingList, map[string]any{"id": n.ID, "summary": fp["summary"]})
+	}
+	out["finding_list"] = findingList
+	const recentFactsCap = 20
+	recentFacts := make([]map[string]any, 0, recentFactsCap)
+	for _, n := range factNodes {
+		if len(recentFacts) >= recentFactsCap {
+			break
+		}
+		m := compactNode(n)
+		var fp map[string]any
+		if json.Unmarshal(n.Payload, &fp) == nil {
+			if c, ok := fp["confidence"].(string); ok && c != "" {
+				m["confidence"] = c
+			}
+		}
+		recentFacts = append(recentFacts, m)
+	}
+	out["recent_facts"] = recentFacts
+	out["tools"] = hosttools.Summary()
+	if t.as != nil && t.taskID > 0 {
+		if hosts, err := t.as.HostsByTaskWithSources(t.taskID); err == nil {
+			out["host_count"] = len(hosts)
+		}
+	}
+	if description, goal, err := t.ts.Root(); err == nil {
+		out["task"] = map[string]any{"description": description, "goal": goal}
 	}
 	return out
 }
@@ -918,7 +1067,7 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 			intent.Inherited = true
 			intent.SourceTaskID = source.Task.TaskID
 		}
-		intentResults := compactIntents(recentDone, parentsOf, yieldsOf)
+		intentResults := compactIntents(recentDone, parentsOf, yieldsOf, nil)
 		for i, intent := range recentDone {
 			intentResults[i]["summary"] = budget.take(intentResults[i]["summary"], 400)
 			acts, _, err := ts.ActivityPageForTerminalIntent(intent.ID, 0, 20)
@@ -1160,6 +1309,7 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 
 // intentItem 是 add_intent 批量/单条的一条探索方向。
 type intentItem struct {
+<<<<<<< ours
 	Summary         string            `json:"summary"`
 	AssetIDs        []json.RawMessage `json:"asset_ids"`
 	ParentIDs       []json.RawMessage `json:"parent_ids"`
@@ -1168,6 +1318,36 @@ type intentItem struct {
 	Continues       []json.RawMessage `json:"continues"`
 	Hypothesis      string            `json:"hypothesis"`
 	SuccessCriteria string            `json:"success_criteria"`
+=======
+	Summary   string            `json:"summary"`
+	Dimension string            `json:"dimension,omitempty"` // 攻击链续跳：继任意图的维度（injection/authz/…）
+	AssetIDs  []json.RawMessage `json:"asset_ids"`
+	ParentIDs []json.RawMessage `json:"parent_ids"`
+	Priority  int               `json:"priority"`
+	// Continues 是本意图【接续】的上游意图 id（0/1/多个）。
+	//
+	// 为什么需要它：接续链此前只存在于 summary 的**自然语言**里（「接续被预算
+	// 掐断的意图 #432」「接续两次被后端重启打断的 #635/#578」）。实测线上 205
+	// 条意图里有 26 条是接续（12.7%），而 #660 的 summary 直接写着「接续两次」。
+	//
+	// 文字形态接续有两个坏处：
+	//  1. **算不出代数**。#660 接续 #635、#635 接续 #578，但图里 #660 的 parent
+	//     是 #14（一个 fact）——接续关系在数据层根本没表达，所以「这条链已经接了
+	//     几代」无法回答。而接续代数正是防止无限续派的关键闸门。
+	//  2. **查不了**。想找「所有接续自 #578 的意图」只能全表扫 summary 文本。
+	//
+	// 结构化之后：接续代数可算、可查、可限。parent_ids 语义不变（只能挂
+	// fact/finding，意图必须锚在已确认知识上）——continues 是**额外**的接续
+	// 标记，不替代 parent_ids。
+	Continues []json.RawMessage `json:"continues"`
+	// Hypothesis 本方向的假设（可选）：依据哪条 fact 的什么推测，引用 fact id。
+	// worker 拿到后作为「definition of done」的验证目标（v0.3.95 B3）。
+	Hypothesis string `json:"hypothesis"`
+	// SuccessCriteria 怎么算成了/没成（可选）：期望拿到的 fact/finding 形态。
+	SuccessCriteria string `json:"success_criteria"`
+	// RequiresIntents 是严格串行链的先决意图 id（平台开关关闭时仅作记录）。
+	RequiresIntents []json.RawMessage `json:"requires_intents"`
+>>>>>>> theirs
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1178,6 +1358,28 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	summary := clampIntentSummary(it.Summary)
 	if strings.TrimSpace(summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
+	}
+	// 意图粒度闸门（v0.4.44）：意图 summary 不能是任务 description/goal 的复读——
+	// 第一轮最常见错误就是 planner 把总目标原封不动包成一条意图派下去，worker
+	// 收到等于收到整个任务。这里用「前缀匹配 + 长度」做确定性检测。
+	if rootDesc, rootGoal, rootErr := t.ts.Root(); rootErr == nil {
+		for _, src := range []string{rootDesc, rootGoal} {
+			src = strings.TrimSpace(src)
+			if len(src) < 40 {
+				continue
+			}
+			// 取目标文本的前 60 字节做前缀匹配（足够区分「复读」和「正常引用」）
+			probe := src
+			if len(probe) > 60 {
+				probe = probe[:60]
+			}
+			if strings.Contains(summary, probe) {
+				return 0, fmt.Errorf(
+					"意图 summary 是任务目标/描述的复读，不是可执行的子步骤。" +
+						"请把它拆成 3–5 条具体意图（如「DNS 解析 + 子域名枚举」「端口扫描与服务识别」「未授权面探测」等），" +
+						"每条 summary 写清【对哪个资产 + 做什么具体动作 + 期望产出】；总目标的完整背景留在任务描述里即可，不需要复述。")
+			}
+		}
 	}
 	// 先校验锚点（建节点前，避免坏锚点留下孤儿意图）。
 	parents := pidList(it.ParentIDs)
@@ -1214,6 +1416,11 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		if cn.Kind != db.KindIntent {
 			return 0, fmt.Errorf("continues %d 是 %q 节点，不能作为接续来源：continues 只能填【意图】id（接续的是一条探索方向）", cid, cn.Kind)
 		}
+		// 接续不能从【正在跑】的意图出发——那是并行竞争。
+		// open 允许：可能是暂停回退的意图，planner 认为需要换角度接续是合理的。
+		if cn.State == "running" {
+			return 0, fmt.Errorf("continues %d 正在执行中，不能接续：等它结束后再派接续意图", cid)
+		}
 		if d := continuationDepthOf(cn); d+1 > depth {
 			depth = d + 1
 		}
@@ -1222,6 +1429,19 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		return 0, fmt.Errorf("接续代数已达上限（%d 代）：这条方向已经被接续了 %d 次，继续接下去大概率是在重复劳动。"+
 			"请改为：①换一种本质不同的打法（换入口/换方法/换目标面）；②或直接放弃这个方向，转向尚未覆盖的方向",
 			maxContinuationDepth, depth)
+	}
+	requires := pidList(it.RequiresIntents)
+	for _, rid := range requires {
+		rn, err := t.ts.GetNode(rid)
+		if err != nil || rn == nil {
+			return 0, fmt.Errorf("requires_intents %d 不存在于本任务：只能填本任务已存在的意图 id", rid)
+		}
+		if rn.Kind != db.KindIntent {
+			return 0, fmt.Errorf("requires_intents %d 是 %q 节点：只能填意图 id（前置是某条探索方向）", rid, rn.Kind)
+		}
+		if rn.State == "deleted" {
+			return 0, fmt.Errorf("requires_intents %d 已被删除，不能作为前置", rid)
+		}
 	}
 	anchors := pidList(it.AssetIDs)
 	seenAnchors := map[int64]bool{}
@@ -1274,7 +1494,15 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		payload["continues"] = continues
 		payload["continuation_depth"] = depth
 	}
+<<<<<<< ours
 	// 派发去重：同任务里已有高度相似的 open/running 意图就不再重复下发。
+=======
+	if len(requires) > 0 {
+		payload["requires_intents"] = requires
+	}
+	// 派发去重：同任务里已有高度相似的 open/running 意图就不再重复下发——两条并行
+	// worker 干同一件事纯属浪费；planner 能看到提示并改写差异。
+>>>>>>> theirs
 	if existID, existSum, similar, err := t.ts.FindSimilarOpenIntent(summary); err == nil && similar {
 		return 0, fmt.Errorf("已存在高度相似的未完成意图 #%d「%s」，未重复下发；若确实要做不同的事，请在 summary 里写清区别",
 			existID, firstLine(existSum, 60))
@@ -1299,6 +1527,55 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	return id, nil
 }
 
+// SetIntentQueueLimit 安装派发阈值 resolver（nil = 不限制）。
+func (t *ToolSet) SetIntentQueueLimit(fn func() (int, int)) { t.intentQueue = fn }
+
+// SetIntentRequiresGate 控制 requires_intents 串行闸门（默认关，只作记录）。
+func (t *ToolSet) SetIntentRequiresGate(on bool) { t.intentRequiresGate = on }
+
+// queueBudget 返回派发阈值与 worker 数；nil resolver = 0,0（不限制）。
+func (t *ToolSet) queueBudget() (limit, workers int) {
+	if t == nil || t.intentQueue == nil {
+		return 0, 0
+	}
+	return t.intentQueue()
+}
+
+// intentRoundAddCap 返回本轮还能新增的意图数上限（-1=不限），以及当前积压与阈值。
+//
+// 阈值 T = max(limit, 2*workers)：
+//   - active >= T      → 本轮 0 条（先等产出；规划轮本身照常跑，可读结果/证目标/写事实）
+//   - active >= T-2    → 本轮 1 条（只补最关键的下一步）
+//   - 其他              → 本轮 3 条
+func (t *ToolSet) intentRoundAddCap() (capN, active, threshold int) {
+	capN = -1
+	if t.worker != "planner" {
+		return
+	}
+	limit, workers := t.queueBudget()
+	if limit <= 0 || t.ts == nil {
+		return
+	}
+	n, err := t.ts.CountActiveIntents()
+	if err != nil {
+		return
+	}
+	active = n
+	threshold = limit
+	if 2*workers > threshold {
+		threshold = 2 * workers
+	}
+	switch {
+	case active >= threshold:
+		capN = 0
+	case active >= threshold-2:
+		capN = 1
+	default:
+		capN = 3
+	}
+	return
+}
+
 func (t *ToolSet) addIntent() actool.CoreTool {
 	return t.writeExpTool("add_intent", "生成【探索方向】写入 frontier，并连入探索链路。意图是开放的探索方向，不是固定类型——用 summary 一句话自由描述要探索/验证/利用什么。\n"+
 		"★优先批量：一轮筛出的多个新方向放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。",
@@ -1309,7 +1586,11 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			"parent_ids":       map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
 			"continues":        map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "【仅当本方向是接续某条旧方向时填】上游【意图】节点 id（0/1/多个）——即本方向要接着哪条被掐断/被收口的意图继续做。**只在 summary 里明说「接续/继续 #NNN」时才填**，且必须与 summary 里提到的意图 id 一致。接续代数有上限（最多接 3 次），超了会被拒绝——到那时请换一种本质不同的打法或转向别的方向，别再接。顶层全新方向留空。"},
 			"priority":         intp("优先级 0-10，默认5。直接逼近目标的利用链步=8-10；新入口面首次探明=6-7；补覆盖/复核=3-4；纯情报=1-2。同轮多意图按价值区分，别全默认 5。"),
+<<<<<<< ours
 			"identity_id":      intp("可选：绑定本任务已配置的测试身份 id（task_identities.id）。0=匿名（默认）。配置了身份也不能不做匿名测试——匿名意图与带身份意图应并行派发。"),
+=======
+			"requires_intents": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "【仅严格串行链使用】本方向依赖的先决意图 id：这些意图跑出结果前，本意图不会被 worker 领取（平台开关关闭时仅作记录）。只在上一步的**实际产出**是下一步输入时填；平行覆盖类方向不要填，否则会白白等待。"},
+>>>>>>> theirs
 			"hypothesis":       str("【建议填】本方向的假设：依据哪条 fact 的什么推测（引用 fact id）。worker 会以它为验证目标，你下轮判「有没有产出」也有对照锚。"),
 			"success_criteria": str("【建议填】怎么算成了/没成：期望拿到的 fact/finding 形态（如「拿到 admin cookie 的请求响应」/「证实参数 X 不可注入的输出」）。"),
 		}),
@@ -1325,17 +1606,31 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 				items = []intentItem{a.intentItem}
 			}
 
-			ids := make([]int64, len(items))
+			origLen := len(items)
+			ids := make([]int64, origLen)
 			errs := map[string]string{}
 			createdAny := false
+			capN, active, threshold := t.intentRoundAddCap()
 			for i, it := range items {
+				if capN >= 0 && t.intentAdded >= capN {
+					errs[strconv.Itoa(i)] = fmt.Sprintf(
+						"派发节流：本任务未完成意图 %d 条（阈值 %d），本轮不再新增（已新建 %d 条）。"+
+							"先等 worker 产出再派，或把多个方向合并成一条；规划轮本身不受影响，"+
+							"仍可读结果、prove_goal、写 fact。设置 intent_queue_limit=0 可关闭节流。",
+						active, threshold, t.intentAdded)
+					continue
+				}
 				id, err := t.addOneIntent(it)
 				if err != nil {
 					errs[strconv.Itoa(i)] = err.Error()
 					continue
 				}
 				ids[i] = id
+				t.intentAdded++
 				createdAny = true
+			}
+			if len(items) < origLen {
+				ids = ids[:len(items)]
 			}
 
 			// 人经主 agent 直投意图 → 若任务已 done（无 open 目标的 goalless 分支），把它
@@ -1358,6 +1653,159 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			}
 			return jsonResult(out)
 		})
+}
+
+func (t *ToolSet) retireIntent() actool.CoreTool {
+	return t.writeExpTool("retire_intent",
+		"退役【尚未开始】的排队意图（open）。当你的新事实已否定某条意图的前提时调用，例如目标被证实是死目标、"+
+			"真实业务入口已在别处定位到、或该方向已被结论排除。退役不删除证据/血缘，只置为 deleted 并记录原因，"+
+			"之后不会再被 worker 领取。正在执行的意图不能退役——先用 kill_work 终止。\n"+
+			"护栏：每轮最多 6 条；因『重复』退役必须用 superseded_by 指明存活的替代意图（不能指向已退役的）；"+
+			"声称『前提失效』时必须在 reason 里引用否定它的事实/finding 节点号。",
+		obj(map[string]any{
+			"ids":    map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "要退役的意图节点 id（必须是 open 状态，可多条；本轮累计最多 6 条）"},
+			"reason": str("退役原因（必填）：写清哪条事实否定了它的前提，或为什么不再需要这条方向"),
+			"superseded_by": map[string]any{"type": "array", "items": map[string]any{"type": "integer"},
+				"description": "【因重复而退役时必填】替代它的存活意图 id（open/running/done）。禁止指向已 deleted 的意图——那会造成覆盖断链。前提失效类退役不需要填。"},
+		}, "ids", "reason"),
+		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				IDs          []json.RawMessage `json:"ids"`
+				Reason       string            `json:"reason"`
+				SupersededBy []json.RawMessage `json:"superseded_by"`
+			}
+			_ = json.Unmarshal(in, &a)
+			ids := pidList(a.IDs)
+			reason := strings.TrimSpace(a.Reason)
+			sup := pidList(a.SupersededBy)
+			if len(ids) == 0 {
+				return actool.Errorf("ids 不能为空"), nil
+			}
+			if reason == "" {
+				return actool.Errorf("reason 必填：写清是哪条事实/结论否定了它的前提"), nil
+			}
+			if remaining := maxIntentRetirePerRun - t.retiredThisRun; remaining <= 0 {
+				return actool.Errorf(fmt.Sprintf("本轮退役已达上限 %d 条：先让 worker 消化积压，下一轮再清理（避免一轮清空导致链式误伤）", maxIntentRetirePerRun)), nil
+			} else if len(ids) > remaining {
+				return actool.Errorf(fmt.Sprintf("本轮最多还能退役 %d 条，本次提交 %d 条：请分轮处理，优先保留证据更完整的替代方向", remaining, len(ids))), nil
+			}
+			if len(sup) > 0 {
+				for _, sid := range sup {
+					if sid <= 0 {
+						continue
+					}
+					for _, id := range ids {
+						if sid == id {
+							return actool.Errorf(fmt.Sprintf("superseded_by 不能指向本次要退役的意图 #%d（自指替代等于没有覆盖）", sid)), nil
+						}
+					}
+					sn, err := t.ts.GetNode(sid)
+					if err != nil || sn == nil {
+						return actool.Errorf(fmt.Sprintf("superseded_by #%d 不存在：替代必须是本任务已存在的意图", sid)), nil
+					}
+					if sn.Kind != db.KindIntent {
+						return actool.Errorf(fmt.Sprintf("superseded_by #%d 是 %q 节点：只能是意图 id", sid, sn.Kind)), nil
+					}
+					switch sn.State {
+					case "open", "running", "done":
+						// 存活替代，可接受
+					default:
+						return actool.Errorf(fmt.Sprintf("superseded_by #%d 当前状态为 %s：替代已被退役/终止，禁止链式退役（请先确认该覆盖类仍有存活意图或事实兜底）", sid, sn.State)), nil
+					}
+				}
+				reason += "；替代意图：" + joinNodeRefs(sup)
+			}
+			if reasonClaimsPremiseInvalid(reason) && !t.reasonCitesKnowledge(reason) {
+				return actool.Errorf("reason 声称『前提失效/被否定』但没有引用任何现存 fact/finding 节点号：请写出否定它的事实 id，或改为 superseded_by 表达重复"), nil
+			}
+			retired := []int64{}
+			errs := map[string]string{}
+			for _, id := range ids {
+				key := strconv.FormatInt(id, 10)
+				n, err := t.ts.GetNode(id)
+				if err != nil || n == nil {
+					errs[key] = "意图不存在"
+					continue
+				}
+				if n.Kind != db.KindIntent {
+					errs[key] = "不是意图节点：" + n.Kind
+					continue
+				}
+				switch n.State {
+				case "open":
+					// 可退役
+				case "running", "paused":
+					errs[key] = "正在执行：先用 kill_work 终止，再退役"
+					continue
+				default:
+					errs[key] = "已是终态（" + n.State + "），无需退役"
+					continue
+				}
+				if _, err := t.ts.SoftDeleteIntent(id, "planner 退役："+reason); err != nil {
+					errs[key] = err.Error()
+					continue
+				}
+				t.retiredThisRun++
+				retired = append(retired, id)
+			}
+			out := map[string]any{"retired": retired, "retired_this_round": t.retiredThisRun, "round_limit": maxIntentRetirePerRun}
+			if len(errs) > 0 {
+				out["errors"] = errs
+			}
+			return jsonResult(out)
+		})
+}
+
+const maxIntentRetirePerRun = 6
+
+func reasonClaimsPremiseInvalid(reason string) bool {
+	for _, w := range []string{"前提", "否定", "失效", "证伪", "已被回答", "死目标"} {
+		if strings.Contains(reason, w) {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *ToolSet) reasonCitesKnowledge(reason string) bool {
+	for _, id := range nodeRefIDs(reason) {
+		n, err := t.ts.GetNode(id)
+		if err != nil || n == nil {
+			continue
+		}
+		if n.Kind == db.KindFact || n.Kind == db.KindFinding {
+			return true
+		}
+	}
+	return false
+}
+
+func nodeRefIDs(s string) []int64 {
+	var out []int64
+	for i := 0; i < len(s); i++ {
+		if s[i] != '#' {
+			continue
+		}
+		j := i + 1
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			j++
+		}
+		if j > i+1 {
+			if n, err := strconv.ParseInt(s[i+1:j], 10, 64); err == nil && n > 0 && n < 1<<40 {
+				out = append(out, n)
+			}
+		}
+		i = j
+	}
+	return out
+}
+
+func joinNodeRefs(ids []int64) string {
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, "#"+strconv.FormatInt(id, 10))
+	}
+	return strings.Join(parts, "/")
 }
 
 func (t *ToolSet) listGoals() actool.CoreTool {
@@ -1423,6 +1871,26 @@ func (t *ToolSet) goalMet() actool.CoreTool {
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct{ Reason string }
 			_ = json.Unmarshal(in, &a)
+			// v0.6.31 内部版同款闸门：未达成/未证明的目标存在时禁止整体收官。
+			// 旧实现允许 planner 以「边际收益耗尽」为由 goal_met 结束任务（目标被标 unverified），
+			// 界面/报告却显示「已完成」——这正是「只完成一部分却自己判完成」的来源。
+			if t.ts != nil {
+				unmet := 0
+				var ids []string
+				if goals, err := t.ts.ListByKind(db.KindGoal, 1000); err == nil {
+					for _, g := range goals {
+						if g.State != "met" {
+							unmet++
+							if len(ids) < 5 {
+								ids = append(ids, fmt.Sprintf("#%d", g.ID))
+							}
+						}
+					}
+				}
+				if unmet > 0 {
+					return actool.Errorf(fmt.Sprintf("还有 %d 个目标未达成（%s），禁止整体收官：goal_met 只能在全目标已用 prove_goal 证明后调用。请继续派深挖/利用链意图；若确认客观不可推进，把阻塞证据写成 fact（含已尝试手段与失败输出），任务会按超时/轮数上限以「未完成」收尾，而不是显示达成。", unmet, strings.Join(ids, "、"))), nil
+				}
+			}
 			t.GoalMet = true
 			t.Reason = a.Reason
 			// 可审计：goal_met 是「整体声称达成」，没有走 prove_goal 的逐条证据链。
@@ -1476,6 +1944,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if t.ts == nil {
 			return actool.Errorf("report_finding 需要任务上下文；平台对话请通过 add_task_hint 向对应任务交接漏洞，并在提示中携带已有的 traffic_refs，由任务 Agent 登记。已登记漏洞可用 bind_finding_traffic 补绑。"), nil
 		}
+<<<<<<< ours
 		score, calcSev, normVec, cwe, cvssErr := EvaluateFindingSeverity(a.Severity, a.CWEID, a.CVSSVector, a.VulnClass, a.Name, a.Summary, a.Evidence)
 		if cvssErr != nil {
 			return actool.Errorf(fmt.Sprintf("cvss_vector 格式错误: %v（示例：CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N）", cvssErr)), nil
@@ -1496,6 +1965,35 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			}
 			if !strings.Contains(a.Summary, normVec) {
 				a.Summary = tag + " " + strings.TrimSpace(a.Summary)
+=======
+		// 证据门槛（v0.4.5）：critical/high 需要足量可核验证据；不足时打回，
+		// 模型可补证据或降级后重试，而不是让"一句话高危"进入报告。
+		if msg := validateFindingEvidence(a.Severity, a.Evidence); msg != "" {
+			return actool.Errorf(msg), nil
+		}
+		// 机械验证凭据校验（v0.4.52）：critical/high 必须附 HTTP 状态码/curl 输出/
+		// 工具命中结果等可机械复现的验证凭据。纯版本匹配不通过。
+		if msg := validateMechanicalEvidence(a.Severity, a.Evidence); msg != "" {
+			return actool.Errorf(msg), nil
+		}
+		// 证据逐字回验（v0.4.29，P0b #2，PentestGPT 机制自研）：先告警后拦截。
+		// 证据里至少要有一行能在本次 run 的真实工具回显里逐字找到出处——
+		// 「none」且档位=block 时只打回 critical/high（误报代价最高的两档）。
+		verifyNote := ""
+		if ledger, mode := ToolOutputsFromContext(ctx); ledger != nil && mode != EvidenceVerifyOff && strings.TrimSpace(a.Evidence) != "" {
+			matched, total := ledger.VerifyEvidence(a.Evidence)
+			switch evidenceVerdict(matched, total) {
+			case "none":
+				if mode == EvidenceVerifyBlock && (a.Severity == "critical" || a.Severity == "high") {
+					return actool.Errorf(fmt.Sprintf(
+						"证据逐字回验未通过：evidence 里没有任何一行能在本次工具输出中找到出处（已比对 %d 行有效内容）。"+
+							"critical/high 必须带本会话真实命令输出：请把工具回显中的关键行原样粘进 evidence（命令 + 输出特征），"+
+							"或降级为 medium 后再报，或改用 record_fact 记为待验证线索。", total)), nil
+				}
+				verifyNote = fmt.Sprintf("⚠️ 证据出处核对：0/%d 行可在本次工具输出中逐字找到——报告读者将无法复核，建议补粘命令与输出原文。", total)
+			case "partial":
+				verifyNote = fmt.Sprintf("⚠️ 证据出处核对：仅 %d/%d 行可在本次工具输出中逐字找到，其余为转述；关键结论请引用原文。", matched, total)
+>>>>>>> theirs
 			}
 		}
 		// Auto-binding off: ignore the evidence params instead of rejecting the call.
@@ -1509,11 +2007,31 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if len(a.EvidenceHintID) > 0 && pid(a.EvidenceHintID) <= 0 {
 			return actool.Errorf("evidence_hint_id 必须为有效的提示节点 ID；无交接提示时省略"), nil
 		}
+		// 漏洞资产自动锚定（v0.4.40，与 record_fact 同一策略）：模型没给 asset_ids
+		// 时，从 summary/evidence 文本反查任务资产补上——归属链路保证 finding 能
+		// 连到资产/意图，报告与按资产聚合才不缺项。
+		if len(a.AssetIDs) == 0 {
+			if auto := t.autoAnchorFact(map[string]any{
+				"summary":  a.Summary,
+				"detail":   a.Evidence,
+				"evidence": a.Evidence,
+			}); len(auto) > 0 {
+				for _, id := range auto {
+					if raw, err := json.Marshal(id); err == nil {
+						a.AssetIDs = append(a.AssetIDs, raw)
+					}
+				}
+			}
+		}
 		refs, err := t.findingRefsFromHint(pid(a.EvidenceHintID), a.TrafficRefs)
 		if err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
-		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
+		// 授权边界守卫（v0.4.63）：finding 的 asset_ids 只能落在自有范围资产上。
+		if msg := t.scopeGuardError(pidList(a.AssetIDs)); msg != "" {
+			return actool.Errorf(msg), nil
+		}
+		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), CrossTaskNotifyDedup: t.CrossTaskNotifyDedup}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
@@ -1542,9 +2060,26 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		}
 		result := struct {
 			*db.RecordedFinding
-			EvidenceStatus string `json:"evidence_status"`
-			EvidenceNote   string `json:"evidence_note,omitempty"`
-		}{RecordedFinding: recorded, EvidenceStatus: "bound"}
+			EvidenceStatus     string `json:"evidence_status"`
+			EvidenceNote       string `json:"evidence_note,omitempty"`
+			EvidenceVerifyNote string `json:"evidence_verify_note,omitempty"`
+			ChainIntentID      int64  `json:"chain_intent_id,omitempty"`
+			ChainNote          string `json:"chain_note,omitempty"`
+		}{RecordedFinding: recorded, EvidenceStatus: "bound", EvidenceVerifyNote: verifyNote}
+		if len(recorded.CrossTaskDupTasks) > 0 {
+			ids := make([]string, 0, len(recorded.CrossTaskDupTasks))
+			for _, tid := range recorded.CrossTaskDupTasks {
+				ids = append(ids, strconv.FormatInt(tid, 10))
+			}
+			result.EvidenceNote = (func(prev string) string {
+				if prev != "" {
+					return prev + " "
+				}
+				return ""
+			})(result.EvidenceNote) + fmt.Sprintf(
+				"◎ 跨任务提示：同指纹漏洞在任务 %s 中已存在，本次推送已按跨任务去重抑制（漏洞记录保留在本任务，页面可见）。"+
+					"这通常意味着该资产属于其他任务的范围——请核对本任务授权边界，不要继续在其他任务的资产上深挖。", strings.Join(ids, "/"))
+		}
 		if len(recorded.Traffic.Bindings) == 0 {
 			result.EvidenceStatus = "not_bound"
 			result.EvidenceNote = "漏洞已保存，未绑定流量。TCP/无包情形可正常继续；若已有核实的 HTTP 流量，请用可用的 bind_finding_traffic 或漏洞页面补绑，再完成证据交接。不要重复创建漏洞。"
@@ -1573,6 +2108,20 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			result.EvidenceStatus = "partially_bound"
 			result.EvidenceNote += " ⚠ 以下流量引用未生效（ID 不存在或正文不可读）：" + strings.Join(ids, ", ") +
 				"。已生效的引用已正常绑定；若这些 ID 确实存在，请用 traffic_get 核实真实 ID 后用 bind_finding_traffic 补绑。"
+		}
+		// 攻击链自动续跳（v0.4.63 红队批次下放）：只有新建的 finding 才续跳；重复上报（已合并）不派。
+		if !recorded.Duplicate {
+			if cid, note := t.dispatchChainIntent(a.VulnClass, a.Name, a.Summary, a.Severity,
+				pidList(a.AssetIDs), recorded.NodeID, pid(a.IntentID)); cid > 0 || note != "" {
+				result.ChainIntentID = cid
+				result.ChainNote = note
+			}
+		}
+		// 回溯归属（v0.4.47）：同一意图目录下所有 finding_id 为空的证据一次性归属。
+		if bindIntent := pid(a.IntentID); bindIntent > 0 && t.taskID > 0 {
+			if n, err := t.ts.RetroBindIntentEvidence(t.taskID, bindIntent, recorded.FindingID); err == nil && n > 0 {
+				result.EvidenceNote += fmt.Sprintf(" ✨ 自动归属了本意图的 %d 条历史证据。", n)
+			}
 		}
 		raw, _ := json.Marshal(result)
 		return actool.Text(fmt.Sprintf("finding recorded: %d\n%s", recorded.NodeID, raw)), nil
@@ -1628,6 +2177,19 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 	// a fact is its OWN node kind (distinct from a vuln finding).
 	assetIDs := pidList(it.AssetIDs)
 	missing := t.missingAssetIDs(assetIDs)
+	// 覆盖归账（v0.4.27）：模型没给 asset_ids 时，从事实文本里反查任务资产自动锚定。
+	// 任务 5 实测 493 个 endpoint 只测到 30% 的主因不是没测——worker 大量用 Bash curl
+	// 探测后 record_fact 不带 asset_ids，覆盖度对账不出来，规划者被误导继续扫面上。
+	// 锚点是 provenance 边：自动锚定只影响覆盖统计与血缘展示，不改事实内容。
+	if len(assetIDs) == 0 {
+		if auto := t.autoAnchorFact(payload); len(auto) > 0 {
+			assetIDs = auto
+		}
+	}
+	// 授权边界守卫（v0.4.63）：fact 锚定只能落在自有范围资产上。
+	if msg := t.scopeGuardError(assetIDs); msg != "" {
+		return 0, fmt.Errorf("%s", msg)
+	}
 	id, err := t.ts.AddNode(db.KindFact, payload, 5, "confirmed", t.worker, assetIDs)
 	if err != nil {
 		return 0, err
@@ -1671,6 +2233,136 @@ func (t *ToolSet) missingAssetIDs(ids []int64) []int64 {
 	return missing
 }
 
+// scopeGuardError 是写回锚定的授权边界闸门（v0.4.63，跨任务串资产
+// 防线的第④层硬化）：fact/finding 的 asset_ids 只允许「自有范围」资产——
+//
+//	own    ：匹配本任务自己的 scope，或本任务发现/登记（task_ids 含本任务）→ 放行；
+//	source ：只匹配来源/继承任务的 scope → 默认拒绝（继承范围只读；确属授权时
+//	         用 add_task_scope 显式纳入，或开启 scope_inherit_writes）；
+//	foreign：完全越界 → 一律拒绝。
+//
+// 返回空串表示放行；非空是给模型的中文纠正提示（含资产标签，便于它自己纠正）。
+// 查询失败 fail-open（返回空串）——闸门故障不能把正常任务全部卡死，由调用方记日志。
+func (t *ToolSet) scopeGuardError(ids []int64) string {
+	if !t.ScopeWriteGuard || t.as == nil || t.taskID <= 0 || len(ids) == 0 {
+		return ""
+	}
+	own, source, foreign, err := t.as.ClassifyAssetsForTask(t.taskID, ids)
+	if err != nil {
+		return "" // fail-open：分类查询故障不阻断正常任务，由调用方日志兜底
+	}
+	_ = own
+	if t.ScopeInheritWrites {
+		source = nil
+	}
+	if len(source) == 0 && len(foreign) == 0 {
+		return ""
+	}
+	label := func(ids []int64) string {
+		assets, err := t.as.GetByIDs(ids)
+		if err != nil {
+			return ""
+		}
+		parts := make([]string, 0, len(assets))
+		for i, a := range assets {
+			if a == nil {
+				continue
+			}
+			name := a.Domain
+			if name == "" {
+				name = a.URL
+			}
+			if name == "" {
+				name = a.IP
+			}
+			if name == "" {
+				name = a.AppName
+			}
+			if name == "" {
+				name = a.RootDomain
+			}
+			if i >= 6 {
+				parts = append(parts, fmt.Sprintf("…等 %d 个", len(assets)))
+				break
+			}
+			parts = append(parts, fmt.Sprintf("#%d %s", a.ID, name))
+		}
+		return strings.Join(parts, "、")
+	}
+	var b strings.Builder
+	b.WriteString("范围守卫：以下资产不属于本任务自有范围，禁止写回/上报：")
+	if len(source) > 0 {
+		b.WriteString(fmt.Sprintf("\n· 来源/继承任务范围（只读，默认不可写）：%s", label(source)))
+	}
+	if len(foreign) > 0 {
+		b.WriteString(fmt.Sprintf("\n· 完全越界：%s", label(foreign)))
+	}
+	b.WriteString("\n处理方式（二选一）：① 把本条结论的 asset_ids 改成自有范围资产，或删掉 asset_ids 让系统只记结论本身；" +
+		"② 若该资产确在本任务授权内，先用 add_task_scope 显式纳入本任务范围后重试。" +
+		"跨域名归属类结论必须先在两个域各自取证复核（本域复验 200/内容一致），未复核一律按 inferred 写，不得标 observed。")
+	return b.String()
+}
+
+var (
+	factURLRe  = regexp.MustCompile(`https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+`)
+	factHostRe = regexp.MustCompile(`(?i)\b([a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}\b`)
+)
+
+// autoAnchorFact infers anchors for a fact that came in without asset_ids:
+// pull URLs/hosts out of the fact text, match them against task-owned assets,
+// cap the result (a fact name-dropping 20 hosts must not mark 20 assets tested).
+// Best effort — any failure just yields no anchors, the fact is written anyway.
+func (t *ToolSet) autoAnchorFact(payload map[string]any) []int64 {
+	if t.as == nil || t.taskID <= 0 {
+		return nil
+	}
+	parts := make([]string, 0, 3)
+	for _, k := range []string{"summary", "detail", "evidence"} {
+		if s, ok := payload[k].(string); ok && s != "" {
+			parts = append(parts, s)
+		}
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	text := strings.Join(parts, "\n")
+	hostSet := map[string]bool{}
+	var hosts []string
+	for _, m := range factHostRe.FindAllString(text, 16) {
+		h := strings.ToLower(m)
+		if !hostSet[h] && net.ParseIP(h) == nil && strings.Contains(h, ".") {
+			hostSet[h] = true
+			hosts = append(hosts, h)
+		}
+		if len(hosts) >= 12 {
+			break
+		}
+	}
+	urlSet := map[string]bool{}
+	var urls []string
+	for _, m := range factURLRe.FindAllString(text, 16) {
+		m = strings.TrimRight(m, ".,;，。；）)】")
+		if u, err := url.Parse(m); err == nil && u.Host != "" {
+			m = fmt.Sprintf("%s://%s%s", u.Scheme, strings.ToLower(u.Host), u.EscapedPath())
+		}
+		if !urlSet[m] {
+			urlSet[m] = true
+			urls = append(urls, m)
+		}
+		if len(urls) >= 12 {
+			break
+		}
+	}
+	if len(hosts) == 0 && len(urls) == 0 {
+		return nil
+	}
+	ids, err := t.as.ResolveHostAssets(t.taskID, hosts, urls, 6)
+	if err != nil {
+		return nil
+	}
+	return ids
+}
+
 func (t *ToolSet) recordFact() actool.CoreTool {
 	return t.writeExpTool("record_fact", "把探索【事实/结论】写入探索图，连到产生它的意图（intent_id）。用于记录探索结果——包括指纹/枚举等【正向结论】，和'端口关闭'/'参数不可注入'/'未发现登录入口'等【否定结论】。\n"+
 		"⚠️一次探索的多个观察要【汇总成一条事实】，不要拆成多条，可以合并成一条事实的就尽量用一条事实表示：summary=对本次结论的总结性一句话，detail=相关细节（可含多个具体项）。例：指纹意图→一条事实 {summary:'识别了 X 站点的技术栈与响应特征', detail:'nginx 1.25 / Vue3 / 200 / title=.. / body_len=..'}，而不是状态码、指纹、标题各记一条。一条意图通常只产出一条事实，拆太碎会让图谱无限膨胀。\n"+
@@ -1696,6 +2388,11 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 			_ = json.Unmarshal(in, &a)
 			batch := len(a.Facts) > 0
 			items := a.Facts
+			// 单次最多 10 条（v0.4.44）：防 worker 一次调用写几十条拆碎的事实，
+			// 图谱会被灌爆。超限截断并在返回值里告知模型。
+			if len(items) > 10 {
+				items = items[:10]
+			}
 			if !batch {
 				items = []factItem{a.factItem}
 			}
@@ -2388,7 +3085,7 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.graphOverview(), t.listFindings(), t.listFacts(), t.nodeDetail(),
 		// cold-digest §6.1: restore folded cold nodes (digest body → members → detail).
 		t.expandDigest(),
-		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.listGoals(), t.addIntent(), t.proveGoal(), t.goalMet(),
+		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.listGoals(), t.addIntent(), t.retireIntent(), t.proveGoal(), t.goalMet(),
 		t.killWorkTool(), t.steerWorkTool(),
 		// report_finding：规划态势研判时若自身已确证漏洞，可直接登记（与 worker 同工具）。
 		t.addFinding(),

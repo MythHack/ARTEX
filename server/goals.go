@@ -10,8 +10,13 @@ import (
 	"strings"
 	"time"
 
+<<<<<<< ours
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+=======
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
+>>>>>>> theirs
 )
 
 type goalSpec struct {
@@ -252,8 +257,17 @@ func (s *Server) admitTaskWhenScheduledWithGenerationChecked(t *Task, mode strin
 	}
 
 	status := lifecycle.Status
+	// 首次准入（bootstrap）之前 tasks.status 一直停在 created，任务实际已跑数小时
+	// 界面上仍显示 created。真正开始执行（不入队）时落 running。
+	if !shouldQueue && status == "created" {
+		status = "running"
+	}
 	if wasTerminal {
 		status = "running"
+		// 终态复活是一次新的探索：清掉旧收尾计数，避免第一轮就被 idle 判据收掉。
+		if err := s.m.pg.ResetTaskProgress(t.ID); err != nil {
+			log.Printf("[auto-finish] task %s 复活时重置进度失败: %v", t.ID, err)
+		}
 	}
 	if err := s.m.applyTaskAdmissionWithSchedule(t.ID, lifecycle.Status, status, shouldQueue, mode, wasQueued, manualUntil, preserveSchedule); err != nil {
 		if !engineWasPaused && !wasPaused && !wasQueued {
@@ -261,6 +275,7 @@ func (s *Server) admitTaskWhenScheduledWithGenerationChecked(t *Task, mode strin
 		}
 		return false, err
 	}
+<<<<<<< ours
 	if lifecycle.Status == "timeout" && status == "running" {
 		// ApplyTaskAdmission reset this timed-out run's persisted clock. Clear the
 		// matching Engine gates before either parking it in FIFO or starting work;
@@ -270,6 +285,31 @@ func (s *Server) admitTaskWhenScheduledWithGenerationChecked(t *Task, mode strin
 		// A final settle round may finish as done. Revival must release its
 		// worker/planner barrier too, while preserving its deadline/checkpoint.
 		s.engine.settling.Delete(t.ID)
+=======
+	if wasTerminal && status == "running" {
+		// 终态复活（timeout/done/failed）统一清 Engine 侧的 per-run 闸门：
+		// ApplyTaskAdmission 已把 first_run_at/deadline_at 清零（旧一轮预算已耗尽，
+		// 复活的跟进工作拿全新预算），这里同步清 settling/deadline/stamped/coordStarted。
+		// 不清的话：timeout 复活会被残留 settling 卡住所有 worker；done 复活则会让
+		// 新起的 deadline 协调器拿过期 deadline 当场再收尾一次，人工跟进意图
+		// （如「深入漏洞」）被静默吞掉（任务 13，2026-11-05 实证）。
+		s.engine.resetTerminalRevival(t.ID)
+		// 上一轮生命周期遗留的挂起收尾请求同样作废——否则复活的第一个规划轮
+		// 会先消费它，把刚复活的任务又收一遍。
+		t.clearSettle()
+		// 自愈：把「服务停止被取消」（部署重启的遗留物）而卡死的 blocked 意图
+		// 重开——继续 = 把没跑完的跑完。用户手动 block 的不受影响。
+		if t.Store != nil {
+			if n, err := t.Store.ReopenCanceledIntents(); err != nil {
+				log.Printf("[admission] task %s 重开 canceled 意图失败: %v", t.ID, err)
+			} else if n > 0 {
+				log.Printf("[admission] task %s 复活时重开 %d 条 canceled blocked 意图", t.ID, n)
+				s.engine.emitActivity(t, db.Activity{Worker: "system", Kind: "text",
+					Summary: fmt.Sprintf("复活时自动重开 %d 条因服务停止而中断的意图", n)})
+			}
+		}
+		log.Printf("[admission] task %s 从终态 %q 复活，超时预算已重置", t.ID, lifecycle.Status)
+>>>>>>> theirs
 	}
 	if shouldQueue {
 		if !wasQueued {
@@ -324,7 +364,7 @@ func (s *Server) startAdmittedTask(t *Task, mode string) {
 	s.engine.Run(s.ctx, t)
 	s.engine.Resume(t)
 	// Run returns early for an already-started task. Explicitly ensure a timeout
-	// coordinator exists after resume; resetTimeoutRevival cleared the completed
+	// coordinator exists after resume; resetTerminalRevival cleared the completed
 	// coordinator's marker and the next real call will stamp a fresh deadline.
 	s.engine.startDeadlineCoordinator(s.ctx, t)
 }

@@ -12,6 +12,7 @@
 #   docker build -t pojun:local .
 FROM python:3.11-slim-bookworm
 ARG TARGETARCH
+<<<<<<< ours
 <<<<<<< .pojun-port/tmp/ours
 # 常用工具：ripgrep / curl / vim，加一批 recon 常备件（按需增删）。
 # Node 从 NodeSource 装 22.x，与前端构建使用的主版本一致。
@@ -21,6 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 =======
+=======
+>>>>>>> theirs
 # 构建源（默认官方；国内/受限网络用 --build-arg 覆盖）：
 #   docker build --build-arg DEBIAN_MIRROR=mirrors.aliyun.com \
 #                --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ .
@@ -48,7 +51,10 @@ RUN apt-get update \
          || echo "[warn] apt 包不可用，跳过: $pkg"; \
        done \
     && curl -fsSL "$NODESOURCE_URL" | bash - \
+<<<<<<< ours
 >>>>>>> .pojun-port/tmp/theirs
+=======
+>>>>>>> theirs
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 # nuclei(漏洞模板扫描引擎,配合 /app/nuclei-templates 情报模板库):
@@ -81,17 +87,23 @@ RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@late
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+<<<<<<< ours
 <<<<<<< .pojun-port/tmp/ours
 ENV TZ=Asia/Shanghai
 # 预编译好的对应架构二进制（dist/amd64/artex 或 dist/arm64/artex）
 COPY dist/${TARGETARCH}/artex /app/artex
 =======
+=======
+>>>>>>> theirs
 # 预编译好的对应架构二进制（dist/amd64/pojun 或 dist/arm64/pojun）
 COPY dist/${TARGETARCH}/pojun /app/pojun
 # 特权安装助手：容器内以 root 常驻 unix socket，「宿主环境」页可运行期装/重装工具；
 # 构建期也用它把 catalog 缺失项一次性装齐（开箱即用，见下方 install-all）。
 COPY dist/${TARGETARCH}/pojun-hostd /app/pojun-hostd
+<<<<<<< ours
 >>>>>>> .pojun-port/tmp/theirs
+=======
+>>>>>>> theirs
 # 守护启动脚本：进程退出后按退出码决定是否重新拉起，页面一键更新靠它完成换装。
 # 它同时负责把 SIGTERM 转发给 pojun —— docker stop 只把信号发给 PID 1，
 # 不转发的话 pojun 收不到、做不了优雅关闭，10 秒后被 SIGKILL 硬杀。

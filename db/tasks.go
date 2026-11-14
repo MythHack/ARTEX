@@ -62,11 +62,22 @@ type Task struct {
 	// 覆盖度、不自动累积 task_scope(source=auto)、不给 agent 开放 add_task_scope/
 	// list_untested_assets、态势里不注入 coverage 块(scope 字段仍保留)。company 关联
 	// (task_scope kind=company)与此开关无关，永不受影响。见 db/task_scope.go。
+<<<<<<< ours
 	CoverageEnabled   bool `json:"coverage_enabled"`
 	ShareGlobalAssets bool `json:"share_global_assets"`
 	// WorkerCount is the per-task concurrent work-agent count. 0 means use the
 	// global settings.workers default when the engine starts this task.
 	WorkerCount int `json:"worker_count"`
+=======
+	CoverageEnabled bool `json:"coverage_enabled"`
+	// AuthConfig 是任务级目标登录凭据（v0.4.8）；Password/TOTPSecret 不参与
+	// JSON 序列化，API 只回传 has_password/has_totp 派生标记。
+	AuthConfig *TaskAuthConfig `json:"auth_config,omitempty"`
+	// 自主推进（Autopilot）：任务级开关；AutopilotExtensions 记录 deadline
+	// 已自动延长的次数（任务复活时归零）。
+	Autopilot           bool `json:"autopilot"`
+	AutopilotExtensions int  `json:"autopilot_extensions,omitempty"`
+>>>>>>> theirs
 }
 
 // TaskDeleteResult reports optional related-data cleanup performed in the same
@@ -206,6 +217,8 @@ type TaskCreateOptions struct {
 	Remark string
 	// InterceptRules 是任务级资产拦截规则,创建时随任务在同一事务内写入 task_intercept_rules。
 	InterceptRules []TaskInterceptRuleInput
+	// AuthConfig 是任务级目标登录凭据（v0.4.8）；nil=未配置。
+	AuthConfig *TaskAuthConfig
 }
 
 // CreateTaskWithOptions creates an exploration, task, direct source relations,
@@ -287,10 +300,22 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		TimeoutSeconds: opts.TimeoutSeconds, PlanHeartbeatSeconds: opts.PlanHeartbeatSeconds,
 		CoverageEnabled: coverageEnabled, ShareGlobalAssets: opts.ShareGlobalAssets, WorkerCount: opts.WorkerCount, Remark: opts.Remark,
 	}
+	var authJSON any
+	if opts.AuthConfig != nil {
+		if raw, err := opts.AuthConfig.DBValue(); err == nil && len(raw) > 0 {
+			authJSON = string(raw)
+		}
+	}
 	if err := tx.QueryRow(`
+<<<<<<< ours
 INSERT INTO tasks(name, remark, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, worker_count, share_global_assets, no_result_seconds, no_result_min_findings, no_result_min_severity)
 VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 RETURNING id, status, paused, created_at`, opts.Name, opts.Remark, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.WorkerCount, opts.ShareGlobalAssets, opts.NoResultSeconds, opts.NoResultMinFindings, opts.NoResultMinSeverity).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+=======
+INSERT INTO tasks(name, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, auth_config)
+VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8,$9,$10)
+RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, authJSON).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+>>>>>>> theirs
 		return nil, err
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
@@ -427,13 +452,23 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 
 const taskCols = `id, COALESCE(name,''), remark, category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
+<<<<<<< ours
 description, goal, exploration_id, status, paused, COALESCE(pause_reason,''), queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), share_global_assets, COALESCE(worker_count,0), first_run_at, deadline_at, COALESCE(active_run_seconds,0), run_segment_started_at, no_result_seconds, no_result_min_findings, no_result_min_severity, no_result_base_seconds, no_result_checked_at, stop_reason`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
 	if err := sc.Scan(&t.ID, &t.Name, &t.Remark, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.PauseReason, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.ShareGlobalAssets, &t.WorkerCount, &t.FirstRunAt, &t.DeadlineAt, &t.ActiveRunSeconds, &t.RunSegmentStartedAt, &t.NoResultSeconds, &t.NoResultMinFindings, &t.NoResultMinSeverity, &t.NoResultBaseSeconds, &t.NoResultCheckedAt, &t.StopReason); err != nil {
+=======
+description, goal, exploration_id, status, paused, queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), first_run_at, deadline_at, COALESCE(auth_config::text,'null'), COALESCE(autopilot,false), COALESCE(autopilot_extensions,0)`
+
+func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
+	var t Task
+	var authRaw string
+	if err := sc.Scan(&t.ID, &t.Name, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.FirstRunAt, &t.DeadlineAt, &authRaw, &t.Autopilot, &t.AutopilotExtensions); err != nil {
+>>>>>>> theirs
 		return nil, err
 	}
+	t.AuthConfig = ParseTaskAuth([]byte(authRaw))
 	t.Pinned = t.PinnedAt != nil
 	return &t, nil
 }
@@ -845,6 +880,10 @@ DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
 	}
 	// llm_usage (the token metering ledger) is intentionally NOT deleted with the
 	// task — it is kept as historical accounting even after the task is gone.
+	// autopilot_events 用 TEXT task_id 且无外键，任务删除时显式清理。
+	if _, err := tx.Exec(`DELETE FROM autopilot_events WHERE task_id=$1`, strconv.FormatInt(id, 10)); err != nil {
+		return result, err
+	}
 	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=$1`, id); err != nil {
 		return result, err
 	}

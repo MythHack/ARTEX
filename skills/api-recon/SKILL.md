@@ -448,3 +448,26 @@ stub 检查：外层 `response_code` 与拦截器门一致；flat codes 与 tree
 
 - Grep 配方、`config.json` 模板、排障、Hook、参数逆向 J 节、site_map 模板：**[reference.md](reference.md)**
 - 参考脚本路径见 [脚本与门禁](#脚本与门禁) 表
+
+## Webpack/Sourcemap 源码泄露（js_audit 工具，SPA 必跑）
+
+Vue/React 单页应用的 dist 产物常把 sourcemap 一起发上线——`.js.map` 里的
+`sourcesContent` 就是**原始源码全文**（Vue SFC 组件、接口封装、硬编码密钥），
+属 CWE-540 源码信息泄露。
+
+**用平台工具 `js_audit`**（入口 URL 1-6 个，自动完成全链路）：
+
+1. 给入口 HTML（或已知 .js）→ 脚本提取 `<script src>` 与 chunk；
+2. 每个 JS 检测 `//# sourceMappingURL=`（外链/内联 base64）+ 兜底探测 `<js>.map`；
+3. 命中则还原 sourcesContent 落盘到任务目录 `jsmap/`（保留 .vue/.env 结构）；
+4. 同步扫描密钥（阿里云 LTAI/AKID、AWS AKIA、私钥、JWT、AK-SK 键值对、内网段）
+   与接口/路由清单（http URL、`/api/**`、vue-router path）。
+
+**结论口径**：
+- map 命中且 sourcesContent 可还原 = CWE-540 **high**（L3：拿到原始源码）；
+- 还原内容里有**真实可用凭据**（AK/SK 能调通、私钥能解密）= **critical**；
+- 只有压缩后 JS 无 map：从 chunk 里抽 `baseURL`/`/api/**`/路由进契约清单
+  （接 `api_contract` / `api-security-testing`）。
+
+假点：`.map` 请求返回 200 但内容是 SPA fallback 的 HTML（不是 JSON）不算命中；
+`sources` 只有 webpack runtime 没有业务文件不算。

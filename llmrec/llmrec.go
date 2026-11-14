@@ -8,11 +8,11 @@ import (
 	"encoding/json"
 	"iter"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Autumn-27/artex/db"	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
 )
 
@@ -85,28 +85,34 @@ func Wrap(inner llm.Provider, pg *db.DB, model, profName, thinkingType, reasonin
 	}
 }
 
-// parseSession extracts task id and worker role from session strings like
-// "exp1-worker-i3" → ("1", "worker") or "exp2-planner" → ("2", "planner").
-func parseSession(s string) (taskID, worker string) {
+// parseSession extracts task id, worker role and intent id from session strings:
+// "exp1-worker-i3" → ("1", "worker", 3)；"exp2-planner" → ("2", "planner", 0)。
+// 无后缀或后缀不是 i<n>（exp%d-compactor、mainagent 等）→ intent 0 = 该调用不属于
+// 某个具体意图（B7：意图级 token 记账靠它）。
+func parseSession(s string) (taskID, worker string, intentID int64) {
 	// format: exp<N>-<role>[-suffix]
 	if !strings.HasPrefix(s, "exp") {
-		return "", ""
+		return "", "", 0
 	}
 	rest := s[3:] // after "exp"
 	// split task number
 	i := strings.IndexByte(rest, '-')
 	if i < 0 {
-		return rest, ""
+		return rest, "", 0
 	}
 	taskID = rest[:i]
 	rest = rest[i+1:]
 	// worker role is up to the next '-' (e.g. "worker" from "worker-i3")
 	if j := strings.IndexByte(rest, '-'); j >= 0 {
 		worker = rest[:j]
+		// intent suffix (B7): "i3" → 3. Older/unknown suffixes (compactor 等) stay 0.
+		if n, err := strconv.Atoi(strings.TrimPrefix(rest[j+1:], "i")); err == nil && n > 0 {
+			intentID = int64(n)
+		}
 	} else {
 		worker = rest
 	}
-	return taskID, worker
+	return taskID, worker, intentID
 }
 
 // Stream implements llm.Provider. It delegates to the inner provider, accumulates
@@ -123,7 +129,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 	recordBodies := r.enabled == nil || r.enabled()
 	start := time.Now()
 	session := transcript.SessionIDFrom(ctx)
-	parsedID, worker := parseSession(session)
+	parsedID, worker, intentID := parseSession(session)
 	if ov := workerFrom(ctx); ov != "" {
 		worker = ov
 	}
@@ -166,8 +172,8 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 			if err != nil {
 				status = "error"
 			}
-			// Lightweight metering row — always written.
-			r.recordUsage(taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
+		// Lightweight metering row — always written.
+		r.recordUsage(taskID, expID, worker, intentID, usage, int(time.Since(start).Milliseconds()), status)
 			// Heavy trace row — only when body recording is on.
 			if recordBodies {
 				r.record(req, session, taskID, worker, reqBody, capt, start, textBuf.String(), thinkingBuf.String(), usage, stopReason, err)
@@ -223,7 +229,7 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	recordBodies := r.enabled == nil || r.enabled()
 	start := time.Now()
 	session := transcript.SessionIDFrom(ctx)
-	parsedID, worker := parseSession(session)
+	parsedID, worker, intentID := parseSession(session)
 	if ov := workerFrom(ctx); ov != "" {
 		worker = ov
 	}
@@ -245,7 +251,7 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	if err != nil {
 		status = "error"
 	}
-	r.recordUsage(taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
+	r.recordUsage(taskID, expID, worker, intentID, usage, int(time.Since(start).Milliseconds()), status)
 	if recordBodies {
 		r.record(req, session, taskID, worker, reqBody, capt, start, msg.Text(), thinkingText(msg), usage, stopReason, err)
 	}
@@ -263,8 +269,10 @@ func thinkingText(msg llm.Message) string {
 }
 
 // recordUsage appends one lightweight metering row to llm_usage (no bodies). Skips
-// zero-token calls with no model, which carry nothing worth metering.
-func (r *Recorder) recordUsage(taskID string, expID int64, worker string, usage llm.Usage, latencyMs int, status string) {
+// zero-token calls with no model, which carry nothing worth metering. intentID (B7)
+// is the intent the session suffix i<n> points at, 0 = not tied to one intent
+// (planner / mainagent / compactor / 无意图 worker 调用).
+func (r *Recorder) recordUsage(taskID string, expID int64, worker string, intentID int64, usage llm.Usage, latencyMs int, status string) {
 	if r.pg == nil {
 		return
 	}
@@ -275,6 +283,7 @@ func (r *Recorder) recordUsage(taskID string, expID int64, worker string, usage 
 	err := r.pg.InsertLLMUsage(&db.LLMUsage{
 		TaskID:        taskID,
 		ExplorationID: expID,
+		IntentID:      intentID,
 		Worker:        worker,
 		Model:         r.model,
 		ProfileName:   r.prof,

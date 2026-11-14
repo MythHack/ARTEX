@@ -5,8 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Autumn-27/artex/db"
-)
+	"github.com/Autumn-27/artex/db")
 
 // modelPrice 是内置参考价（USD / 1M tokens）。定价表只能近似：各家价格随
 // 版本/渠道变动，这里给的是公开标价的数量级，用于让用户看清"哪个任务、

@@ -1,4 +1,4 @@
-// Package hostd:ARTEX 的特权安装助手(artex-hostd)。
+// Package hostd:POJUN 的特权安装助手(pojun-hostd)。
 //
 // 为什么需要它:主服务 systemd 单元带 NoNewPrivileges=true + ProtectSystem=strict
 // + CapabilityBoundingSet=CAP_NET_BIND_SERVICE,进程无法提权、/usr 只读——所以
@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/user"
 	"strings"
 
 	"github.com/Autumn-27/artex/hosttools"
@@ -22,8 +23,8 @@ import (
 type PkgMgr string
 
 const (
-	PkgApt PkgMgr = "apt"
-	PkgDnf PkgMgr = "dnf"
+	PkgApt  PkgMgr = "apt"
+	PkgDnf  PkgMgr = "dnf"
 	PkgNone PkgMgr = ""
 )
 
@@ -90,15 +91,22 @@ func aptArgv(tool hosttools.Tool, mgr PkgMgr, proxy string) ([]string, error) {
 	if pkg == "" {
 		return nil, fmt.Errorf("%s 没有适配本机包管理器的包名", tool.Name)
 	}
+	// 一个工具可能对应多个系统包（如 LibreOffice 三组件），包名字段允许空格分隔。
+	pkgs := strings.Fields(pkg)
+	if len(pkgs) == 0 {
+		return nil, fmt.Errorf("%s 没有适配本机包管理器的包名", tool.Name)
+	}
 	if mgr == PkgApt {
 		argv := append([]string{"apt-get"}, APTProxyArgs(proxy)...)
-		return append(argv, "install", "-y", pkg), nil
+		argv = append(argv, "install", "-y")
+		return append(argv, pkgs...), nil
 	}
 	argv := []string{"dnf"}
 	if proxy != "" {
 		argv = append(argv, "--setopt=proxy="+proxy)
 	}
-	return append(argv, "install", "-y", pkg), nil
+	argv = append(argv, "install", "-y")
+	return append(argv, pkgs...), nil
 }
 
 // aptUpdateArgv apt 索引刷新(apt 源随时间失效,装之前先 update 一次)。
@@ -133,13 +141,20 @@ func pipArgv(tool hosttools.Tool, proxy string) []string {
 	if !tool.PipLibrary {
 		if _, err := os.Stat("/usr/bin/pipx"); err == nil {
 			argv := []string{"pipx", "install"}
-			if proxy != "" {
-				argv = append(argv, "--pip-args=--proxy="+proxy)
+			// root 下必须 --global：否则入口脚本落 /root/.local/bin，
+			// 服务用户 pojun 既穿不过 /root 也不在 PATH（install.sh 同款坑）。
+			if runningAsRoot() {
+				argv = append(argv, "--global")
 			}
+			pipArgs := "--no-cache-dir"
+			if proxy != "" {
+				pipArgs += " --proxy=" + proxy
+			}
+			argv = append(argv, "--pip-args="+pipArgs)
 			return append(argv, pkgs...)
 		}
 	}
-	argv := []string{"python3", "-m", "pip", "install", "--break-system-packages"}
+	argv := []string{"python3", "-m", "pip", "install", "--break-system-packages", "--no-cache-dir"}
 	if proxy != "" {
 		argv = append(argv, "--proxy", proxy)
 	}
@@ -149,12 +164,14 @@ func pipArgv(tool hosttools.Tool, proxy string) []string {
 // GitHubAssetURL 由资产模板拼出下载地址。tag 形如 v3.4.10,资产名里不带 v。
 //
 // 模板占位符：
-//   {ver}   版本号（不带 v），如 3.4.10
-//   {verv}  版本号（带 v），如 v3.4.10
-//   {arch}  架构，amd64 / arm64（Go 的 GOARCH 写法）
-//   {arch2} 架构，x86_64 / aarch64（部分项目用这套，如 gitleaks/amass）
-//   {arch3} 架构，x86 / arm（又一套，如 chisel 的部分资产）
-//   {arch4}  架构，x64 / arm64（gitleaks 用这套）
+//
+//	{ver}   版本号（不带 v），如 3.4.10
+//	{verv}  版本号（带 v），如 v3.4.10
+//	{arch}  架构，amd64 / arm64（Go 的 GOARCH 写法）
+//	{arch2} 架构，x86_64 / aarch64（部分项目用这套，如 gitleaks/amass）
+//	{arch3} 架构，x86 / arm（又一套，如 chisel 的部分资产）
+//	{arch4}  架构，x64 / arm64（gitleaks 用这套）
+//	{arch5}  架构，64bit / ARM64（trivy 用这套）
 //
 // 各项目的资产命名差异很大（架构在前/后、版本带不带 v、扩展名 .zip/.tar.gz/.gz），
 // 所以模板必须能覆盖这些差异，否则「一键安装」只能对着一半项目有效。
@@ -166,10 +183,18 @@ func GitHubAssetURL(tool hosttools.Tool, tag string) string {
 	asset = strings.ReplaceAll(asset, "{arch2}", hosttools.ArchAlt())
 	asset = strings.ReplaceAll(asset, "{arch3}", hosttools.ArchShort())
 	asset = strings.ReplaceAll(asset, "{arch4}", hosttools.ArchX64())
+	asset = strings.ReplaceAll(asset, "{arch5}", hosttools.ArchLong())
 	return fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", tool.Repo, tag, asset)
 }
 
 // GitHubAPITagURL 取最新 tag 的 API 地址。
 func GitHubAPITagURL(tool hosttools.Tool) string {
 	return fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", tool.Repo)
+}
+
+// runningAsRoot 判断当前宿主进程是否 root。hostd 由 systemd 以 root 启动；
+// 非 root 时 pipx 不加 --global（保持用户级安装语义）。
+func runningAsRoot() bool {
+	u, err := user.Current()
+	return err == nil && u.Uid == "0"
 }

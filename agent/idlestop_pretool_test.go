@@ -96,14 +96,24 @@ func TestIdleStopPreToolUseNudgesThenStops(t *testing.T) {
 		t.Error("第一次拦截不应直接收场（要给模型写回的机会）")
 	}
 
-	// 模型收到提示后仍不停（继续零写回）→ 第二次真收场。
-	block2, _, _ := hooks.PreToolUse(context.Background(), "Bash", []byte(`{}`))
-	hooks.PostToolUse(context.Background(), "Bash", []byte(`{}`), []byte(`ok`), false)
+	// 模型收到提示后仍不停（继续零写回）：先继续拦截提醒，到 prevent 轮
+	// 才真收场（v0.4.62：nudge 3 轮 + prevent 5 轮，不再无限 block 辩论）。
+	var block2 bool
+	// nudge 后再推进 prevent-nudge 轮；cancel 发生在「到 prevent 轮的那次
+	// PreToolUse」上（peek 判据），所以循环后再补一次 PreToolUse 触发。
+	for i := 0; i < idleStopPreventRounds-idleStopRounds; i++ {
+		block2, _, _ = hooks.PreToolUse(context.Background(), "Bash", []byte(`{}`))
+		if !block2 {
+			t.Fatalf("提示后第 %d 轮仍零写回，应继续拦截", i+1)
+		}
+		hooks.PostToolUse(context.Background(), "Bash", []byte(`{}`), []byte(`ok`), false)
+	}
+	block2, _, _ = hooks.PreToolUse(context.Background(), "Bash", []byte(`{}`))
 	if !block2 {
-		t.Fatal("第二次仍零写回应继续拦截")
+		t.Fatal("到 prevent 轮仍应拦截")
 	}
 	if stoppedReason == "" {
-		t.Error("第二次仍不停应真收场并记原因")
+		t.Errorf("到 prevent 轮(%d)应真收场并记原因", idleStopPreventRounds)
 	}
 }
 

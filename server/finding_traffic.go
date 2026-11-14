@@ -13,10 +13,10 @@ import (
 	"strconv"
 	"unicode/utf8"
 
+	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/evidence"
-	actool "github.com/Autumn-27/norma/tool"
 )
 
 func (s *Server) evidenceStore() *evidence.Store {
@@ -109,7 +109,7 @@ func (s *Server) findingTrafficAccess(w http.ResponseWriter, r *http.Request, wr
 	}
 	f, err := s.m.pg.GetFinding(id)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeInternalError(w, "findings.traffic.access", err)
 		return 0, false
 	}
 	if f == nil {

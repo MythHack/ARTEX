@@ -4,8 +4,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-)
+	"github.com/Autumn-27/artex/db")
 
 // 重试策略的服务端解析，见 docs/LLM重试设计.md。五层里：
 //   - 建连 / 空响应 / 同 provider 安全窗口 是「跟着端点走」的，每个 LLM 配置可以覆盖

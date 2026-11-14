@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+<<<<<<< ours
 	"github.com/Autumn-27/artex/agent"
 	pgdb "github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/enrich"
@@ -23,7 +24,16 @@ import (
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/artex/vulnintel"
+=======
+>>>>>>> theirs
 	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Autumn-27/artex/agent"
+	pgdb "github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/enrich"
+	"github.com/Autumn-27/artex/guard"
+	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/artex/vulnintel"
 )
 
 // Task is one engagement: a description + goal + its own exploration store,
@@ -92,6 +102,74 @@ type Task struct {
 	// a burst into one round, so several may pile up before drainTriggers() clears them.
 	trigMu          sync.Mutex
 	pendingTriggers []agent.TriggerEvent
+
+	// 自动收尾（v0.5.0）：runRound 只登记原因，plannerLoop 在本轮 inflight
+	// 释放后再执行 settle，避免 settle 的 drain 等自己。goal_met 在有在跑
+	// 意图时也会先挂起，等 frontier 抽干后的下一次唤醒直接收尾。
+	settleMu            sync.Mutex
+	pendingSettleReason string
+	pendingSettleDetail string
+
+	// autopilot 是自主推进开关的运行态镜像（每次现查，关掉开关下一次规划/执行
+	// 就回到普通任务语义）。持久化在 tasks.autopilot。
+	autopilot atomic.Bool
+}
+
+// AutopilotEnabled reports whether this task is running in autopilot mode.
+func (t *Task) AutopilotEnabled() bool { return t != nil && t.autopilot.Load() }
+
+// SetAutopilot flips the runtime mirror (persistence happens in db.SetTaskAutopilot).
+func (t *Task) SetAutopilot(on bool) { t.autopilot.Store(on) }
+
+// NotifyAutopilotStall wakes the planner with an autopilot stall trigger.
+//
+// 刻意**不复用 hint**：hint 会进 freshDirection（新增方向），在 auto_finish 里
+// 触发 ResetTaskProgress 把 idle 计数清零——看门狗一唤醒就等于宣布「有新进展」，
+// 恰好把要判定的停滞信号抹掉。这个 kind 只唤醒、不改方向、不重置进度。
+func (t *Task) NotifyAutopilotStall(detail string) {
+	if t == nil || strings.TrimSpace(detail) == "" {
+		return
+	}
+	t.trigMu.Lock()
+	t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "autopilot_stall", Detail: detail})
+	t.trigMu.Unlock()
+	t.Notify()
+}
+
+// requestSettle 登记自动收尾原因（不在此处执行 settle）。重复登记以最后一条为准。
+func (t *Task) requestSettle(reason, detail string) {
+	if reason == "" {
+		return
+	}
+	t.settleMu.Lock()
+	t.pendingSettleReason, t.pendingSettleDetail = reason, detail
+	t.settleMu.Unlock()
+}
+
+func (t *Task) peekSettle() (string, string) {
+	t.settleMu.Lock()
+	defer t.settleMu.Unlock()
+	return t.pendingSettleReason, t.pendingSettleDetail
+}
+
+func (t *Task) clearSettle() {
+	t.settleMu.Lock()
+	t.pendingSettleReason, t.pendingSettleDetail = "", ""
+	t.settleMu.Unlock()
+}
+
+// hasPendingFreshDirection 检查尚未消费的 trigger 里是否有用户新增目标/提示。
+// 用于挂起收尾的瞬间：用户刚加目标时不能先 settle 再丢目标。
+func (t *Task) hasPendingFreshDirection() bool {
+	t.trigMu.Lock()
+	defer t.trigMu.Unlock()
+	for _, ev := range t.pendingTriggers {
+		switch ev.Kind {
+		case "goal", "goal_edited", "goal_deleted", "hint":
+			return true
+		}
+	}
+	return false
 }
 
 // taskLifecycleState is an internally consistent view of the mutable task
@@ -285,6 +363,11 @@ type Manager struct {
 	vulnSyncMu        sync.Mutex
 	vulnSyncRunning   atomic.Bool
 	vulnSyncStartedAt atomic.Int64
+	// vulnSyncCancel 存当前那轮的可取消 ctx 的 CancelFunc（经 atomic.Value 包一层）；
+	// vulnSyncPhase 是当前阶段的人读描述（状态页展示「同步进行到哪一步」）。
+	// 两者都只在持有 vulnSyncMu 的那一轮里写，CancelVulnIntelSync 只读。
+	vulnSyncCancel atomic.Value // context.CancelFunc
+	vulnSyncPhase  atomic.Value // string
 	// 近期高危快通道的互斥：与主同步【不共用锁】——主同步一轮最长 30 分钟，
 	// 快通道必须能在那期间照常把新披露的高危送进库（共用锁会被拖到 30 分钟
 	// 一次，等于没有快通道）。快通道自己内部也互斥，避免重复拉同一窗口。
@@ -350,6 +433,10 @@ const (
 	settingCompactionTokens     = "compaction_max_tokens"
 	settingCompactionTimeout    = "compaction_timeout_seconds"
 	settingCompactionMaxMembers = "compaction_max_members"
+	// 冷节点压缩器钉住的 LLM 配置 id（B10）。空/0 = 跟随任务链上的 planner 配置；
+	// >0 = 压缩器的一次性 Complete 调用永远跑在这个 profile 上（绑定语义：不参与
+	// 任务链轮转）。让用户能把长会话留给贵模型、把机械压缩留给便宜模型。
+	settingCompactorProfileID = "compactor_profile_id"
 	// LLM 轮询(故障转移)。默认关闭——开启后走「全局激活配置」的 agent 在当前配置
 	// 不可用(余额不足/key 失效/限流/服务异常)时自动切到下一个配置。
 	// settingLLMPoolBindFallback 仅在轮询开启时有意义:默认关闭,即 agent/任务显式
@@ -668,6 +755,35 @@ func (m *Manager) SetCompactionMaxMembers(n int) error {
 	return m.pg.SetSetting(settingCompactionMaxMembers, strconv.Itoa(n))
 }
 
+// CompactorProfileID 返回压缩器钉住的 LLM profile id（B10）。0/未设置 = 跟随任务链上
+// 的 planner 配置（历史行为）。
+func (m *Manager) CompactorProfileID() int64 {
+	if m == nil || m.pg == nil {
+		return 0
+	}
+	v, ok, err := m.pg.GetSetting(settingCompactorProfileID)
+	if err != nil || !ok {
+		return 0
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// SetCompactorProfileID 持久化压缩器钉住的 profile id。id<=0 = 恢复跟随 planner（清空设置）。
+// 调用方负责由此触发的 agent 重建（putSettings 走 invalidateTaskAgents）。
+func (m *Manager) SetCompactorProfileID(id int64) error {
+	if m == nil || m.pg == nil {
+		return fmt.Errorf("数据库未就绪")
+	}
+	if id <= 0 {
+		return m.pg.SetSetting(settingCompactorProfileID, "")
+	}
+	return m.pg.SetSetting(settingCompactorProfileID, strconv.FormatInt(id, 10))
+}
+
 // Enrich returns the asset auto-completion engine (may be nil if init failed).
 func (m *Manager) Enrich() *enrich.Engine { return m.enrich }
 
@@ -708,6 +824,9 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	}
 	if err := pg.EnsureLLMRecordsTable(); err != nil {
 		log.Printf("[llmrec] create table: %v", err)
+	}
+	if err := pg.EnsureTaskArtifactsTable(); err != nil {
+		return nil, err
 	}
 	if err := pg.EnsureLLMUsageTable(); err != nil {
 		log.Printf("[llmusage] create table: %v", err)
@@ -1005,10 +1124,13 @@ func (m *Manager) deepSeekSearchKey() string {
 	return strings.TrimSpace(key)
 }
 
+<<<<<<< ours
 func (m *Manager) setDeepSeekSearchKey(key string) error {
 	return m.pg.SetSetting(settingDeepSeekSearchKey, strings.TrimSpace(key))
 }
 
+=======
+>>>>>>> theirs
 // WebSearchEnabled reports whether web search is enabled.
 func (m *Manager) WebSearchEnabled() bool {
 	m.mu.RLock()
@@ -1428,7 +1550,7 @@ func unixNanoOrZero(t *time.Time) int64 {
 }
 
 func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Interceptor) *Task {
-	return &Task{
+	t := &Task{
 		ID: strconv.FormatInt(pt.ID, 10), ExpID: pt.ExplorationID,
 		Name:       pt.Name,
 		Remark:     pt.Remark,
@@ -1451,6 +1573,8 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		ActiveRunSeconds: pt.ActiveRunSeconds, RunSegmentStartedAt: unixOrZero(pt.RunSegmentStartedAt),
 		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
 	}
+	t.autopilot.Store(pt.Autopilot)
+	return t
 }
 
 // UpdateTaskMetadata changes task metadata and asset visibility without interrupting any
@@ -1746,10 +1870,41 @@ func (m *Manager) SetTaskPaused(id string, paused bool) error {
 	return nil
 }
 
+// SetTaskAutopilot 持久化单任务自主推进开关，并同步运行态镜像与留痕。
+func (m *Manager) SetTaskAutopilot(id string, on bool) (*Task, error) {
+	m.taskStateMu.Lock()
+	defer m.taskStateMu.Unlock()
+	n, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.pg.SetTaskAutopilot(n, on); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	t := m.tasks[id]
+	m.mu.Unlock()
+	if t != nil {
+		t.autopilot.Store(on)
+	}
+	kind, detail := "disabled", "自主推进已关闭"
+	if on {
+		kind, detail = "enabled", "自主推进已开启"
+	}
+	_ = m.pg.InsertAutopilotEvent(id, kind, detail)
+	return t, nil
+}
+
 // ApplyTaskAdmission atomically commits the lifecycle fields controlled by the
 // concurrency scheduler. Keeping status, paused and queue metadata in one UPDATE
 // prevents a failed resume from leaving a task half-revived (for example running
 // but still user-paused, or dequeued without an Engine start).
+//
+// Terminal revival (expectedStatus done/failed/timeout → running) resets
+// first_run_at/deadline_at: the old run's wall-clock budget is spent, and the
+// revived work (human follow-up intent / new goals) deserves a fresh one.
+// Without this, a task revived hours after its deadline makes the deadline
+// coordinator settle it again within seconds — silently swallowing the new work.
 //
 // preservePosition applies only when the row is already queued. A repeated
 // admission keeps its FIFO timestamp; a task that was explicitly paused and is
@@ -1814,12 +1969,16 @@ func (m *Manager) applyTaskAdmissionWithSchedule(id, expectedStatus, status stri
 	    END,
 	    stop_reason=CASE WHEN $6 IN ('done','failed','timeout') AND $2 NOT IN ('done','failed','timeout') THEN '' ELSE stop_reason END,
 	    first_run_at=CASE
-	        WHEN $6='timeout' AND $2 NOT IN ('done','failed','timeout') THEN NULL
+	        WHEN $6 IN ('done','failed','timeout') AND $2 NOT IN ('done','failed','timeout') THEN NULL
 	        ELSE first_run_at
 	    END,
 	    deadline_at=CASE
-	        WHEN $6='timeout' AND $2 NOT IN ('done','failed','timeout') THEN NULL
+	        WHEN $6 IN ('done','failed','timeout') AND $2 NOT IN ('done','failed','timeout') THEN NULL
 	        ELSE deadline_at
+	    END,
+	    autopilot_extensions=CASE
+	        WHEN $6 IN ('done','failed','timeout') AND $2 NOT IN ('done','failed','timeout') THEN 0
+	        ELSE autopilot_extensions
 	    END
 	    ,active_run_seconds=active_run_seconds + CASE WHEN ($3 OR $2 IN ('done','failed','timeout')) AND run_segment_started_at IS NOT NULL THEN GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (now() - run_segment_started_at)))::bigint) ELSE 0 END
 	    ,run_segment_started_at=CASE WHEN $3 OR $2 IN ('done','failed','timeout') THEN NULL ELSE run_segment_started_at END
@@ -2670,6 +2829,18 @@ func (t *Task) NotifyFinding(intentID int64, summary string) {
 	t.trigMu.Lock()
 	t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "finding", IntentID: intentID, Detail: summary})
 	t.trigMu.Unlock()
+	t.Notify()
+}
+
+// NotifyReview (B2) 记录一个意图以 exhausted 收场且**零写回**（事实/资产/漏报全 0）——
+// 「烧了一整轮却什么都没留下」。Detail 带着该方向最近几步的实动作摘要，planner 下一轮
+// 直接拿它复盘落 fact，不用再整跑轨迹。事件同样能穿过早退的收场轮（drain 在门后）。
+func (t *Task) NotifyReview(intentID int64, detail string) {
+	if intentID > 0 {
+		t.trigMu.Lock()
+		t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "review", IntentID: intentID, Detail: detail})
+		t.trigMu.Unlock()
+	}
 	t.Notify()
 }
 

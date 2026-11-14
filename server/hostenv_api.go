@@ -1,6 +1,6 @@
 // 宿主环境 API:体检 + 一键安装。
 //
-// 「一键安装」的实现在特权助手 artex-hostd 里(见 hostd 包)——主服务受
+// 「一键安装」的实现在特权助手 pojun-hostd 里(见 hostd 包)——主服务受
 // NoNewPrivileges + ProtectSystem=strict 限制无法提权,只能经 Unix socket 把
 // 请求转过去。本文件是这层转发 + 前端契约。
 package server
@@ -19,11 +19,10 @@ import (
 
 	"github.com/Autumn-27/artex/hosttools"
 	"github.com/Autumn-27/artex/proxyprobe"
-	"github.com/Autumn-27/artex/selfupdate"
-)
+	"github.com/Autumn-27/artex/selfupdate")
 
 // 默认 socket 路径,与 hostd 单元里的 -socket 一致;可用环境变量覆盖。
-const defaultHostdSocket = "/run/artex/hostd.sock"
+const defaultHostdSocket = "/run/pojun/hostd.sock"
 
 func hostdSocket() string {
 	if p := strings.TrimSpace(os.Getenv("ARTEX_HOSTD_SOCKET")); p != "" {
@@ -56,7 +55,7 @@ func (s *Server) hostdProbe(ctx context.Context) (bool, string) {
 	}
 	resp, err := hostdClient().Do(req)
 	if err != nil {
-		return false, "宿主助手未运行（未安装 artex-hostd，或当前是 Docker 部署）"
+		return false, "宿主助手未运行（未安装 pojun-hostd，或当前是 Docker 部署）"
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -101,7 +100,7 @@ func (s *Server) hostenvStatus(w http.ResponseWriter, r *http.Request) {
 	ver, present := s.hostdVersion(r.Context())
 	reason := ""
 	if !present {
-		reason = "宿主助手未运行（未安装 artex-hostd，或当前是 Docker 部署）"
+		reason = "宿主助手未运行（未安装 pojun-hostd，或当前是 Docker 部署）"
 	}
 	writeJSON(w, 200, map[string]any{
 		"tools": hosttools.Inventory(),
@@ -317,7 +316,7 @@ type hostdUnavailable struct{ msg string }
 func (e hostdUnavailable) Error() string { return e.msg }
 
 func errConnectHostd(err error) error {
-	return hostdUnavailable{"宿主助手不可用（未安装 artex-hostd，或当前是 Docker 部署）: " + err.Error()}
+	return hostdUnavailable{"宿主助手不可用（未安装 pojun-hostd，或当前是 Docker 部署）: " + err.Error()}
 }
 
 // hostdVersion 查询助手版本。
@@ -344,7 +343,7 @@ func (s *Server) hostdVersion(ctx context.Context) (version string, present bool
 
 // StartHostdReconcile 在后台把助手版本对齐到主程序版本。
 //
-// 为什么需要它：助手 artex-hostd 装在 root 拥有的 /usr/local/bin，主服务受
+// 为什么需要它：助手 pojun-hostd 装在 root 拥有的 /usr/local/bin，主服务受
 // ProtectSystem=strict 限制写不进去，所以**助手的升级只能由助手自己完成**。
 // 主程序每次自我升级后重启，这里发现版本落后就通知助手自我换装；助手会自己从
 // 官方 Release 下载并按 SHA256SUMS 校验，主程序能影响的只有"装哪个已发布版本"。

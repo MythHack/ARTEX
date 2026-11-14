@@ -58,8 +58,6 @@ func (s *Server) listenerStart(w http.ResponseWriter, r *http.Request) {
 	// 本机端口已在收，隧道可后续修；错误随响应带出）。
 	cb := s.ResolveConnectBack(l.Port)
 	if s.c2RelayConfig().Mode == "ssh" {
-		// pojun v0.4.68：隧道生命周期不再绑定 HTTP 请求 context（请求结束会杀隧道），
-		// startRelayTunnel 已去掉 ctx 参数。
 		if terr := s.startRelayTunnel(l.Name, l.Port); terr != nil {
 			cb.Via = "中继隧道建立失败: " + terr.Error()
 		}

@@ -9,8 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/artex/db"
-)
+	"github.com/Autumn-27/artex/db")
 
 // Scheduler drives P3 triggers: on each tick it fires due interval triggers and
 // scans for new findings / newly-met goals (any task) to fire event triggers.

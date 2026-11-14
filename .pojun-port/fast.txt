@@ -1,0 +1,16 @@
+M	agent/idlestop.go
+M	agent/idlestop_pretool_test.go
+M	agent/idlestop_test.go
+M	config/config_test.go
+M	db/finding_dedup_test.go
+M	db/intent_dedup_test.go
+M	db/prompt_seed_test.go
+M	db/skill_visibility_test.go
+M	guard/guard_test.go
+M	hosttools/category_test.go
+M	notify/http.go
+M	server/hostenv_batch_test.go
+M	skills/api-recon/SKILL.md
+M	skills/redteam-ops/SKILL.md
+M	skills/vuln-hunting/reference.md
+M	traffic/archive.go

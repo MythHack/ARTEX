@@ -88,6 +88,14 @@ const (
 	// 事实、拉取目标信息），这些轮次不写回是正常的。给它一段起跑宽限期，
 	// 避免开局就被判定为空转。
 	idleStopMinElapsed = 3 * time.Minute
+
+	// idleStopPreventRounds 是「提示后仍无写回」多久才真收场。
+	//
+	// 与 nudge 轮数分开（issue #2 的核心诉求）：3 轮无写回先提示（给模型写回
+	// 机会），提示后再给 2 轮；仍无写回就结束本轮——而不是像以前那样每次工具
+	// 调用都 blocked 但 run 不结束，模型跟 hook 逐轮辩论烧 token（线上实测
+	// 单条意图被拦到「连续 20 轮」才结束，journal 里 2583 条收场日志）。
+	idleStopPreventRounds = 5
 )
 
 // idleStopper 在一轮 worker run 内跟踪「连续无写回的轮数」，到阈值就要求收场。
@@ -215,7 +223,6 @@ func (s *idleStopper) totalLocked() int {
 	return s.writes().Total()
 }
 
-
 // idleStopHooks 把 idleStopper 挂在 harness 的 hook 链上。
 //
 // 它是**旁路观察 + 收场请求**的组合：
@@ -244,6 +251,9 @@ func (s *idleStopper) totalLocked() int {
 type idleStopHooks struct {
 	inner harness.HookRunner
 	stop  *idleStopper
+	// cancel 取消本 run 的 context（v0.4.62）：提示后仍无写回时用它真正收场——
+	// PreToolUse 的 block 只拦单次工具调用，run 会继续，模型会逐轮辩论。
+	cancel func(err error)
 	// onStop 被调用一次（带收场原因），用于落日志/落库。
 	onStop func(reason string)
 	// nudged 记录是否已经给过 blocking 提示（给过之后才允许 prevent）。
@@ -288,11 +298,20 @@ func (h *idleStopHooks) PreToolUse(ctx context.Context, name string, input []byt
 		// 第一次：拦住这次工具调用，提示模型写回并收手（它还有机会把成果落库）。
 		return true, idleStopMessage, nil
 	}
-	// 第二次：提示过还不停，真的收场。
-	if h.onStop != nil {
-		h.onStop(reason)
+	// 提示后仍无写回：再给 idleStopPreventRounds 轮机会；到点就取消 run context
+	// 真正收场（block 只拦单次工具调用，不 cancel 的话模型会逐轮跟 hook 辩论）。
+	if h.stop.rounds >= idleStopPreventRounds {
+		// 先记原因（落日志/可落库），再取消 run context；cancel 缺省时退化为
+		// 只拦截——由 Stop hook 的 prevent 路径兜底收场。
+		if h.onStop != nil {
+			h.onStop(reason)
+		}
+		if h.cancel != nil {
+			h.cancel(AbortIdleStop)
+		}
+		return true, idleStopMessage + "（已多次提示未收场，本轮就此结束）", nil
 	}
-	return true, idleStopMessage + "（已多次提示未收场，本轮就此结束）", nil
+	return true, idleStopMessage + "（请立即写回并停止调用工具；再继续将结束本轮）", nil
 }
 
 // PostToolUse 推进「一轮」的计数：一次工具执行 = 一轮。
@@ -330,12 +349,17 @@ func (h *idleStopHooks) Stop(ctx context.Context, messages []llm.Message) (bool,
 	h.mu.Lock()
 	alreadyNudged := h.nudged
 	h.nudged = true
+	rounds := h.stop.rounds
 	h.mu.Unlock()
 	if !alreadyNudged {
 		// 第一次触发：给模型一次把已确认结果写回的机会。
 		return false, []string{idleStopMessage}, ""
 	}
-	// 第二次触发：模型已经收到提示还不停，真的收场。
+	// 提示后仍无写回：到 prevent 轮才真收场（未到只提醒，避免 Stop 路径
+	// 比 PreToolUse 更早切断）。
+	if rounds < idleStopPreventRounds {
+		return false, []string{idleStopMessage + "（请立即写回并停止调用工具；再继续将结束本轮）"}, ""
+	}
 	if h.onStop != nil {
 		h.onStop(reason)
 	}
@@ -343,8 +367,12 @@ func (h *idleStopHooks) Stop(ctx context.Context, messages []llm.Message) (bool,
 }
 
 // wrapIdleStop 把 idleStopper 套在已有 hook 链外层。
-func wrapIdleStop(inner harness.HookRunner, writes func() WriteCounts, onStop func(string)) *idleStopHooks {
-	return &idleStopHooks{inner: inner, stop: newIdleStopper(writes), onStop: onStop}
+func wrapIdleStop(inner harness.HookRunner, writes func() WriteCounts, onStop func(string), cancel ...func(error)) *idleStopHooks {
+	h := &idleStopHooks{inner: inner, stop: newIdleStopper(writes), onStop: onStop}
+	if len(cancel) > 0 {
+		h.cancel = cancel[0]
+	}
+	return h
 }
 
 // idleStopWriteTools 是「写回类」工具：它们是**结束动作**而不是探测动作。
@@ -355,9 +383,12 @@ func wrapIdleStop(inner harness.HookRunner, writes func() WriteCounts, onStop fu
 //   - 不推进计数。写回会让 writes 增长，计数自然被 refreshLocked 清零；
 //     再额外推进一次等于把「有产出」的一轮算成两轮。
 var idleStopWriteTools = map[string]bool{
-	"record_fact":     true,
-	"insert_assets":   true,
-	"report_finding":  true,
+	"record_fact":    true,
+	"insert_assets":  true,
+	"report_finding": true,
+	// save_evidence：附证据=有具体发现（截图/数据样本/日志），且它是收尾动作，
+	// 绝不能拦。计入写回后「找到东西先落证据」也能重置空转计数。
+	"save_evidence": true,
 }
 
 // idleStopMessage 是收场时给模型的说明。
@@ -365,7 +396,12 @@ var idleStopWriteTools = map[string]bool{
 // 说清「为什么收」很重要：模型看到「预算耗尽被终止」会以为是被惩罚，于是
 // 倾向于把还没验证的东西也写成结论；看到「这个方向没有新产出，请把已确认的
 // 写回并停手」它会正确地把已确认的收好。
-const idleStopMessage = "本轮已连续多轮没有任何新发现被写回——这个方向暂时探不到新的东西了。请立刻停止继续探测：把你**已经确认**的结果写回（资产用 insert_assets、结论用 record_fact、确认漏洞用 report_finding），然后用一句话纯文本总结你探到了什么、卡在哪里，结束本轮。不要为了「有产出」而把没验证的猜测写成事实。"
+const idleStopMessage = "本轮已连续多轮没有任何写回——这个方向暂时探不到新东西了。请立即停止调用工具，转入收尾：\n\n" +
+	"1. 把**已经确认**的结果写回（这四种都算产出，写回后计数会重置）：\n" +
+	"   - 结论/观察/排除 → record_fact（**负结果也算**：「测了 X，无 Y，现象 Z」是一条事实）\n" +
+	"   - 新资产 → insert_assets；确认漏洞 → report_finding；现场证据 → save_evidence\n" +
+	"2. 写回完成后，用一句话纯文本总结你探到了什么、卡在哪里，结束本轮。\n\n" +
+	"这不是惩罚，是给你一次把成果落库的机会——已写回的内容全部保留。不要为了「有产出」把没验证的猜测写成事实。"
 
 // logIdleStop 记一条收场日志（统一格式，便于事后统计）。
 func logIdleStop(worker string, taskID int64, intentID int64, reason string) {
@@ -383,6 +419,7 @@ func summarizeWriteDelta(cur, prev WriteCounts) string {
 // planner 靠它区分两种 exhausted：
 //   - 「被墙钟掐断」（还有明确的下一步，只是没时间）
 //   - 「探到边界」（这个方向本身没东西了）
+//
 // 这两种在 planner 的决策里完全相反，混在一起就会导致「一直续派同一方向」。
 func idleStopStateText(reason string) string {
 	return strings.TrimSpace(reason)

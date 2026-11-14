@@ -9,8 +9,7 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-)
+	"github.com/Autumn-27/artex/db")
 
 // 覆盖矩阵缺口提醒（v0.4.63）。
 //

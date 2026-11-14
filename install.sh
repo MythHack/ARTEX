@@ -927,9 +927,9 @@ deploy_docker(){
 POSTGRES_USER=pojun
 POSTGRES_PASSWORD=$PG_PASS
 POSTGRES_DB=pojun
-POJUN_IMAGE=$IMAGE
-POJUN_TAG=$VERSION
-POJUN_INSTALL_PROXY=$INSTALL_PROXY
+ARTEX_IMAGE=$IMAGE
+ARTEX_TAG=$VERSION
+ARTEX_INSTALL_PROXY=$INSTALL_PROXY
 ENV
     chmod 600 "$INSTALL_DIR/.env"
     ok "已生成 $INSTALL_DIR/.env（含随机数据库密码，权限 600）"
@@ -938,10 +938,10 @@ ENV
     # 但代理要跟着本次安装走：它不是"首次生成"的密钥，升级时也该同步，
     # 否则用户改了代理后重跑安装，旧 .env 里的旧代理还在生效。
     if [ -n "$INSTALL_PROXY" ]; then
-      if grep -q '^POJUN_INSTALL_PROXY=' "$INSTALL_DIR/.env"; then
-        sed -i "s|^POJUN_INSTALL_PROXY=.*|POJUN_INSTALL_PROXY=$INSTALL_PROXY|" "$INSTALL_DIR/.env"
+      if grep -q '^ARTEX_INSTALL_PROXY=' "$INSTALL_DIR/.env"; then
+        sed -i "s|^ARTEX_INSTALL_PROXY=.*|ARTEX_INSTALL_PROXY=$INSTALL_PROXY|" "$INSTALL_DIR/.env"
       else
-        printf 'POJUN_INSTALL_PROXY=%s\n' "$INSTALL_PROXY" >> "$INSTALL_DIR/.env"
+        printf 'ARTEX_INSTALL_PROXY=%s\n' "$INSTALL_PROXY" >> "$INSTALL_DIR/.env"
       fi
       ok "已同步 .env 里的装机代理"
     fi
@@ -967,21 +967,21 @@ services:
     restart: unless-stopped
 
   pojun:
-    image: \${POJUN_IMAGE}:\${POJUN_TAG}
+    image: \${ARTEX_IMAGE}:\${ARTEX_TAG}
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      POJUN_PG_DSN: postgres://\${POSTGRES_USER:-pojun}:\${POSTGRES_PASSWORD}@postgres:5432/\${POSTGRES_DB:-pojun}?sslmode=disable
+      ARTEX_PG_DSN: postgres://\${POSTGRES_USER:-pojun}:\${POSTGRES_PASSWORD}@postgres:5432/\${POSTGRES_DB:-pojun}?sslmode=disable
       ANTHROPIC_API_KEY: \${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: \${OPENAI_API_KEY:-}
-      POJUN_LLM_PROVIDER: \${POJUN_LLM_PROVIDER:-}
-      POJUN_LLM_MODEL: \${POJUN_LLM_MODEL:-}
-      POJUN_LLM_BASE_URL: \${POJUN_LLM_BASE_URL:-}
-      POJUN_LLM_PROXY: \${POJUN_LLM_PROXY:-}
+      ARTEX_LLM_PROVIDER: \${ARTEX_LLM_PROVIDER:-}
+      ARTEX_LLM_MODEL: \${ARTEX_LLM_MODEL:-}
+      ARTEX_LLM_BASE_URL: \${ARTEX_LLM_BASE_URL:-}
+      ARTEX_LLM_PROXY: \${ARTEX_LLM_PROXY:-}
       # 装机代理：宿主环境页的「一键安装」和后台情报同步用。Docker 形态没有
       # config.json，只能走环境变量；服务端读它作为数据库 setting 的兜底。
-      POJUN_INSTALL_PROXY: \${POJUN_INSTALL_PROXY:-}
+      ARTEX_INSTALL_PROXY: \${ARTEX_INSTALL_PROXY:-}
     ports:
       - "${PORT}:8787"
       - "127.0.0.1:${PROXY_PORT}:8788"

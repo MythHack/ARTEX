@@ -6,7 +6,9 @@ package report
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +23,8 @@ type TaskDocxInput struct {
 	GeneratedAt time.Time
 	AssetCounts map[string]int
 	Findings    []*db.DBFinding
+	// Goals 是逐条任务目标及其达成状态（红队版 v0.6.31 下放）；nil = 报告省略「目标达成情况」。
+	Goals []GoalLine
 	// AssetNames 资产 id → 可读名（域名/IP/URL）。nil/缺项回退 "id:N"（A8）。
 	AssetNames map[int64]string
 	// Retests finding id → 复测记录（最新在前）。报告带「复测记录」小节（A9）。
@@ -35,6 +39,9 @@ type TaskDocxInput struct {
 	Classification string
 	// PageHeader 页眉文字（空 = 「渗透测试报告」）。
 	PageHeader string
+	// ArtifactImage 证据附件图片解析器（v0.5.0）：Markdown 里
+	// ![说明](artifact:<id>) 会内嵌为图片；nil = 降级为文字说明。
+	ArtifactImage func(id int64) (data []byte, caption string, ok bool)
 }
 
 func sevRankKey(f *db.DBFinding) int {
@@ -59,6 +66,8 @@ func sevRankKey(f *db.DBFinding) int {
 // 同类漏洞×多主机的重复上报在类别层折叠呈现。
 func BuildTaskDocx(in TaskDocxInput) *Docx {
 	d := NewDocx()
+	embedGongwenFonts(d) // 公文字体随文档嵌入（GB/T 9704 全链路）
+	d.SetArtifactImageResolver(in.ArtifactImage)
 	if in.PageHeader != "" {
 		d.SetHeaderText(in.PageHeader)
 	}
@@ -136,6 +145,25 @@ func BuildTaskDocx(in TaskDocxInput) *Docx {
 		d.H2("任务目标")
 		d.P(in.Goal)
 	}
+	// 目标达成情况（红队版 v0.6.31 下放）：逐条列出是否被证明，未全部达成时明确标注。
+	if len(in.Goals) > 0 {
+		met, total := GoalTally(in.Goals)
+		d.H2("目标达成情况")
+		if met < total {
+			d.P(fmt.Sprintf("共 %d 个任务目标，已证明达成 %d 个；未达成目标如实记录，本次任务按「未完成」归档。", total, met))
+		} else {
+			d.P(fmt.Sprintf("共 %d 个任务目标，全部已由可复现证据证明达成。", total))
+		}
+		rows := make([][]string, 0, len(in.Goals))
+		for _, g := range in.Goals {
+			state := "未达成"
+			if g.Met() {
+				state = "已达成"
+			}
+			rows = append(rows, []string{g.Text, state, nz(g.Criteria, "—")})
+		}
+		d.Table([]string{"目标", "状态", "验收标准"}, rows)
+	}
 	d.H2("测试窗口")
 	if in.TestWindow != "" {
 		d.P("测试执行窗口:" + in.TestWindow)
@@ -156,7 +184,7 @@ func BuildTaskDocx(in TaskDocxInput) *Docx {
 		d.Bullet(strings.Join(parts, "；"))
 	}
 	d.H2("方法论")
-	d.P("本次评估由 AI 多 Agent 自主渗透平台 ARTEX 执行:规划 Agent 依据目标与资产态势派发探" +
+	d.P("本次评估由 AI 多 Agent 自主渗透平台 POJUN 执行:规划 Agent 依据目标与资产态势派发探" +
 		"测意图,执行 Agent 以真实工具(nmap/httpx/nuclei/ffuf/sqlmap 等)完成侦察、漏洞验证" +
 		"与利用,全程流量经记录代理留痕;漏洞结论均要求可复现证据(PoC 命令/请求响应)支撑," +
 		"critical/high 级发现建议按复测记录进行独立复验。")
@@ -442,43 +470,90 @@ func groupByClass(fs []*db.DBFinding) []classGroup {
 	return out
 }
 
+// FindingDocxInput 是单漏洞报告的输入（v0.4.0：与总报告同级的封面/页眉）。
+type FindingDocxInput struct {
+	Finding *db.DBFinding
+	// ArtifactImage 证据附件图片解析器（v0.5.0，见 TaskDocxInput.ArtifactImage）。
+	ArtifactImage  func(id int64) (data []byte, caption string, ok bool)
+	GeneratedAt    time.Time
+	AssetNameMap   map[int64]string
+	Retests        []*db.FindingRetest
+	Customer       string // 委托方（空 = 省略该行）
+	Classification string // 密级占位（空 = 默认「内部资料 · 仅限授权方」）
+}
+
 // BuildFindingDocx 渲染单漏洞报告(复现步骤/证据/修复建议的自包含文档)。
-func BuildFindingDocx(f *db.DBFinding, generatedAt time.Time, assetNameMap map[int64]string, retests []*db.FindingRetest) *Docx {
+// v0.4.0：补真封面页（居中标题/委托方/密级/日期）+ 页眉（漏洞名）——与总报告
+// 同一交付标准；正文里的请求/响应/复测章节沿用 v0.3.93 的渲染。
+func BuildFindingDocx(in FindingDocxInput) *Docx {
+	f := in.Finding
+	generatedAt := in.GeneratedAt
 	d := NewDocx()
+	embedGongwenFonts(d) // 公文字体随文档嵌入（GB/T 9704 全链路）
+	d.SetArtifactImageResolver(in.ArtifactImage)
+	d.SetHeaderText("渗透测试报告 — " + findingTitle(f))
+
+	// 封面页（与总报告同版式）
+	for i := 0; i < 6; i++ {
+		d.CoverLine("", 0, false)
+	}
 	if hex := SeverityHex(f.Severity); hex != "" {
-		d.headingColored(fmt.Sprintf("[%s] %s", SeverityCN(f.Severity), findingTitle(f)), 1, hex)
+		d.CoverLineColored(fmt.Sprintf("[%s] %s", SeverityCN(f.Severity), findingTitle(f)), 44, hex, true)
 	} else {
-		d.H1(fmt.Sprintf("[%s] %s", SeverityCN(f.Severity), findingTitle(f)))
+		d.CoverLine(fmt.Sprintf("[%s] %s", SeverityCN(f.Severity), findingTitle(f)), 44, true)
 	}
-	d.P(fmt.Sprintf("漏洞类别:%s · 严重度:%s", nz(f.VulnClass, "未分类"), SeverityCN(f.Severity)))
+	d.CoverLine("", 0, false)
+	if in.Customer != "" {
+		d.CoverLine("委托方:"+in.Customer, 28, false)
+	}
+	classification := in.Classification
+	if classification == "" {
+		classification = "内部资料 · 仅限授权方"
+	}
+	d.CoverLine(classification, 24, false)
+	d.CoverLine("", 0, false)
+	d.CoverLine("报告生成时间:"+FormatTimeUTC(generatedAt), 24, false)
+	d.PageBreak()
+
+	// 目录页（与总报告一致：TOC 字段，settings updateFields 打开自动刷新）
+	d.TOC()
+	d.PageBreak()
+
+	d.P(fmt.Sprintf("漏洞类别:%s · 严重度:%s · 状态:%s", nz(f.VulnClass, "未分类"), SeverityCN(f.Severity), statusCN(f.Status)))
 	if len(f.AssetIDs) > 0 {
-		d.P(fmt.Sprintf("影响资产:%s", assetNames(f.AssetIDs, assetNameMap)))
+		d.P(fmt.Sprintf("影响资产:%s", assetNames(f.AssetIDs, in.AssetNameMap)))
 	}
-	d.P(fmt.Sprintf("发现时间:%s · 报告生成:%s", FormatTimeUTC(f.CreatedAt), FormatTimeUTC(generatedAt)))
+	d.P(fmt.Sprintf("发现时间:%s · 发现者:%s", FormatTimeUTC(f.CreatedAt), nz(f.Worker, "-")))
 	if s := strings.TrimSpace(f.Summary); s != "" {
-		d.H2("一、漏洞概述")
+		d.Hei1("一、漏洞概述")
 		d.P(s)
 	}
 	if body := strings.TrimSpace(f.Report); body != "" {
-		d.H2("二、详细报告")
+		d.Hei1("二、详细报告")
 		writeMarkdownish(d, body)
 	}
 	if ev := strings.TrimSpace(f.Evidence); ev != "" {
-		d.H2("三、证据 / PoC")
+		d.Hei1("三、证据 / PoC")
 		d.Code(ev)
 	}
 	// 四、流量证据 / 五、复测记录 —— 与总报告同源（A9/A10）
 	writeTrafficEvidenceDocx(d, f)
-	if len(retests) > 0 {
-		d.H2("复测记录")
-		latest := retests[0]
+	if len(in.Retests) > 0 {
+		d.Hei1("复测记录")
+		latest := in.Retests[0]
 		line := fmt.Sprintf("最近复测:%s · %s", retestVerdictCN(latest.Verdict), FormatTimeUTC(latest.CreatedAt))
 		if s := strings.TrimSpace(latest.Summary); s != "" {
 			line += " · " + s
 		}
 		d.P(line)
-		if len(retests) > 1 {
-			d.P(fmt.Sprintf("历史复测共 %d 次。", len(retests)))
+		if len(in.Retests) > 1 {
+			d.P(fmt.Sprintf("历史复测共 %d 次。", len(in.Retests)))
+		}
+	} else {
+		// 未复测标注（v0.4.27）：pending 且没有任何复测记录的漏洞，报告里明确标出
+		// 「待人工复核」，避免读报告的人把模型结论当成已验证事实。
+		if strings.EqualFold(f.Status, "pending") {
+			d.P("复测记录:未复测（待人工复核）")
 		}
 	}
 	return d
@@ -520,15 +595,25 @@ func writeMarkdownish(d *Docx, md string) {
 		}
 		tableBuf = tableBuf[:0]
 	}
+	// 围栏代码块收集：整块一个 Code 段落（行间 w:br）——逐行成段会让长
+	// JSON/curl 被拆成几十个独立段落堆成一片（v0.4.1）。
+	var codeBuf []string
+	flushCode := func() {
+		if len(codeBuf) > 0 {
+			d.Code(strings.Join(codeBuf, "\n"))
+			codeBuf = codeBuf[:0]
+		}
+	}
 	for _, ln := range lines {
 		trimmed := strings.TrimSpace(ln)
 		if strings.HasPrefix(trimmed, "```") {
 			flushTable()
+			flushCode()
 			inCode = !inCode
 			continue
 		}
 		if inCode {
-			d.buf.WriteString(fmt.Sprintf(`<w:p><w:pPr><w:pStyle w:val="Code"/><w:shd w:val="clear" w:fill="F2F2F2"/></w:pPr><w:r><w:t xml:space="preserve">%s</w:t></w:r></w:p>`, esc(ln)))
+			codeBuf = append(codeBuf, ln)
 			continue
 		}
 		if strings.HasPrefix(trimmed, "|") && strings.HasSuffix(trimmed, "|") {
@@ -536,25 +621,75 @@ func writeMarkdownish(d *Docx, md string) {
 			continue
 		}
 		flushTable()
+		// 证据附件图片：![说明](artifact:<id>) → 内嵌截图 + 图注（v0.5.0）。
+		if artRe.MatchString(trimmed) {
+			m := artRe.FindStringSubmatch(trimmed)
+			alt, rawID := strings.TrimSpace(m[1]), m[2]
+			id, _ := strconv.ParseInt(rawID, 10, 64)
+			inserted := false
+			if id > 0 && d.artifactImage != nil {
+				if data, caption, ok := d.artifactImage(id); ok {
+					if caption == "" {
+						caption = alt
+					}
+					inserted = d.Image(data, caption)
+				}
+			}
+			if !inserted {
+				// 附件缺失/非图片/环境不支持：降级成一行说明，不中断报告。
+				d.P("（证据图片：" + alt + "，附件缺失或不可嵌入）")
+			}
+			continue
+		}
 		switch {
 		case strings.HasPrefix(trimmed, "### "):
 			d.H4(strings.TrimPrefix(trimmed, "### "))
 		case strings.HasPrefix(trimmed, "## "):
-			d.H4(strings.TrimPrefix(trimmed, "## "))
+			// 公文二级标题：楷体三号（v0.4.3 对齐参考件）
+			d.Kai2(strings.TrimPrefix(trimmed, "## "))
 		case strings.HasPrefix(trimmed, "# "):
-			d.H3(strings.TrimPrefix(trimmed, "# "))
+			// 公文一级标题：黑体三号（v0.4.3 对齐参考件）
+			d.Hei1(strings.TrimPrefix(trimmed, "# "))
 		case strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* "):
-			d.buf.WriteString(`<w:p><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr>`)
-			d.buf.WriteString(runsXML(parseBold(strings.TrimPrefix(strings.TrimPrefix(trimmed, "- "), "* "))))
+			// 嵌套列表：行首每 2 个空格一级（reporter 常写二级清单），ilvl 交给
+			// numbering.xml 的多级定义；压平会让层级关系全丢（v0.4.0）。
+			indent := len(ln) - len(strings.TrimLeft(ln, " 	"))
+			lvl := indent / 2
+			if lvl > 2 {
+				lvl = 2
+			}
+			fmt.Fprintf(&d.buf, `<w:p><w:pPr><w:numPr><w:ilvl w:val="%d"/><w:numId w:val="1"/></w:numPr><w:ind w:firstLine="0" w:left="%d"/><w:jc w:val="both"/></w:pPr>`, lvl, 720+lvl*360)
+			d.buf.WriteString(runsXML(parseRich(strings.TrimPrefix(strings.TrimPrefix(trimmed, "- "), "* "))))
 			d.buf.WriteString(`</w:p>`)
 		case trimmed == "":
 			// 段间空行,段落间距已由样式给,跳过
 		default:
+			// 公文序号标题识别（v0.4.3 对齐参考件）：reporter 正文里常出现
+			// 「一、排查经过」（黑体一级）与「（一）现场证据采集。」（楷体二级），
+			// 短行按标题排版，长行仍按正文（避免误伤带内容的段落）。
+			if gongwenHeiRe.MatchString(trimmed) && len([]rune(trimmed)) <= 40 {
+				d.Hei1(trimmed)
+				continue
+			}
+			if gongwenKaiRe.MatchString(trimmed) && len([]rune(trimmed)) <= 30 {
+				d.Kai2(trimmed)
+				continue
+			}
 			d.PRich(trimmed)
 		}
 	}
 	flushTable()
+	flushCode()
 }
+
+// 公文序号标题识别：一、/二、… 开头（黑体一级）、（一）/（二）… 开头（楷体二级）。
+// 只对【整行短语】生效——带正文内容的段落不误伤。
+var (
+	gongwenHeiRe = regexp.MustCompile(`^[一二三四五六七八九十]{1,3}、`)
+	gongwenKaiRe = regexp.MustCompile(`^（[一二三四五六七八九十]{1,3}）`)
+	// artRe 匹配报告里的证据图片引用：![说明](artifact:12)
+	artRe = regexp.MustCompile(`^!\[(.*?)\]\(artifact:(\d+)\)$`)
+)
 
 // splitMarkdownRow 拆一行 | a | b | → [a, b]。
 func splitMarkdownRow(ln string) []string {

@@ -55,9 +55,6 @@ func FindingsMarkdown(fs []*db.DBFinding, generatedAt time.Time) string {
 	} {
 		fmt.Fprintf(&b, "| %s | %d |\n", s.label, counts[s.key])
 	}
-	if counts["unassessed"] > 0 {
-		fmt.Fprintf(&b, "| 待评估 | %d |\n", counts["unassessed"])
-	}
 	b.WriteString("\n")
 
 	if len(items) == 0 {
@@ -75,12 +72,15 @@ func FindingsMarkdown(fs []*db.DBFinding, generatedAt time.Time) string {
 		if desc := strings.TrimSpace(f.TaskDescription); desc != "" {
 			fmt.Fprintf(&b, "- **所属任务**：%s\n", desc)
 		}
-		fmt.Fprintf(&b, "- **发现时间**：%s\n\n", f.CreatedAt.Format("2006-01-02 15:04:05"))
+		fmt.Fprintf(&b, "- **发现时间**：%s\n", f.CreatedAt.Format("2006-01-02 15:04:05"))
+		if w := strings.TrimSpace(f.Worker); w != "" {
+			fmt.Fprintf(&b, "- **发现者**：%s\n", w)
+		}
 		if s := strings.TrimSpace(f.Summary); s != "" {
 			fmt.Fprintf(&b, "%s\n\n", s)
 		}
 		if e := strings.TrimSpace(f.Evidence); e != "" {
-			fmt.Fprintf(&b, "**证据：**\n\n```\n%s\n```\n\n", e)
+			fmt.Fprintf(&b, "**证据 / PoC：**\n\n```\n%s\n```\n\n", e)
 		}
 		if rep := strings.TrimSpace(f.Report); rep != "" {
 			b.WriteString("**详细报告：**\n\n")
@@ -130,9 +130,6 @@ func FindingFilename(f *db.DBFinding) string {
 	sev := nz(f.Severity, "info")
 	title := findingTitle(f)
 	name := fmt.Sprintf("%s_%s_#%d", sev, title, f.ID)
-	if f.ExportCaseID > 0 {
-		name = fmt.Sprintf("case_%d_%s_%s", f.ExportCaseID, sev, title)
-	}
 	name = unsafeFilenameChars.ReplaceAllString(name, "_")
 	name = strings.Trim(name, "._")
 	if name == "" {
@@ -157,12 +154,8 @@ func FindingsCSV(fs []*db.DBFinding) []byte {
 	w := csv.NewWriter(&buf)
 	_ = w.Write([]string{"ID", "名称", "类别", "严重等级", "状态", "所属任务", "发现时间", "概述", "流量证据数量", "流量证据ID"})
 	for _, f := range items {
-		id := fmt.Sprintf("%d", f.ID)
-		if f.ExportCaseID > 0 {
-			id = fmt.Sprintf("case:%d", f.ExportCaseID)
-		}
 		_ = w.Write([]string{
-			id,
+			fmt.Sprintf("%d", f.ID),
 			findingTitle(f),
 			f.VulnClass,
 			nz(f.Severity, "info"),

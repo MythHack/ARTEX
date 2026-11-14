@@ -7,6 +7,8 @@ package server
 import (
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -127,24 +129,100 @@ func (s *Server) exportTaskDocx(w http.ResponseWriter, r *http.Request) {
 		}
 		appendix[ty] = names
 	}
+	goals, _ := t.Store.ListByKind(db.KindGoal, 1000)
 	doc := report.BuildTaskDocx(report.TaskDocxInput{
 		Title:          fmt.Sprintf("渗透测试报告 — %s", t.Description),
 		Goal:           t.Goal,
 		GeneratedAt:    time.Now(),
 		AssetCounts:    counts,
 		Findings:       findings,
+		Goals:          report.GoalLines(goals),
 		AssetNames:     s.reportAssetNames(findings),
 		Retests:        s.reportRetests(findings),
 		Customer:       s.taskCustomerNames(t),
 		TestWindow:     taskTestWindow(t),
 		AppendixAssets: appendix,
 		PageHeader:     fmt.Sprintf("渗透测试报告 — %s", t.Description),
+		ArtifactImage:  s.artifactImageResolver(t.ID, 0),
 	})
-	name := fmt.Sprintf("artex-report-task%s-%s.docx", t.ID, time.Now().Format("20060102"))
+	name := fmt.Sprintf("pojun-report-task%s-%s.docx", t.ID, time.Now().Format("20060102"))
 	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
 	w.WriteHeader(200)
 	_ = doc.Encode(w)
+}
+
+// artifactImageResolver 构造证据附件图片解析器（v0.5.0）：只解析本任务内的
+// 图片附件，非图片/跨任务/文件丢失都返回 ok=false（报告降级为文字说明）。
+func (s *Server) artifactImageResolver(taskID string, onlyFindingID int64) func(int64) ([]byte, string, bool) {
+	if taskID == "" {
+		return nil
+	}
+	return func(id int64) ([]byte, string, bool) {
+		pg := s.m.PG()
+		if pg == nil {
+			return nil, "", false
+		}
+		a, err := pg.GetTaskArtifact(id)
+		if err != nil || a == nil || a.TaskID != taskID {
+			return nil, "", false
+		}
+		// 单漏洞报告只嵌「该漏洞的图」：归属别的漏洞或任务级材料一律不嵌，
+		// 避免张冠李戴。
+		if onlyFindingID > 0 && a.FindingID != onlyFindingID {
+			return nil, "", false
+		}
+		data, ok := s.artifactImageData(a)
+		caption := a.Note
+		if caption == "" {
+			caption = a.Name
+		}
+		// 文档附件（v0.4.21）：引用文档时嵌入第一页预览图，让报告里也能“看到”。
+		if !ok && a.PreviewState == "ready" && a.PreviewPages > 0 {
+			p := filepath.Join(s.previewDir(a.TaskID, a.ID), "page-1.jpg")
+			if b, err := os.ReadFile(p); err == nil && len(b) > 0 {
+				data, ok = b, true
+				caption = caption + "（文档第 1 页预览）"
+			}
+		}
+		if !ok {
+			return nil, "", false
+		}
+		// 大图先压到 1600px JPEG：20MB 原图直接塞进 docx 会让报告膨胀到几十 MB。
+		if len(data) > 2<<20 {
+			if small, ok := s.shrinkDocxImage(data); ok {
+				data = small
+			}
+		}
+		return data, caption, true
+	}
+}
+
+// shrinkDocxImage 把大图缩到长边 1600 的 JPEG；失败返回 false 由调用方用原图。
+func (s *Server) shrinkDocxImage(data []byte) ([]byte, bool) {
+	f, err := os.CreateTemp("", "pojun-embed-*.img")
+	if err != nil {
+		return nil, false
+	}
+	src := f.Name()
+	defer os.Remove(src)
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return nil, false
+	}
+	if err := f.Close(); err != nil {
+		return nil, false
+	}
+	dst := src + ".jpg"
+	defer os.Remove(dst)
+	if err := writeThumbnail(src, dst, 1600); err != nil {
+		return nil, false
+	}
+	out, err := os.ReadFile(dst)
+	if err != nil || len(out) == 0 || len(out) >= len(data) {
+		return nil, false
+	}
+	return out, true
 }
 
 // taskCustomerNames 任务关联企业名（封面「委托方」行；A12）。
@@ -193,8 +271,31 @@ func (s *Server) exportFindingDocx(w http.ResponseWriter, r *http.Request) {
 	}
 	names := s.reportAssetNames([]*db.DBFinding{f})
 	retests, _ := s.m.pg.ListFindingRetests(f.ID)
-	doc := report.BuildFindingDocx(f, time.Now(), names, retests)
-	name := fmt.Sprintf("artex-finding-%d-%s.docx", f.ID, time.Now().Format("20060102"))
+	customer := ""
+	classification := ""
+	if f.TaskID != nil && *f.TaskID > 0 {
+		if t := s.m.ResolveTask(strconv.FormatInt(*f.TaskID, 10)); t != nil {
+			customer = s.taskCustomerNames(t)
+			classification = "内部资料 · 仅限授权方"
+		}
+	}
+	doc := report.BuildFindingDocx(report.FindingDocxInput{
+		Finding:        f,
+		GeneratedAt:    time.Now(),
+		AssetNameMap:   names,
+		Retests:        retests,
+		Customer:       customer,
+		Classification: classification,
+		ArtifactImage: func() func(int64) ([]byte, string, bool) {
+			if f.TaskID == nil || *f.TaskID <= 0 {
+				return nil
+			}
+			// 单漏洞报告严格只嵌归属本漏洞的图（v0.4.20）：不再回退任务级图；
+			// 历史照片可在任务「证据附件」里批量改归属。
+			return s.artifactImageResolver(strconv.FormatInt(*f.TaskID, 10), f.ID)
+		}(),
+	})
+	name := fmt.Sprintf("pojun-finding-%d-%s.docx", f.ID, time.Now().Format("20060102"))
 	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
 	w.WriteHeader(200)
