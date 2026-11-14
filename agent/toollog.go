@@ -188,46 +188,10 @@ func cmdHead(cmd string) string {
 	if i := strings.IndexAny(line, "\r\n"); i >= 0 {
 		line = line[:i]
 	}
-	return trunc(redactSecrets(strings.TrimSpace(line)), 96)
+	return trunc(strings.TrimSpace(line), 96)
 }
 
-// redactSecrets 把命令行里出现的凭据换成 ***。
-//
-// 为什么要脱敏：agent 的命令里带着真实口令（sshpass -p 'xxx'、mysql -p xxx、
-// Authorization: Bearer xxx），而工具日志会把命令摘要写进 journal——**口令就
-// 进了系统日志**，而 journal 默认所有用户可读、还会被 journalctl 导出。
-// 实测抓到过 `sshpass -p 'dolphin!@#'` 原样进日志。
-//
-// 只做「形状明确」的替换，不做通用密钥识别：宁可漏脱敏（仍会打码的粗粒度），
-// 也不能把正常参数误伤成 ***，否则日志失去可读性。
-func redactSecrets(s string) string {
-	for _, p := range secretPatterns {
-		s = p.re.ReplaceAllString(s, p.rep)
-	}
-	return s
-}
-
-// secretPatterns 匹配「键=值」形态的凭据。每条规则自带替换串：分组 1 是
-// 【要保留的前缀】，值部分被换成 ***（URL 那条额外保留 group 3 的 @host）。
-var secretPatterns = []struct {
-	re  *regexp.Regexp
-	rep string
-}{
-	// sshpass -p 'xxx' / sshpass -p xxx / sshpass -pxxx
-	{regexp.MustCompile(`(?i)(sshpass\s+-p\s*)('[^']*'|"[^"]*"|\S+)`), "${1}***"},
-	// key=value / key: value（限定常见凭据键名，避免误伤）
-	{regexp.MustCompile(`(?i)((?:password|passwd|pwd|pass|secret|token|apikey|api_key|access_key|auth[_-]?key)\s*[=:]\s*)('[^']*'|"[^"]*"|[^\s&;]+)`), "${1}***"},
-	// Authorization: Bearer xxx / Basic xxx
-	{regexp.MustCompile(`(?i)(authorization\s*:\s*(?:bearer|basic)\s+)('[^']*'|"[^"]*"|\S+)`), "${1}***"},
-	// URL 里的 user:pass@host（保留 scheme 与 user，只打码口令）
-	{regexp.MustCompile(`(?i)(://[^:/@\s]+:)([^@\s/]+)(@)`), "${1}***${3}"},
-	// mysql/psql 的 -p 口令形式。
-	//
-	// **必须限定命令**：`--password` 这类带字母的写法没有歧义，但裸 `-p` 在不同
-	// 命令里含义不同——sshpass/mysql/psql 的 -p 是口令，mkdir/tar 的 -p 是
-	// "parents"/"preserve"。通用化会误伤，实测 `mkdir -p /some/dir` 的路径被打成 ***。
-	{regexp.MustCompile(`(?i)((?:^|[\s;|&])(?:mysql|mysqldump|psql|pg_dump|mariadb)\s+[^\n;|&]*?\s-p\s*)('[^']*'|"[^"]*"|\S+)`), "${1}***"},
-}
+// 活动日志/工具摘要保留命令行原文（v0.4.37：第一方证据需可溯源，不再脱敏）。
 
 func trunc(s string, n int) string {
 	r := []rune(s)
@@ -249,13 +213,13 @@ func shortID(s string) string {
 var reToolBlocked = regexp.MustCompile(`(?i)\b(403|forbidden|waf|blocked|rate.?limit|429|captcha|denied|too many requests)\b`)
 
 // platformBlockMarker 是平台拦截消息的固定前缀（见 guard.systemBlockMessage）。
-// 出现它 = 这次调用被 ARTEX 自己拦了，与目标侧的 WAF 是两回事。
-const platformBlockMarker = "【ARTEX 平台管控·非目标防御】"
+// 出现它 = 这次调用被 POJUN 自己拦了，与目标侧的 WAF 是两回事。
+const platformBlockMarker = "【POJUN 平台管控·非目标防御】"
 
 // classifyToolResult 把工具结果压成一个分类标签。
 //
 // 语义分层，别混：
-//   - blocked：平台**自己**拦了这次调用。判据是 ARTEX 的固定前缀，精确可靠。
+//   - blocked：平台**自己**拦了这次调用。判据是 POJUN 的固定前缀，精确可靠。
 //     （PreToolUse 行会标 BLOCKED，这里是兜底——理论上被拦的调用不会有 post 行。）
 //   - waf：输出里出现 WAF/403/denied 措辞，**只对 Bash 生效**。Bash 是打目标的，
 //     命令输出里的 403 说明被目标挡了——这是给 planner 做归因的有用信号。

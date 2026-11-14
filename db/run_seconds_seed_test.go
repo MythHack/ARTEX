@@ -8,7 +8,7 @@ import (
 //
 // 为什么锁死这个值（2026-10-21 修正）：
 //
-// 上游 ARTEX-upstream 的种子默认就是 1200s，它靠「短 run → exhausted →
+// 上游 POJUN-upstream 的种子默认就是 1200s，它靠「短 run → exhausted →
 // 规划者看 trace 判进度 → 续派或换打法」形成小步快跑的闭环。
 //
 // 我们在 2026-10-20 把它迁到 3600s，理由是「89 个意图 exhausted vs 8 个

@@ -1,4 +1,7 @@
 # 编译产物
+/pojun
+/pojun.exe
+/pojun-*
 /artex
 /artex.exe
 /artex-*
@@ -62,3 +65,4 @@ Thumbs.db
 __pycache__/
 *.pyc
 .build-tmp/
+peers/

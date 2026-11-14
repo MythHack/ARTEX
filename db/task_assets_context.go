@@ -143,6 +143,17 @@ FROM target GROUP BY target.type ORDER BY target.type`, taskID)
 	return cov, nil
 }
 
+// untestedOrderExpression ranks the backlog for consumption instead of id order:
+// static-asset URLs sink to the end (they are noise to probe), and everything
+// else clusters by host + first path segment so one intent can sweep a whole
+// /prod-api group at once. 任务 5 实测 493 个 endpoint 里 443 个是无扩展路径、
+// 静态仅 5 个——按 id 排序会把同簇接口摊散到不同轮次，规划者很难一次吃掉一簇。
+const untestedOrderExpression = `
+ORDER BY
+  (CASE WHEN target.label ~* '\.(js|css|mjs|png|jpe?g|gif|svg|ico|bmp|webp|avif|woff2?|ttf|otf|eot|map|mp[34]|webm|avi|flv|wav|zip|gz|tgz|rar|7z|pdf|docx?|xlsx?|pptx?)(\?|#|$)' THEN 1 ELSE 0 END),
+  split_part(split_part(regexp_replace(COALESCE(target.label,''), '^https?://[^/]+', ''), '/', 2), '?', 1),
+  target.id`
+
 // ListUntestedAssetsWithSources is the direct-source-aware backlog query used
 // by inherited tasks. Source fact anchors remove assets from the backlog.
 func (s *AssetStore) ListUntestedAssetsWithSources(taskID int64, typ string, limit, offset int) ([]CoverageAsset, int, error) {
@@ -168,8 +179,8 @@ SELECT count(*) FROM target WHERE target.id NOT IN (SELECT asset_id FROM tested)
 	offsetPosition := strconv.Itoa(len(args) + 2)
 	rows, err := s.db.Query(`WITH `+contextCoverageCTE+`
 SELECT target.id, target.type, target.label FROM target
-WHERE target.id NOT IN (SELECT asset_id FROM tested)`+typeFilter+`
-ORDER BY target.id LIMIT $`+limitPosition+` OFFSET $`+offsetPosition, pageArgs...)
+WHERE target.id NOT IN (SELECT asset_id FROM tested)`+typeFilter+untestedOrderExpression+`
+LIMIT $`+limitPosition+` OFFSET $`+offsetPosition, pageArgs...)
 	if err != nil {
 		return nil, total, err
 	}

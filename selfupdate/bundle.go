@@ -17,7 +17,7 @@ import (
 
 // 本文件提供"下载并校验发布包 / 从包里取出某个文件"两个原子操作。
 //
-// 拆出来是为了让**伴随二进制**（artex-hostd）复用同一套安全校验：它由 root 常驻、
+// 拆出来是为了让**伴随二进制**（pojun-hostd）复用同一套安全校验：它由 root 常驻、
 // 装在 /usr/local/bin，主服务写不进去，只能由它自己换装；如果它另写一份下载校验
 // 逻辑，两边迟早会出现一处漏校验的情况。
 //
@@ -143,7 +143,7 @@ func SmokeTestBinary(bin string, args ...string) error {
 const smokeTimeout = 30 * time.Second
 
 // smokeTestWithArgs 是冒烟测试的实现，允许调用方指定探测参数
-// （artex 用 -h；artex-hostd 用 -version，因为它 -h 也会 exit 0 但输出更短）。
+// （pojun 用 -h；pojun-hostd 用 -version，因为它 -h 也会 exit 0 但输出更短）。
 func smokeTestWithArgs(bin string, args []string) error {
 	if err := os.Chmod(bin, 0o755); err != nil {
 		return fmt.Errorf("赋予执行权限: %w", err)

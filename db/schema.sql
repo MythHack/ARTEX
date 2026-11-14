@@ -1,4 +1,4 @@
--- ARTEX PostgreSQL schema (单一数据源)
+-- POJUN PostgreSQL schema (单一数据源)
 -- 幂等：可重复执行（IF NOT EXISTS / OR REPLACE / DROP TRIGGER IF EXISTS）。
 
 -- =====================================================================
@@ -571,6 +571,9 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS worker_count INTEGER NOT NULL DEFAULT
 -- task creation order. queue_mode distinguishes first bootstrap from resuming an
 -- exploration that already owns goals/history.
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued_at TIMESTAMPTZ;
+-- 任务级目标登录凭据（v0.4.8）：worker 先登录再测；password/totp_secret 只在
+-- DB 内保存，任何 API 响应都脱敏（见 db/task_auth.go）。NULL=未配置。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS auth_config JSONB;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queue_mode TEXT NOT NULL DEFAULT '';
 -- 可选的任务名称;补旧库。空串=未命名,前端展示时回退到描述。
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT '';
@@ -589,6 +592,28 @@ CREATE INDEX IF NOT EXISTS idx_tasks_pinned ON tasks(pinned_at DESC)
     WHERE deleted_at IS NULL AND pinned_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_archived ON tasks(archived_at DESC)
     WHERE archived_at IS NOT NULL;
+
+-- ── 自主推进（Autopilot）──────────────────────────────────────────────
+-- autopilot：任务级开关。停滞自动重规划、deadline 自动延长、不因「没新增」被
+-- 自动收尾（见 server/autopilot.go）。平台审批不放行，与公开版审批门一致。
+-- autopilot_extensions：已自动延长 deadline 的次数；任务复活时归零（见
+-- ApplyTaskAdmission），防止长时间运行的任务被无限延长。
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS autopilot BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS autopilot_extensions INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_tasks_autopilot ON tasks(created_at DESC)
+    WHERE autopilot AND deleted_at IS NULL;
+
+-- 自主推进的决策留痕：开启/关闭、停滞唤醒、deadline 延长、收尾抑制。
+-- task_id 用 TEXT 与 task_progress/intercept_pending 的约定一致（不做外键，
+-- 任务硬删除时由 DeleteTaskCascade 清理）。
+CREATE TABLE IF NOT EXISTS autopilot_events (
+    id         BIGSERIAL PRIMARY KEY,
+    task_id    TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    detail     TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_autopilot_events_task ON autopilot_events(task_id, id DESC);
 
 -- Cold task archives retain only compact metadata in PostgreSQL. The complete
 -- task payload lives in a versioned .tar.zst package under data/archives/tasks.
@@ -1759,3 +1784,55 @@ CREATE TABLE IF NOT EXISTS vuln_sync_state (
     enabled       BOOLEAN NOT NULL DEFAULT true
 );
 ALTER TABLE vuln_sync_state ADD COLUMN IF NOT EXISTS page_cursor TEXT NOT NULL DEFAULT '';
+
+-- 任务自动收尾的进度快照（v0.5.0）：每个常规规划轮记录一次 fact/finding/
+-- tested asset 计数；连续零增长轮数达到阈值且无在跑意图时，引擎自动收尾。
+-- 以 round_no 做 fencing，迟到/重复轮次不会重复累计。
+CREATE TABLE IF NOT EXISTS task_progress (
+    task_id       TEXT PRIMARY KEY,
+    round_no      BIGINT NOT NULL DEFAULT 0,
+    idle_rounds   INTEGER NOT NULL DEFAULT 0,
+    fact_count    BIGINT NOT NULL DEFAULT 0,
+    finding_count BIGINT NOT NULL DEFAULT 0,
+    tested_count  BIGINT NOT NULL DEFAULT 0,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+
+-- ── 漏洞多键去重与合并（红队版 v0.9 下放，2026-11-10）──────────────────
+-- root_cause_key 由 Agent 显式声明（同根因跨端点）；merge_count 记录合并进来的来源数；
+-- merged_into_id 让被合并记录可追溯（不物理删除）；last_merged_at 供列表排序/提示。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS root_cause_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS merge_count INT NOT NULL DEFAULT 0;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS merged_into_id BIGINT REFERENCES findings(id) ON DELETE SET NULL;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS last_merged_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_findings_merged_into ON findings(merged_into_id) WHERE merged_into_id IS NOT NULL;
+
+-- 一条 finding 可带多个身份键：cve / root / endpoint / param（强键，自动合并）、
+-- asset_class / name（弱键，只做候选提示）、legacy（兼容旧指纹）。
+CREATE TABLE IF NOT EXISTS finding_keys (
+    finding_id BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    dedup_key  TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (finding_id, dedup_key)
+);
+CREATE INDEX IF NOT EXISTS idx_finding_keys_key ON finding_keys(dedup_key);
+
+-- 漏洞更新记录：初始上报、自动/人工合并、证据补绑、报告与状态变更都留一条，
+-- 供详情页时间线与报告来源说明使用。findings.evidence/report 仍是当前快照。
+CREATE TABLE IF NOT EXISTS finding_updates (
+    id          BIGSERIAL PRIMARY KEY,
+    finding_id  BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,
+    source_id   BIGINT REFERENCES findings(id) ON DELETE SET NULL,
+    worker      TEXT NOT NULL DEFAULT '',
+    intent_id   BIGINT,
+    summary     TEXT NOT NULL DEFAULT '',
+    evidence    TEXT NOT NULL DEFAULT '',
+    report      TEXT NOT NULL DEFAULT '',
+    asset_ids   JSONB NOT NULL DEFAULT '[]',
+    traffic_ids JSONB NOT NULL DEFAULT '[]',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_finding_updates_finding ON finding_updates(finding_id, id DESC);

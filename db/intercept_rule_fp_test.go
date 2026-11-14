@@ -26,7 +26,7 @@ func TestBuiltinRulesDoNotFalsePositiveOnRealCommands(t *testing.T) {
 		name string
 		cmd  string
 	}{
-		{"临时文件清理", `cd /opt/artex/data/tasks/3/i348/ && curl -s -o /tmp_out.$$ "http://10.10.42.18:8161/x"; rm -f /tmp_out.$$`},
+		{"临时文件清理", `cd /opt/pojun/data/tasks/3/i348/ && curl -s -o /tmp_out.$$ "http://10.10.42.18:8161/x"; rm -f /tmp_out.$$`},
 		{"设备管理路径枚举", `for p in /getPreLoginData/ /login.cgi /webacs/ /reboot /reset /getVersion; do code=$(curl -s -o /dev/null -w "%{http_code}" "https://172.24.0.14$p"); done`},
 		{"清空代理环境", `unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy; curl -sk https://172.16.105.2:9000/`},
 		{"REST 路径枚举", `for path in /api/ /api/users /api/login /api/status /api/config /api/health /api/version; do curl -s -o /dev/null -w "%{http_code}" "http://10.10.47.11:6969$path"; done`},

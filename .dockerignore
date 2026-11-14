@@ -7,6 +7,9 @@ jwt.key
 web/.next
 web/out
 server/webui/dist
+/pojun
+/pojun.exe
+/pojun-*
 /artex
 data
 *.db
@@ -18,3 +21,10 @@ bench/.env
 bench/scheduler.py
 bench/entrypoint_v2.sh
 bench/seed_v2.sh
+<<<<<<< .pojun-port/tmp/ours
+=======
+# 构建上下文只保留镜像需要的二进制（dist 下几十个 zip 会撑爆 context）
+/dist
+!/dist/amd64
+!/dist/arm64
+>>>>>>> .pojun-port/tmp/theirs

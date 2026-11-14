@@ -240,3 +240,53 @@ func TestRetestFixedTriageOnlyAfterSuccessfulCompletion(t *testing.T) {
 		})
 	}
 }
+
+// 批量复测（v0.4.27）：候选清单（pending+无进行中复测，critical 优先）与最新复测状态映射。
+func TestRetestCandidatesAndStates(t *testing.T) {
+	d, _, _ := testSetup(t)
+	tk, err := d.CreateTask("批量复测测试", "目标", nil, 0, 0)
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	t.Cleanup(func() { _, _ = d.DeleteTaskCascade(tk.ID, true, true) })
+
+	f1, err := d.AddFinding(tk.ID, 0, "未授权访问", "候选A", "critical", "sum", "ev", "worker", nil)
+	if err != nil {
+		t.Fatalf("add finding 1: %v", err)
+	}
+	f2, _ := d.AddFinding(tk.ID, 0, "注入", "候选B", "high", "sum", "ev", "worker", nil)
+	f3, _ := d.AddFinding(tk.ID, 0, "XSS", "低危不进候选", "low", "sum", "ev", "worker", nil)
+	// f2 已有一条历史（completed/fixed）→ 仍是候选（历史不算进行中），且 states 里能查到 fixed。
+	if _, err := d.Exec(`INSERT INTO finding_retests(finding_id, snapshot, status, verdict) VALUES ($1,'{}','completed','fixed')`, f2); err != nil {
+		t.Fatalf("seed retest: %v", err)
+	}
+	// f1 有一条进行中复测 → 从候选里排除，states 里是其 running 状态。
+	if _, err := d.Exec(`INSERT INTO finding_retests(finding_id, snapshot, status) VALUES ($1,'{}','running')`, f1); err != nil {
+		t.Fatalf("seed active retest: %v", err)
+	}
+
+	cands, err := d.RetestCandidates(tk.ID, []string{"critical", "high"}, 50)
+	if err != nil {
+		t.Fatalf("candidates: %v", err)
+	}
+	got := map[int64]bool{}
+	for _, c := range cands {
+		got[c.ID] = true
+	}
+	if got[f1] || !got[f2] || got[f3] {
+		t.Fatalf("candidates=%v want f2 only (f1 active, f3 low)", got)
+	}
+	states, err := d.RetestStatesByTask(tk.ID)
+	if err != nil {
+		t.Fatalf("states: %v", err)
+	}
+	if s, ok := states[f2]; !ok || s.Verdict != "fixed" {
+		t.Fatalf("states[%d]=%+v want fixed", f2, s)
+	}
+	if s, ok := states[f1]; !ok || s.Status != "running" {
+		t.Fatalf("states[%d]=%+v want running", f1, s)
+	}
+	if _, ok := states[f3]; ok {
+		t.Fatalf("f3 has no retests but appeared in states")
+	}
+}

@@ -19,7 +19,7 @@ import (
 
 func testDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "artex-test-"+sanitizeName(t.Name()))
+	dir, err := os.MkdirTemp("", "pojun-test-"+sanitizeName(t.Name()))
 	if err != nil {
 		t.Fatal(err)
 	}

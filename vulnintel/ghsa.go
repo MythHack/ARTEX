@@ -289,7 +289,7 @@ func (c *GhsaClient) FetchByCVEID(ctx context.Context, cveID string) ([]GhsaAdvi
 func (c *GhsaClient) setHeaders(req *http.Request) {
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	req.Header.Set("User-Agent", "artex-vulnintel")
+	req.Header.Set("User-Agent", "pojun-vulnintel")
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}

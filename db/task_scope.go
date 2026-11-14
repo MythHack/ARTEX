@@ -692,3 +692,82 @@ ORDER BY t.id LIMIT $`+limPos+` OFFSET $`+offPos, pageArgs...)
 	}
 	return out, total, rows.Err()
 }
+
+// ScopeCompanyDistribution 统计任务当前（非 company 类）范围资产的公司归属分布，
+// 用于任务开跑时的「自动归属公司」判断。
+func (d *DB) ScopeCompanyDistribution(taskID int64) (map[int64]int, int, error) {
+	rows, err := d.Query(`
+WITH target AS (
+  SELECT DISTINCT a.id, a.company_id
+  FROM assets a
+  JOIN task_scope ts ON (
+       (ts.kind='root_domain' AND a.root_domain = ts.domain)
+    OR (ts.kind='subdomain'   AND a.domain = ts.domain)
+    OR (ts.kind IN ('ip','cidr') AND ts.net >>= try_inet(a.ip))
+  )
+  JOIN tasks t ON t.id=ts.task_id
+  WHERE ts.task_id=$1 AND ts.kind<>'company'
+)
+SELECT COALESCE(company_id,0), count(*) FROM target GROUP BY company_id`, taskID)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	dist := map[int64]int{}
+	total := 0
+	for rows.Next() {
+		var cid int64
+		var n int
+		if err := rows.Scan(&cid, &n); err != nil {
+			return nil, 0, err
+		}
+		dist[cid] = n
+		total += n
+	}
+	return dist, total, rows.Err()
+}
+
+// CompanyScopeAssetCount 返回某公司当前资产总数（含未入任务的）。
+func (d *DB) CompanyScopeAssetCount(companyID int64) (int, error) {
+	var n int
+	err := d.QueryRow(`SELECT count(*) FROM assets WHERE company_id=$1`, companyID).Scan(&n)
+	return n, err
+}
+
+// AddCompanyScopeAuto 把任务自动归属到某公司：写 task_scope(kind=company, source=auto)
+// 并把该公司现有资产快照进任务（与创建时关联企业同一套语义）。
+func (d *DB) AddCompanyScopeAuto(taskID, companyID int64, reason string) error {
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+INSERT INTO task_scope(task_id, kind, company_id, source, reason)
+VALUES ($1, 'company', $2, 'auto', $3)
+ON CONFLICT DO NOTHING`, taskID, companyID, reason); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+UPDATE assets
+SET task_ids=CASE WHEN $1=ANY(task_ids) THEN task_ids ELSE array_append(task_ids,$1) END
+WHERE company_id=$2`, taskID, companyID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+INSERT INTO task_asset_links(task_id, asset_id, source, source_summary)
+SELECT $1, a.id, 'auto', $3
+FROM assets a WHERE a.company_id=$2 AND $1=ANY(a.task_ids)
+ON CONFLICT (task_id, asset_id) DO UPDATE
+SET source=EXCLUDED.source, source_summary=EXCLUDED.source_summary, source_node_id=NULL`, taskID, companyID, reason); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// HasCompanyScope 报告任务是否已有关联企业范围。
+func (d *DB) HasCompanyScope(taskID int64) (bool, error) {
+	var exists bool
+	err := d.QueryRow(`SELECT EXISTS(SELECT 1 FROM task_scope WHERE task_id=$1 AND kind='company')`, taskID).Scan(&exists)
+	return exists, err
+}

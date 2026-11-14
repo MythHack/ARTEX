@@ -154,7 +154,7 @@ func TestHealthResponseHasNoIdentity(t *testing.T) {
 	w := httptest.NewRecorder()
 	s.health(w, httptest.NewRequest("GET", "/api/health", nil))
 	body := w.Body.String()
-	for _, banned := range []string{"artex", "ARTEX", "version", "0.3"} {
+	for _, banned := range []string{"pojun", "POJUN", "version", "0.3"} {
 		if strings.Contains(strings.ToLower(body), strings.ToLower(banned)) {
 			t.Fatalf("health 响应包含指纹信息 %q: %s", banned, body)
 		}

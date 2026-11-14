@@ -2,11 +2,11 @@
 # start.sh 的崩溃处理与 install.sh 的 systemd 单元属性检查。
 #
 # 背景（2026-10-22 在真机上撞到）：配置坏了（如数据库密码不一致）时，
-# artex 会反复崩溃重启，而 start.sh 无限自拉起 + systemd 的 Restart=always
+# pojun 会反复崩溃重启，而 start.sh 无限自拉起 + systemd 的 Restart=always
 # 叠加，结果是：
 #
 #   - systemctl status 显示 **active (running)**——活着的是 start.sh 这个包装
-#     脚本，artex 本体在崩；
+#     脚本，pojun 本体在崩；
 #   - 网页打不开，但状态一切正常，排查方向完全跑偏；
 #   - 日志被同一行错误刷爆，首因被埋掉。
 #

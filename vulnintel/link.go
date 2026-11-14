@@ -220,7 +220,7 @@ FROM assets a WHERE a.type='service'`)
 	// 此前这里是 O(资产 × tech × product) 的三重嵌套扫描,而且 cpeTokens(product)
 	// 对每个 product 每轮都要重算一遍。实测全库 4966 条资产时,这一段跑了 28 秒、
 	// 往 journal 写了 3.2 万行 debug 日志——把 agent 的日志信号整个淹掉(见
-	// [[artex-obs-loop]])。倒排索引把它降到 O(CVE × token + 资产 × token)。
+	// [[pojun-obs-loop]])。倒排索引把它降到 O(CVE × token + 资产 × token)。
 	tokIndex := map[string][]cveRow{}
 	for _, c := range cves {
 		for _, pt := range cpeTokens(c.Product) {

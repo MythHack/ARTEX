@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/Autumn-27/norma/harness"
@@ -120,6 +121,29 @@ var taskTimeoutWrapupDefaults = map[string]string{
 const workerTaskTimeoutDefault = "**整个任务已到达超时上限，即将结束**（不是你这次 run 的预算，是整场探索到点了）。这是最后机会：(1) 把你已识别但还没写回的内容【全部】落库——新资产 insert_assets、探索结论/事实 record_fact、确认漏洞 report_finding；(2) 不要再启动任何新命令/探测；(3) **最后单独用一句话纯文本**总结你在本意图上的关键结论。"
 
 const plannerTaskTimeoutDefault = "**整个任务已到达超时上限，即将结束**（不是本轮，是整个任务终止）。请基于当前【全部】事实与发现，做最后一次目标判定：对已被证据证明达成的目标调 prove_goal 标记 met（别漏判）。**不要再生成任何新意图**（此时派意图也不会再被执行）。判定完即收束，无需输出总结文本。"
+
+const plannerAutoFinishDefault = "**整个任务已按自动收尾策略结束**（原因：%s），不是超时、也不是本轮预算耗尽。请基于当前【全部】事实与发现做最后一次目标判定：对已被证据证明达成的目标调 prove_goal 标记 met（别漏判）；**不要再生成任何新意图**（此时派意图也不会再被执行）。最后用一句话总结本次任务的主要产出与未覆盖范围。"
+
+func autoFinishReasonText(reason string) string {
+	switch reason {
+	case "auto_idle":
+		return "连续多轮无新增事实/发现/已测资产，边际收益已归零"
+	case "auto_coverage":
+		return "资产覆盖率达到设定阈值"
+	case "auto_rounds":
+		return "达到最大规划轮数上限"
+	default:
+		return reason
+	}
+}
+
+// AutoFinishWrapup 返回自动收尾的 planner 终局词（内置，不可在 Agent 页覆盖）。
+func AutoFinishWrapup(agentKey, reason string) string {
+	if agentKey != "planner" {
+		return ""
+	}
+	return fmt.Sprintf(plannerAutoFinishDefault, autoFinishReasonText(reason))
+}
 
 // TaskTimeoutWrapupDefault 返回某 agent 的任务超时内置默认收尾词（供后台占位/恢复默认）。
 func TaskTimeoutWrapupDefault(agentKey string) string {

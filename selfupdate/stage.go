@@ -37,7 +37,7 @@ const (
 // 其余阶段传 -1。
 type Progress func(ph Phase, pct int, msg string)
 
-// Stage 下载指定 Release 的当前平台发布包，校验后把新二进制暂存为 artex.new。
+// Stage 下载指定 Release 的当前平台发布包，校验后把新二进制暂存为 pojun.new。
 //
 // 走的是完整 zip 而不是裸二进制，理由有两个：现有 Release 的 SHA256SUMS 本来就
 // 只覆盖 zip，走 zip 不需要改 CI，也能兼容已经发布出去的历史版本；zip 里还带着
@@ -64,7 +64,7 @@ func stageAt(ctx context.Context, c *http.Client, rel *Release, currentVersion s
 	binPath := p.New + ".part"
 	defer func() { _ = os.Remove(binPath) }()
 
-	// 下载与校验走共享实现（bundle.go）：伴随二进制 artex-hostd 的自我换装用的是
+	// 下载与校验走共享实现（bundle.go）：伴随二进制 pojun-hostd 的自我换装用的是
 	// 同一份逻辑，避免两边各写一份、迟早有一处漏校验。
 	// 临时文件落在程序目录，保证最后的 rename 是同文件系统内的原子操作。
 	zipPath, err := FetchVerifiedZip(ctx, c, rel, p.Dir, prog)
@@ -205,7 +205,7 @@ func get(ctx context.Context, c *http.Client, rawURL string) (io.ReadCloser, err
 	if err := checkURL(req.URL); err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "artex-selfupdate")
+	req.Header.Set("User-Agent", "pojun-selfupdate")
 	resp, err := c.Do(req)
 	if err != nil {
 		return nil, err
@@ -217,14 +217,14 @@ func get(ctx context.Context, c *http.Client, rawURL string) (io.ReadCloser, err
 	return resp.Body, nil
 }
 
-// extractBinary 从发布包里取出 artex 可执行文件。
+// extractBinary 从发布包里取出 pojun 可执行文件。
 //
-// 包内结构是 artex-<版本>-<os>-<arch>/artex，但这里按**基名**匹配而不是拼完整
+// 包内结构是 pojun-<版本>-<os>-<arch>/pojun，但这里按**基名**匹配而不是拼完整
 // 路径：版本号在包名里出现过一次，拼错一个字符就整个升级失败，按基名找更耐改。
 func extractBinary(zipPath, dst string) error {
-	want := "artex"
+	want := "pojun"
 	if runtime.GOOS == "windows" {
-		want = "artex.exe"
+		want = "pojun.exe"
 	}
 	zr, err := zip.OpenReader(zipPath)
 	if err != nil {
@@ -266,7 +266,7 @@ func extractBinary(zipPath, dst string) error {
 // checkWritable 提前确认目录可写。没有这一步，非 root 运行、或二进制被放在系统
 // 目录时，会在下载完几十 MB 之后才在换装那一刻失败。
 func checkWritable(dir string) error {
-	probe, err := os.CreateTemp(dir, ".artex-update-probe-*")
+	probe, err := os.CreateTemp(dir, ".pojun-update-probe-*")
 	if err != nil {
 		return fmt.Errorf("程序目录 %s 不可写，无法自动更新（请检查权限或改用手动升级）: %w", dir, err)
 	}

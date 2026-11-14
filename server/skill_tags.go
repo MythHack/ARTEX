@@ -31,7 +31,7 @@ import (
 // norma 的 skill.LoadDir 不认识 tags 字段——但 yaml.Unmarshal 默认忽略未知
 // 字段，所以加了标签的 SKILL.md 对 norma 完全透明（db 的
 // TestShippedSkillsLoadWithNormaLoader 守着这一点）。
-// ARTEX 自己解析标签：本文件的 ParseSkillTags。
+// POJUN 自己解析标签：本文件的 ParseSkillTags。
 //
 // ## 三类标签各自的用途
 //

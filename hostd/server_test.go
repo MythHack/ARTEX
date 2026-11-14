@@ -65,7 +65,7 @@ func TestHealthz(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("healthz 应 200，得到 %d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "artex-hostd") {
+	if !strings.Contains(w.Body.String(), "pojun-hostd") {
 		t.Errorf("healthz 响应异常: %s", w.Body.String())
 	}
 }

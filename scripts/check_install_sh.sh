@@ -85,12 +85,12 @@ check "install.sh 启用 set -euo pipefail" \
 
 # 7) 数据库角色已存在时必须同步密码。
 #
-# 踩过的坑（2026-10-22 真实安装）：机器上残留旧的 artex 角色时，脚本走
+# 踩过的坑（2026-10-22 真实安装）：机器上残留旧的 pojun 角色时，脚本走
 # 「已存在 → 跳过创建」分支，config.json 里写的却是**新生成**的密码 →
 # 服务起来就反复 SASL 认证失败退出，报错指不到真因。
 check "角色已存在时同步密码（ALTER ROLE）" \
   bash -c '
-    grep -v "^[[:space:]]*#" "'"$TARGET"'" | grep -q "ALTER ROLE artex LOGIN PASSWORD"
+    grep -v "^[[:space:]]*#" "'"$TARGET"'" | grep -q "ALTER ROLE pojun LOGIN PASSWORD"
   '
 
 if [ "$fail" -gt 0 ]; then

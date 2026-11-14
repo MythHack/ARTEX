@@ -1,25 +1,27 @@
 #!/usr/bin/env bash
-# ARTEX 安装 / 部署脚本（唯一入口）
+# POJUN 安装 / 部署脚本（唯一入口）
 #
 # 运行后选择部署形态，再走对应流程；也可用 --mode 直接指定。
 #
 #   sudo ./install.sh                     交互选择（二进制 / Docker）
 #   sudo ./install.sh --mode=binary       二进制：单文件 + systemd + 系统 PostgreSQL
+#                                         （macOS 上自动走 launchd + Homebrew PostgreSQL，
+#                                          不需要 sudo：brew 与用户级 launchd 都是当前用户）
 #   sudo ./install.sh --mode=docker       Docker Compose：容器 + 容器内 PostgreSQL
 #   sudo ./install.sh --mode=binary --with-tools
 #
-#   curl -fsSL .../install.sh | sudo bash -s -- --mode=binary   # 管道场景必须显式给 --mode
+#   curl -fsSL .../install.sh | sudo bash    # 一条命令，交互式（模式/代理均可在 /dev/tty 里选）
 #
 # 幂等：重复执行 = 升级程序，保留数据（config.json / jwt.key / data / 数据库 / .env）。
 #
-# 卸载：二进制 systemctl disable --now artex && rm -rf /opt/artex
-#       Docker   cd /opt/artex && docker compose down -v && rm -rf /opt/artex
+# 卸载：二进制 systemctl disable --now pojun && rm -rf /opt/pojun
+#       Docker   cd /opt/pojun && docker compose down -v && rm -rf /opt/pojun
 set -euo pipefail
 
-REPO="chu0119/ARTEX"
-INSTALL_DIR="/opt/artex"
-SERVICE="artex"
-RUN_USER="artex"
+REPO="chu0119/Pojun"
+INSTALL_DIR="/opt/pojun"
+SERVICE="pojun"
+RUN_USER="pojun"
 VERSION="latest"
 MODE="${MODE:-}"
 WITH_TOOLS=0
@@ -29,11 +31,17 @@ PG_SUPER="${PG_SUPER:-postgres}"
 # 安装期出网代理（apt / curl / go 下载走它）。留空 = 直连。
 # 只作用于「装东西」，与运行期 Agent 的目标代理、LLM 代理互不相干。
 INSTALL_PROXY="${INSTALL_PROXY:-${HTTPS_PROXY:-}}"
-IMAGE="ghcr.io/${REPO,,}"
+# macOS 自带 bash 3.2（不支持 ${var,,} 小写展开），用 tr 做兼容
+IMAGE="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
 ASSUME_YES=0
-# 是否安装特权助手 artex-hostd(提供「系统 → 宿主环境」页的一键安装)。
+# 是否安装特权助手 pojun-hostd(提供「系统 → 宿主环境」页的一键安装)。
 # 默认装;不想让 Web 端具备装包能力时用 --no-installer 关掉。
 WITH_INSTALLER=1
+
+# 管道执行（curl ... | sudo bash）时 stdin 是脚本本身，不能用来读输入。
+# 只要 /dev/tty 可读，就仍可交互提问（宝塔式一键安装的关键）。
+CAN_PROMPT=0
+if [ -r /dev/tty ]; then CAN_PROMPT=1; fi
 
 info(){ printf '\033[36m[*]\033[0m %s\n' "$*"; }
 ok(){   printf '\033[32m[+]\033[0m %s\n' "$*"; }
@@ -42,17 +50,21 @@ die(){  printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage(){
   cat <<EOF
-ARTEX 安装脚本
+POJUN 安装脚本
 
 用法: $0 [选项]
 
+系统建议: Debian 12 / Ubuntu 22.04+ LTS（稳定）；Kali 适合开箱全套工具（滚动更新有风险）
+          最低 2C4G/20G，推荐 4C8G/60G（含工具、字典与浏览器）
+
 部署形态:
   --mode=binary|docker   二进制（默认，推荐）或 Docker。不给则交互选择
+                         （管道执行 curl ... | bash 时同样会从 /dev/tty 交互）
   --with-tools           顺装常用渗透工具（Docker 形态下工具随镜像固定，见说明）
 
 通用:
   --version=VER          版本，默认 latest（如 v0.3.20）
-  --dir=PATH             安装目录（默认 /opt/artex）
+  --dir=PATH             安装目录（默认 /opt/pojun）
   --listen=ADDR          监听地址（默认 :8787）
   --proxy=ADDR           流量记录代理地址（默认 127.0.0.1:8788）
   --install-proxy=URL    安装期出网代理，如 http://10.0.0.14:7897（默认取 \$HTTPS_PROXY）
@@ -60,9 +72,9 @@ ARTEX 安装脚本
   -h, --help             显示帮助
 
 二进制形态专用:
-  --user=NAME            运行用户（默认 artex）
+  --user=NAME            运行用户（默认 pojun）
   --pg-super=NAME        PostgreSQL 超级用户（默认 postgres）
-  --no-installer         不安装特权助手 artex-hostd（关掉 Web 端的一键安装能力）
+  --no-installer         不安装特权助手 pojun-hostd（关掉 Web 端的一键安装能力）
 
 Docker 形态专用:
   --image=REF            镜像名（默认 $IMAGE）
@@ -80,7 +92,7 @@ for arg in "$@"; do
     --mode=*)          MODE="${arg#--mode=}" ;;
     --with-tools)      WITH_TOOLS=1 ;;
     --version=*)       VERSION="${arg#--version=}" ;;
-    --dir=*)           INSTALL_DIR="${arg#--dir=}" ;;
+    --dir=*)           INSTALL_DIR="${arg#--dir=}"; DIR_EXPLICIT=1 ;;
     --listen=*)        LISTEN_ADDR="${arg#--listen=}" ;;
     --proxy=*)         PROXY_ADDR="${arg#--proxy=}" ;;
     --install-proxy=*) INSTALL_PROXY="${arg#--install-proxy=}" ;;
@@ -95,15 +107,37 @@ for arg in "$@"; do
 done
 
 # ── 前置检查 ─────────────────────────────────────
-[ "$(uname -s)" = "Linux" ] || die "仅支持 Linux"
-[ "$(id -u)" = "0" ] || die "请用 root/sudo 运行"
+DIR_EXPLICIT="${DIR_EXPLICIT:-0}"
+IS_MAC=0
+case "$(uname -s)" in
+  Linux)  : ;;
+  Darwin) IS_MAC=1 ;;
+  *) die "仅支持 Linux / macOS" ;;
+esac
 
 ARCH="$(uname -m)"
-case "$ARCH" in
-  x86_64)  PKG_ARCH="linux-amd64" ;;
-  aarch64) PKG_ARCH="linux-arm64" ;;
-  *) die "不支持的架构: $ARCH（支持 x86_64/aarch64）" ;;
-esac
+if [ "$IS_MAC" = "1" ]; then
+  # macOS：brew 与用户级 launchd 都是当前用户体系，全程不需要 sudo。
+  # 显式用 sudo 反而坏事：root 的 brew/HOME 与用户不一致，服务会落在 root 的
+  # LaunchAgents 里起不来。目录默认也放 $HOME/pojun（/opt 需要特权）。
+  [ "$(id -u)" = "0" ] && die "macOS 请直接运行本脚本（不要加 sudo）"
+  case "$ARCH" in
+    arm64)  PKG_ARCH="darwin-arm64" ;;
+    x86_64) PKG_ARCH="darwin-amd64" ;;
+    *) die "不支持的 Mac 架构: $ARCH（支持 arm64/x86_64）" ;;
+  esac
+  # /opt 在 macOS 需要特权；默认装到家目录，显式 --dir 优先
+  if [ "$DIR_EXPLICIT" != "1" ]; then
+    INSTALL_DIR="$HOME/pojun"
+  fi
+else
+  [ "$(id -u)" = "0" ] || die "请用 root/sudo 运行"
+  case "$ARCH" in
+    x86_64)  PKG_ARCH="linux-amd64" ;;
+    aarch64) PKG_ARCH="linux-arm64" ;;
+    *) die "不支持的架构: $ARCH（支持 x86_64/aarch64）" ;;
+  esac
+fi
 
 # curl 是两种形态的公共依赖
 if ! command -v curl >/dev/null 2>&1; then
@@ -111,6 +145,45 @@ if ! command -v curl >/dev/null 2>&1; then
   command -v dnf >/dev/null 2>&1 && dnf install -y curl >/dev/null || true
 fi
 command -v curl >/dev/null 2>&1 || die "curl 安装失败，请手动安装"
+
+# CA 证书是后续全部 HTTPS 的前提。极简系统（比如用 --no-install-recommends
+# 装的 curl 不会带入 Recommends 的 ca-certificates）会出现 curl: (77)
+# "error setting certificate file"，所有 HTTPS 请求全挂且报错指不到真因。
+# 两大发行版的 CA 包位置都判一下，缺哪个补哪个；装不上也不阻断（真实新
+# 机器几乎都自带，这里只兜极端裁剪过的系统）。
+# macOS 的系统证书在 /etc/ssl/cert.pem（随系统自带），Linux 才需要下面的兜底安装
+if [ "$IS_MAC" != "1" ] && \
+   [ ! -e /etc/ssl/certs/ca-certificates.crt ] && [ ! -e /etc/pki/tls/certs/ca-bundle.crt ]; then
+  info "未检测到 CA 证书包，尝试安装 ca-certificates..."
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq >/dev/null 2>&1 || true
+    apt-get install -y ca-certificates >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y ca-certificates >/dev/null 2>&1 || true
+  fi
+  [ -e /etc/ssl/certs/ca-certificates.crt ] || [ -e /etc/pki/tls/certs/ca-bundle.crt ] \
+    || die "CA 证书包缺失且自动安装失败，请手动安装 ca-certificates 后重试"
+  ok "CA 证书包就绪"
+fi
+
+# ── 资源前置检查（只提醒不阻断）────────────────────
+mem_kb="$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+if [ "${mem_kb:-0}" -gt 0 ] && [ "$mem_kb" -lt 3800000 ]; then
+  warn "内存 < 4G：多 worker 并发 + 压缩器会吃紧（建议 4C8G 起）"
+fi
+disk_avail="$(df -Pk / 2>/dev/null | awk 'NR==2{print $4}')"
+if [ -n "${disk_avail:-}" ] && [ "$disk_avail" -lt 10485760 ]; then
+  warn "根分区可用 < 10G：装工具/SecLists(约2.5G)/nuclei 模板/chromium 可能不够（建议 ≥40G）"
+fi
+if command -v python3 >/dev/null 2>&1; then
+  pyver="$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "0.0")"
+  case "$pyver" in
+    3.10|3.11|3.12|3.13|3.14) ;;
+    *) warn "python3 版本 ${pyver}：内置 FOFA MCP 需要 ≥3.10（不影响主服务）" ;;
+  esac
+else
+  warn "未检测到 python3：内置 FOFA MCP 需要 Python ≥3.10（不影响主服务）"
+fi
 
 # ── 出网代理：交互式配置 + 自动验证 ────────────────
 #
@@ -214,7 +287,7 @@ configure_proxy(){
 
   # 非交互场景不打扰：直连。
   [ "$ASSUME_YES" = "1" ] && return 0
-  [ ! -t 0 ] && return 0
+  [ "$CAN_PROMPT" = "0" ] && return 0
 
   printf '\n'
   printf '是否配置出网代理？\n'
@@ -223,7 +296,7 @@ configure_proxy(){
   printf '  带认证：http://user:pass@host:port ；留空 = 直连\n'
   printf '代理地址（留空直连）: '
   local ans=""
-  read -r ans || ans=""
+  read -r ans </dev/tty || ans=""
   ans="$(printf '%s' "$ans" | tr -d ' \t"'"'"'')"
   [ -z "$ans" ] && { info "使用直连"; return 0; }
 
@@ -272,11 +345,11 @@ if [ -n "$INSTALL_PROXY" ]; then
   else
     printf '\n'
     warn "代理验证失败（GitHub API 不可达）"
-    if [ "$ASSUME_YES" = "1" ] || [ ! -t 0 ]; then
+    if [ "$ASSUME_YES" = "1" ] || [ "$CAN_PROMPT" = "0" ]; then
       die "代理不可用，中止安装（用 --install-proxy= 修正，或不传该参数走直连）"
     fi
     printf '仍然使用这个代理继续？(y/N) '
-    local _ans=""; read -r _ans || _ans=""
+    local _ans=""; read -r _ans </dev/tty || _ans=""
     case "$_ans" in
       y|Y|yes|YES) : ;;
       *) die "已中止" ;;
@@ -322,7 +395,7 @@ choose_mode(){
   if [ -n "$MODE" ]; then
     case "$MODE" in binary|docker) return ;; *) die "--mode 只能是 binary 或 docker"; esac
   fi
-  if [ "$ASSUME_YES" = "1" ] || [ ! -t 0 ]; then
+  if [ "$ASSUME_YES" = "1" ] || [ "$CAN_PROMPT" = "0" ]; then
     MODE="binary"
     info "非交互模式，默认使用二进制部署（--mode 可显式指定）"
     return
@@ -332,7 +405,7 @@ choose_mode(){
   printf '  2) Docker 部署         容器编排，工具随镜像固定\n'
   printf '选择 [1]: '
   local pick=""
-  read -r -t 60 pick || true
+  read -r -t 60 pick </dev/tty || true
   case "${pick:-1}" in
     2|docker|D) MODE="docker" ;;
     *)          MODE="binary" ;;
@@ -362,7 +435,7 @@ trap 'rm -rf "$TMP"' EXIT
 fetch_release(){
   resolve_version
   ok "目标版本: $VERSION"
-  local zip="artex-${VERSION#v}-${PKG_ARCH}.zip"
+  local zip="pojun-${VERSION#v}-${PKG_ARCH}.zip"
   info "下载 $zip"
   # 用原名落盘：SHA256SUMS 里写的就是这个名字，改名保存会让 sha256sum -c 找不到文件。
   #
@@ -388,11 +461,12 @@ fetch_release(){
 # 二进制部署
 # ══════════════════════════════════════════════════
 deploy_binary(){
+  if [ "$IS_MAC" = "1" ]; then deploy_binary_darwin; return; fi
   command -v systemctl >/dev/null 2>&1 || die "未检测到 systemd"
   command -v unzip   >/dev/null 2>&1 || { apt-get install -y unzip >/dev/null 2>&1 || dnf install -y unzip >/dev/null 2>&1 || die "需要 unzip"; }
 
   fetch_release
-  local src="$TMP/unpack/artex-${VERSION#v}-${PKG_ARCH}"
+  local src="$TMP/unpack/pojun-${VERSION#v}-${PKG_ARCH}"
   [ -d "$src" ] || die "发行包结构异常: 找不到 $src"
 
   mkdir -p "$INSTALL_DIR"
@@ -400,7 +474,7 @@ deploy_binary(){
   # 二进制不能直接 cp 覆盖正在运行的进程（Linux 报 ETXTBSY "Text file busy"），
   # 先落到同目录临时名再 rename——rename 对运行中的可执行文件是合法的。
   # 这一步之前漏了，导致「重跑 install.sh 即升级」在服务运行状态下必然失败。
-  for b in artex artex-hostd; do
+  for b in pojun pojun-hostd pojun-maint; do
     [ -f "$src/$b" ] || continue
     cp "$src/$b" "$INSTALL_DIR/.$b.new"
     chmod +x "$INSTALL_DIR/.$b.new"
@@ -409,11 +483,11 @@ deploy_binary(){
   # 其余文件（skills / README / start.sh / config.example.json）直接覆盖
   for f in "$src"/*; do
     base="$(basename "$f")"
-    case "$base" in artex|artex-hostd) continue ;; esac
+    case "$base" in pojun|pojun-hostd|pojun-maint) continue ;; esac
     cp -r "$f" "$INSTALL_DIR/"
   done
   chmod +x "$INSTALL_DIR/start.sh"
-  ok "程序就绪: $INSTALL_DIR/artex"
+  ok "程序就绪: $INSTALL_DIR/pojun"
 
   # 运行用户
   if ! id "$RUN_USER" >/dev/null 2>&1; then
@@ -448,7 +522,7 @@ deploy_binary(){
     DB_PASS="$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)"
     # 角色已存在时**必须同步密码**，不能只跳过。
     #
-    # 踩过的坑（2026-10-22 真实安装）：机器上残留了旧的 artex 角色（重装 /
+    # 踩过的坑（2026-10-22 真实安装）：机器上残留了旧的 pojun 角色（重装 /
     # 换端口 / 忘了删角色），脚本走「角色已存在 → 跳过创建」这条分支，
     # 于是 config.json 里写的是**新生成**的密码，而库里的角色还是**旧密码**
     # → 服务起来就反复 SASL 认证失败退出，而报错完全指不到真因。
@@ -456,29 +530,29 @@ deploy_binary(){
     # 同步密码是安全的：config.json 由本脚本独占写入（不覆盖已有安装），
     # 密码以它为准。角色已存在但 config.json 也在时，install.sh 根本不会
     # 走到这里（见上面的「仅首次」判断），所以不会误改既有安装的密码。
-    if sudo -u "$PG_SUPER" psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='artex'" | grep -q 1; then
-      info "数据库角色 artex 已存在，同步密码"
-      sudo -u "$PG_SUPER" psql -c "ALTER ROLE artex LOGIN PASSWORD '$DB_PASS'" >/dev/null
+    if sudo -u "$PG_SUPER" psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='pojun'" | grep -q 1; then
+      info "数据库角色 pojun 已存在，同步密码"
+      sudo -u "$PG_SUPER" psql -c "ALTER ROLE pojun LOGIN PASSWORD '$DB_PASS'" >/dev/null
     else
-      sudo -u "$PG_SUPER" psql -c "CREATE ROLE artex LOGIN PASSWORD '$DB_PASS'"
+      sudo -u "$PG_SUPER" psql -c "CREATE ROLE pojun LOGIN PASSWORD '$DB_PASS'"
     fi
-    sudo -u "$PG_SUPER" psql -tAc "SELECT 1 FROM pg_database WHERE datname='artex'" | grep -q 1 \
-      || sudo -u "$PG_SUPER" createdb -O artex artex
+    sudo -u "$PG_SUPER" psql -tAc "SELECT 1 FROM pg_database WHERE datname='pojun'" | grep -q 1 \
+      || sudo -u "$PG_SUPER" createdb -O pojun pojun
     cat > "$INSTALL_DIR/config.json" <<JSON
 {
   "database": {
     "host": "127.0.0.1",
     "port": 5432,
-    "user": "artex",
+    "user": "pojun",
     "password": "$DB_PASS",
-    "dbname": "artex",
+    "dbname": "pojun",
     "sslmode": "disable"
   }
 }
 JSON
     chown "$RUN_USER:$RUN_USER" "$INSTALL_DIR/config.json"
     chmod 600 "$INSTALL_DIR/config.json"
-    ok "数据库 artex 就绪（密码已写入 config.json，权限 600）"
+    ok "数据库 pojun 就绪（密码已写入 config.json，权限 600）"
   else
     ok "沿用既有 config.json（升级不覆盖）"
   fi
@@ -503,7 +577,7 @@ JSON
   # 注：--dir 若指向 /home 或 /root 底下，ProtectHome=true 会把它整个藏起来，需自行去掉该项。
   cat > "/etc/systemd/system/${SERVICE}.service" <<UNIT
 [Unit]
-Description=ARTEX - AI Autonomous Penetration Testing System
+Description=POJUN - AI Autonomous Penetration Testing System
 Documentation=https://github.com/${REPO}
 After=network-online.target postgresql.service
 Wants=network-online.target postgresql.service
@@ -512,7 +586,7 @@ Wants=network-online.target postgresql.service
 # start.sh 自己也有崩溃次数上限（连续 5 次异常退出就放弃自拉起并非 0 退出），
 # 但那只是第一道防线：systemd 的 Restart=always 会立刻再拉起 start.sh，
 # 于是又变成「status 显示 active (running)、实际全挂」的状态（start.sh 活着，
-# artex 本体在崩）。这里的 StartLimit 是第二道：达到上限后单元真正进入
+# pojun 本体在崩）。这里的 StartLimit 是第二道：达到上限后单元真正进入
 # failed，运维一眼能看出服务是坏的，而不是被「running」骗过去。
 StartLimitIntervalSec=300
 StartLimitBurst=5
@@ -560,6 +634,12 @@ UNIT
   systemctl restart "$SERVICE"
   ok "systemd 服务已启动（${SERVICE}）"
 
+  # 内置 MCP 服务器随包落地（FOFA 资产测绘），并把 uv 备好，预设开箱即用。
+  if [ -d "$INSTALL_DIR/mcp-servers/fofa" ]; then
+    ok "内置 MCP 服务器已安装（$INSTALL_DIR/mcp-servers/fofa）"
+  fi
+  ensure_uv
+
   if [ "$WITH_INSTALLER" = "1" ]; then install_hostd; fi
 }
 
@@ -571,6 +651,138 @@ UNIT
 # 走数据库而不是 HTTP API：设置接口要 JWT，而管理员密码是用户首次访问
 # 时自己设的，install.sh 拿不到。settings 表结构简单（key/value），
 # 直接 UPSERT 最省事。
+# ══════════════════════════════════════════════════
+# 二进制部署 · macOS（launchd + Homebrew PostgreSQL）
+# ══════════════════════════════════════════════════
+# 与 Linux 版的差异（其余流程——下载/校验/解压/config.json/一键更新——完全复用）：
+#   - 包管理器 apt/dnf → Homebrew；PostgreSQL 走 postgresql@16 formula，
+#     superuser 就是当前用户（brew 不建 postgres 系统用户），psql 直连即可；
+#   - 服务化 systemd → launchd：LaunchAgents plist 拉 start.sh（KeepAlive）。
+#     start.sh 本身就是守护脚本（崩溃退避重拉 + 一键更新换装都在里面），
+#     launchd 只负责「开机自启 + 意外退出拉起」，不重复实现守护逻辑；
+#   - 不装 pojun-hostd（apt 体系工具安装不可用），不建系统用户；
+#   - 全程当前用户，不需要 sudo（sudo 反而会破坏 brew/launchd 的一致性）。
+deploy_binary_darwin(){
+  # Homebrew：没有就装（官方安装器，需要交互确认一次密码给 /usr/local 写权限的
+  # Intel 机器；Apple Silicon 装到 /opt/homebrew 不需要密码）
+  if ! command -v brew >/dev/null 2>&1; then
+    warn "未检测到 Homebrew，先安装它（可能要求输入密码/回车确认）..."
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"       || die "Homebrew 安装失败；也可手动安装后重跑本脚本"
+    eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || true)"
+    eval "$(/usr/local/bin/brew shellenv 2>/dev/null || true)"
+  fi
+  command -v brew >/dev/null 2>&1 || die "brew 不可用（PATH 未包含？）"
+  local BREW_PREFIX
+  BREW_PREFIX="$(brew --prefix)"
+  export PATH="$BREW_PREFIX/bin:$BREW_PREFIX/opt/postgresql@16/bin:$PATH"
+
+  command -v unzip >/dev/null 2>&1 || brew install unzip >/dev/null 2>&1 || die "需要 unzip"
+
+  # PostgreSQL 16（硬依赖）。按 formula 是否安装来判断，而不是 command -v psql：
+  # 机器上可能有别的 psql（旧版 formula / 系统 CLI），会让我们误以为 @16 已就位。
+  if ! brew list --formula 2>/dev/null | grep -q "^postgresql@16$"; then
+    info "安装 PostgreSQL 16（brew，首次几分钟）..."
+    brew install postgresql@16 || die "postgresql@16 安装失败"
+  fi
+  export PATH="$BREW_PREFIX/opt/postgresql@16/bin:$PATH"
+  command -v psql >/dev/null 2>&1 || die "psql 不在 PATH（postgresql@16 是 keg-only，脚本已显式加 PATH，不应走到这）"
+  if ! brew services list 2>/dev/null | grep -q "postgresql@16.*started"; then
+    info "启动 PostgreSQL 服务（brew services = launchd）..."
+    brew services start postgresql@16 || die "启动 PostgreSQL 失败"
+  fi
+  local i
+  for i in $(seq 1 30); do pg_isready -q >/dev/null 2>&1 && break; sleep 2; done
+  pg_isready -q >/dev/null 2>&1 || die "PostgreSQL 60s 内未就绪（brew services list 看状态）"
+  ok "PostgreSQL 就绪"
+  # psql 不带 -d 时默认连「与当前用户同名」的库（通常不存在）——显式钉到 postgres
+  export PGDATABASE=postgres
+
+  fetch_release
+  local src="$TMP/unpack/pojun-${VERSION#v}-${PKG_ARCH}"
+  [ -d "$src" ] || die "发行包结构异常: 找不到 $src"
+
+  mkdir -p "$INSTALL_DIR"
+  for b in pojun pojun-hostd pojun-maint; do
+    [ -f "$src/$b" ] || continue
+    cp "$src/$b" "$INSTALL_DIR/.$b.new"
+    chmod +x "$INSTALL_DIR/.$b.new"
+    mv -f "$INSTALL_DIR/.$b.new" "$INSTALL_DIR/$b"
+  done
+  local f base
+  for f in "$src"/*; do
+    base="$(basename "$f")"
+    case "$base" in pojun|pojun-hostd|pojun-maint) continue ;; esac
+    cp -r "$f" "$INSTALL_DIR/"
+  done
+  chmod +x "$INSTALL_DIR/start.sh"
+  ok "程序就绪: $INSTALL_DIR/pojun"
+
+  # config.json（仅首次；升级不覆盖）
+  if [ ! -f "$INSTALL_DIR/config.json" ]; then
+    local DB_PASS
+    DB_PASS="$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)"
+    # brew 的 PostgreSQL superuser 就是当前用户，无需 sudo -u postgres
+    if psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='pojun'" 2>/dev/null | grep -q 1; then
+      info "数据库角色 pojun 已存在，同步密码"
+      psql -c "ALTER ROLE pojun LOGIN PASSWORD '$DB_PASS'" >/dev/null
+    else
+      psql -c "CREATE ROLE pojun LOGIN PASSWORD '$DB_PASS'" >/dev/null
+    fi
+    psql -tAc "SELECT 1 FROM pg_database WHERE datname='pojun'" 2>/dev/null | grep -q 1       || createdb -O pojun pojun
+    cat > "$INSTALL_DIR/config.json" <<JSON
+{
+  "database": {
+    "host": "127.0.0.1",
+    "port": 5432,
+    "user": "pojun",
+    "password": "$DB_PASS",
+    "dbname": "pojun",
+    "sslmode": "disable"
+  }
+}
+JSON
+    chmod 600 "$INSTALL_DIR/config.json"
+    ok "数据库 pojun 就绪（密码已写入 config.json，权限 600）"
+  else
+    ok "沿用既有 config.json（升级不覆盖）"
+  fi
+
+  # launchd 用户级服务（开机自启 + KeepAlive 崩溃拉起）
+  # 拆开声明：local 是命令，同一行 `local A=1 B=$A` 的 $A 在 A 赋值前展开，
+  # set -u 下直接报 unbound variable
+  local PLIST_LABEL="com.pojun"
+  local PLIST_DIR="$HOME/Library/LaunchAgents"
+  local PLIST="$PLIST_DIR/$PLIST_LABEL.plist"
+  mkdir -p "$PLIST_DIR"
+  cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$PLIST_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>$INSTALL_DIR/start.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>$INSTALL_DIR</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$INSTALL_DIR/pojun.launchd.log</string>
+  <key>StandardErrorPath</key><string>$INSTALL_DIR/pojun.launchd.log</string>
+</dict>
+</plist>
+PLIST
+  launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" || die "launchd 注册失败（$PLIST）"
+  ok "launchd 服务已注册（开机自启，崩溃自动拉起）"
+
+  info "可选依赖（按需自装，不影响核心功能）："
+  info "  brew install libreoffice --cask   # Word/证据渲染（装完 ln -sf "/Applications/LibreOffice.app/Contents/MacOS/soffice" "$BREW_PREFIX/bin/soffice"）"
+  info "  brew install poppler imagemagick  # PDF/图片预览"
+  info "  brew install nmap sqlmap nuclei ffuf ...  # 渗透工具按需装，缺失项在「宿主环境」页如实显示"
+}
+
 persist_install_proxy(){
   [ -n "$INSTALL_PROXY" ] || return 0
   [ -f "$INSTALL_DIR/config.json" ] || { warn "找不到 config.json，跳过写入运行期代理"; return 0; }
@@ -596,8 +808,8 @@ except Exception:
     d = {}
 host = str(d.get("host") or "127.0.0.1")
 port = str(d.get("port") or 5432)
-user = str(d.get("user") or "artex")
-dbname = str(d.get("dbname") or "artex")
+user = str(d.get("user") or "pojun")
+dbname = str(d.get("dbname") or "pojun")
 password = str(d.get("password") or "")
 
 # SQL 字符串字面量转义:单引号翻倍。代理地址已过 URL 校验(仅 http/https/socks5
@@ -623,21 +835,21 @@ PYEOF
   fi
 }
 
-# ── 特权安装助手 artex-hostd ─────────────────────
+# ── 特权安装助手 pojun-hostd ─────────────────────
 # 主服务单元带 NoNewPrivileges + ProtectSystem=strict,进程无法提权、/usr 只读,
 # 所以「一键安装」做不了——必须在外面用一个 root 助手。它只监听一个 Unix socket,
 # 且只认 hosttools 里的白名单工具 id,不接受自由命令。
 install_hostd(){
-  if [ ! -f "$INSTALL_DIR/artex-hostd" ]; then
-    warn "发行包里没有 artex-hostd（旧版本包），跳过；体检仍可用，一键安装不可用"
+  if [ ! -f "$INSTALL_DIR/pojun-hostd" ]; then
+    warn "发行包里没有 pojun-hostd（旧版本包），跳过；体检仍可用，一键安装不可用"
     return 0
   fi
   # 同上：目标可能是正在运行的助手，先落临时名再 rename 避免 ETXTBSY。
-  install -m 0755 "$INSTALL_DIR/artex-hostd" /usr/local/bin/.artex-hostd.new
-  mv -f /usr/local/bin/.artex-hostd.new /usr/local/bin/artex-hostd
+  install -m 0755 "$INSTALL_DIR/pojun-hostd" /usr/local/bin/.pojun-hostd.new
+  mv -f /usr/local/bin/.pojun-hostd.new /usr/local/bin/pojun-hostd
   cat > "/etc/systemd/system/${SERVICE}-hostd.service" <<UNIT
 [Unit]
-Description=ARTEX host tool installer (privileged helper)
+Description=POJUN host tool installer (privileged helper)
 Documentation=https://github.com/${REPO}
 After=network-online.target
 Wants=network-online.target
@@ -645,12 +857,12 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/artex-hostd -socket /run/artex/hostd.sock -socket-group ${RUN_USER}
+ExecStart=/usr/local/bin/pojun-hostd -socket /run/pojun/hostd.sock -socket-group ${RUN_USER}
 ${INSTALL_PROXY_ENV}
 Restart=always
 RestartSec=5
-# /run/artex 由 systemd 建好并随停止清理;socket 本身被助手下调成 0660 root:${RUN_USER}
-RuntimeDirectory=artex
+# /run/pojun 由 systemd 建好并随停止清理;socket 本身被助手下调成 0660 root:${RUN_USER}
+RuntimeDirectory=pojun
 RuntimeDirectoryMode=0755
 # 助手要调 apt/dnf、写 /usr/local/bin,所以不能像主服务那样把根挂成只读。
 #
@@ -686,7 +898,7 @@ UNIT
   systemctl enable "${SERVICE}-hostd" 2>/dev/null || true
   # 同主服务：已在跑时要显式 restart 才会换成新装的二进制。
   systemctl restart "${SERVICE}-hostd"
-  ok "安装助手已启动（${SERVICE}-hostd）→ socket /run/artex/hostd.sock"
+  ok "安装助手已启动（${SERVICE}-hostd）→ socket /run/pojun/hostd.sock"
 }
 
 # ══════════════════════════════════════════════════
@@ -700,7 +912,7 @@ deploy_docker(){
 
   # skills 要挂进容器：空目录挂载会覆盖镜像内置的 /app/skills，所以先从发行包取一份
   fetch_release
-  local src="$TMP/unpack/artex-${VERSION#v}-${PKG_ARCH}"
+  local src="$TMP/unpack/pojun-${VERSION#v}-${PKG_ARCH}"
   mkdir -p "$INSTALL_DIR/data" "$INSTALL_DIR/skills"
   if [ ! -f "$INSTALL_DIR/skills/.keep" ] && [ -z "$(ls -A "$INSTALL_DIR/skills" 2>/dev/null)" ]; then
     [ -d "$src/skills" ] && cp -r "$src/skills/." "$INSTALL_DIR/skills/"
@@ -712,12 +924,12 @@ deploy_docker(){
     local PG_PASS
     PG_PASS="$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)"
     cat > "$INSTALL_DIR/.env" <<ENV
-POSTGRES_USER=artex
+POSTGRES_USER=pojun
 POSTGRES_PASSWORD=$PG_PASS
-POSTGRES_DB=artex
-ARTEX_IMAGE=$IMAGE
-ARTEX_TAG=$VERSION
-ARTEX_INSTALL_PROXY=$INSTALL_PROXY
+POSTGRES_DB=pojun
+POJUN_IMAGE=$IMAGE
+POJUN_TAG=$VERSION
+POJUN_INSTALL_PROXY=$INSTALL_PROXY
 ENV
     chmod 600 "$INSTALL_DIR/.env"
     ok "已生成 $INSTALL_DIR/.env（含随机数据库密码，权限 600）"
@@ -726,10 +938,10 @@ ENV
     # 但代理要跟着本次安装走：它不是"首次生成"的密钥，升级时也该同步，
     # 否则用户改了代理后重跑安装，旧 .env 里的旧代理还在生效。
     if [ -n "$INSTALL_PROXY" ]; then
-      if grep -q '^ARTEX_INSTALL_PROXY=' "$INSTALL_DIR/.env"; then
-        sed -i "s|^ARTEX_INSTALL_PROXY=.*|ARTEX_INSTALL_PROXY=$INSTALL_PROXY|" "$INSTALL_DIR/.env"
+      if grep -q '^POJUN_INSTALL_PROXY=' "$INSTALL_DIR/.env"; then
+        sed -i "s|^POJUN_INSTALL_PROXY=.*|POJUN_INSTALL_PROXY=$INSTALL_PROXY|" "$INSTALL_DIR/.env"
       else
-        printf 'ARTEX_INSTALL_PROXY=%s\n' "$INSTALL_PROXY" >> "$INSTALL_DIR/.env"
+        printf 'POJUN_INSTALL_PROXY=%s\n' "$INSTALL_PROXY" >> "$INSTALL_DIR/.env"
       fi
       ok "已同步 .env 里的装机代理"
     fi
@@ -742,34 +954,34 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: \${POSTGRES_USER:-artex}
+      POSTGRES_USER: \${POSTGRES_USER:-pojun}
       POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:?请在 .env 设置 POSTGRES_PASSWORD}
-      POSTGRES_DB: \${POSTGRES_DB:-artex}
+      POSTGRES_DB: \${POSTGRES_DB:-pojun}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U \${POSTGRES_USER:-artex} -d \${POSTGRES_DB:-artex}"]
+      test: ["CMD-SHELL", "pg_isready -U \${POSTGRES_USER:-pojun} -d \${POSTGRES_DB:-pojun}"]
       interval: 5s
       timeout: 3s
       retries: 10
     restart: unless-stopped
 
-  artex:
-    image: \${ARTEX_IMAGE}:\${ARTEX_TAG}
+  pojun:
+    image: \${POJUN_IMAGE}:\${POJUN_TAG}
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      ARTEX_PG_DSN: postgres://\${POSTGRES_USER:-artex}:\${POSTGRES_PASSWORD}@postgres:5432/\${POSTGRES_DB:-artex}?sslmode=disable
+      POJUN_PG_DSN: postgres://\${POSTGRES_USER:-pojun}:\${POSTGRES_PASSWORD}@postgres:5432/\${POSTGRES_DB:-pojun}?sslmode=disable
       ANTHROPIC_API_KEY: \${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: \${OPENAI_API_KEY:-}
-      ARTEX_LLM_PROVIDER: \${ARTEX_LLM_PROVIDER:-}
-      ARTEX_LLM_MODEL: \${ARTEX_LLM_MODEL:-}
-      ARTEX_LLM_BASE_URL: \${ARTEX_LLM_BASE_URL:-}
-      ARTEX_LLM_PROXY: \${ARTEX_LLM_PROXY:-}
+      POJUN_LLM_PROVIDER: \${POJUN_LLM_PROVIDER:-}
+      POJUN_LLM_MODEL: \${POJUN_LLM_MODEL:-}
+      POJUN_LLM_BASE_URL: \${POJUN_LLM_BASE_URL:-}
+      POJUN_LLM_PROXY: \${POJUN_LLM_PROXY:-}
       # 装机代理：宿主环境页的「一键安装」和后台情报同步用。Docker 形态没有
       # config.json，只能走环境变量；服务端读它作为数据库 setting 的兜底。
-      ARTEX_INSTALL_PROXY: \${ARTEX_INSTALL_PROXY:-}
+      POJUN_INSTALL_PROXY: \${POJUN_INSTALL_PROXY:-}
     ports:
       - "${PORT}:8787"
       - "127.0.0.1:${PROXY_PORT}:8788"
@@ -810,16 +1022,32 @@ install_tools(){
     apt-get "${APT_PROXY[@]}" update -qq || warn "apt update 失败，继续尝试"
     # seclists 在 apt 源里没有稳定包名，单独克隆（见 install_wordlists）；
     # 其余一次装齐，缺的包不阻断整体（不同发行版源里包名有出入）。
-    apt-get "${APT_PROXY[@]}" install -y nmap masscan sqlmap hydra whatweb nikto gobuster ffuf john \
-      netcat-openbsd dnsutils whois unzip nodejs npm python3-impacket gitleaks \
-      >/dev/null 2>&1 \
-      || apt-get "${APT_PROXY[@]}" install -y nmap masscan sqlmap hydra whatweb nikto gobuster ffuf john \
-           netcat-openbsd dnsutils whois unzip nodejs npm python3-impacket \
-           >/dev/null \
-      || warn "部分 apt 工具未装上"
+    # imagemagick：报告证据拼图/文件名水印（v0.4.10 起依赖）；
+    # libreoffice-writer/calc/impress + poppler-utils：文档证据转图片预览
+    # （v0.4.21 起，Word/Excel/PPT→PDF→JPEG）。
+    # 安装策略：先按组整装（快），整组失败再**逐包重试**。
+    # 为什么必须逐包兜底：apt-get install 是原子事务，弱网下 200 个包里任何一个
+    # 下载失败会让整组回滚——实测丢 git（script 类工具全挂 127）这类关键小包。
+    apt_install() {
+      apt-get "${APT_PROXY[@]}" install -y "$@" >/dev/null 2>&1 && return 0
+      local p
+      for p in "$@"; do
+        apt-get "${APT_PROXY[@]}" install -y "$p" >/dev/null 2>&1 \
+          || warn "  apt 缺包: $p"
+      done
+    }
+    # 关键基础包优先（git/ca 证书这类缺失会让后续 script 安装全面失败）
+    apt_install git jq perl ruby ca-certificates curl wget unzip openssl openssh-client netcat-openbsd
+    # 渗透工具组
+    apt_install nmap masscan sqlmap hydra whatweb nikto gobuster ffuf john \
+      dnsutils whois nodejs npm python3-impacket gitleaks imagemagick \
+      hashcat testssl.sh default-jre-headless apktool adb aapt awscli tcpdump sshuttle
+    # 文档渲染组（体积大、弱网下最容易拖垮整组，单独一组）
+    apt_install libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils
   elif command -v dnf >/dev/null 2>&1; then
     dnf "${DNF_PROXY[@]}" install -y nmap masscan sqlmap hydra whatweb nikto john nmap-ncat bind-utils unzip \
-      nodejs python3-impacket \
+      nodejs python3-impacket ImageMagick hashcat openssl tcpdump \
+      libreoffice-writer libreoffice-calc libreoffice-impress poppler-utils \
       || warn "dnf 部分包缺失，已装可用项"
   else
     warn "未识别的包管理器，跳过系统源工具安装"
@@ -831,6 +1059,64 @@ install_tools(){
   install_wordlists
   install_pip_tools
   install_browser_mcp
+  install_fonts
+  # catalog 预装（v0.4.68）：宿主助手按 90 项工具目录补齐上面未覆盖的
+  # （移动逆向/内网穿透/二进制利用等），与 Web 一键安装同一套清单。
+  install_catalog_tools
+}
+
+# ── catalog 预装：复用 hostd 的白名单配方与串行队列 ──────────
+# 为什么放在最后一棒：apt 基础包与 GitHub 表驱动安装是验证最久的路径，
+# catalog 只补它们没覆盖的工具（幂等：已可用的会跳过）。
+install_catalog_tools(){
+  local bin="/usr/local/bin/pojun-hostd"
+  if [ ! -x "$bin" ]; then
+    warn "  未安装 pojun-hostd，跳过 catalog 预装（Web 端仍可一键安装）"
+    return 0
+  fi
+  info "按 catalog 预装缺失工具（首次较慢：apt/pip/GitHub 全量）..."
+  local was_active=0
+  if systemctl is-active --quiet pojun-hostd 2>/dev/null; then
+    was_active=1
+    systemctl stop pojun-hostd 2>/dev/null || true
+  fi
+  # 弱网下 GitHub/pip 抖动是常态：失败项自动重试三轮（每轮只重装缺失项，
+  # 已装好的直接跳过），大幅提高无人值守安装的成功率。
+  local attempt ok_any=0
+  for attempt in 1 2 3; do
+    if "$bin" -install-all; then
+      ok "catalog 工具预装完成"
+      ok_any=1
+      break
+    fi
+    if [ "$attempt" -lt 3 ]; then
+      warn "catalog 预装第 $attempt 轮存在失败项，30 秒后重试…"
+      sleep 30
+    fi
+  done
+  if [ "$ok_any" != "1" ]; then
+    warn "catalog 工具预装仍有失败项；可在 Web「系统 → 宿主环境」逐项重试"
+  fi
+  [ "$was_active" = "1" ] && systemctl start pojun-hostd 2>/dev/null || true
+}
+
+# ── 公文字体：报告 PDF 渲染 ────────────────────────
+# docx 里字体已内嵌（odttf），Word/WPS 打开不需要系统字体；但 LibreOffice
+# 转 PDF 时读系统字体，新机器不装会 fallback。从仓库 raw 拉三件套（ASCII
+# 文件名，TTF 内部 family 名仍是仿宋_GB2312 等，docx 引用按内部名匹配）。
+# 下载失败只告警——不影响 Word 导出。
+install_fonts(){
+  local dir="/usr/share/fonts/gongwen"
+  mkdir -p "$dir" || { warn "无法创建 $dir，跳过公文字体"; return 0; }
+  local base="https://raw.githubusercontent.com/${REPO}/main/report/fonts"
+  local f
+  for f in fangsong_gb2312.ttf kaiti_gb2312.ttf fzxiaobiaosong_gbk.ttf; do
+    if [ ! -s "$dir/$f" ]; then
+      "${CURL[@]}" -fsSL "$base/$f" -o "$dir/$f" >/dev/null 2>&1         || { rm -f "$dir/$f"; warn "  公文字体 $f 下载失败（仅影响本机 docx→PDF）"; }
+    fi
+  done
+  command -v fc-cache >/dev/null 2>&1 && fc-cache -f "$dir" >/dev/null 2>&1 || true
+  ok "公文字体就位（$dir）"
 }
 
 # ── GitHub Release 单文件工具 ───────────────────
@@ -844,9 +1130,9 @@ install_tools(){
 # 不用 apt 源：这些工具的 apt 包要么没有要么版本极旧。
 install_github_tools(){
   local GOBIN_DIR="/usr/local/bin"
-  local arch="amd64" arch2="x86_64" arch3="x86" arch4="x64"
+  local arch="amd64" arch2="x86_64" arch3="x86" arch4="x64" lin="x86_64"
   if [ "$ARCH" = "aarch64" ]; then
-    arch="arm64"; arch2="aarch64"; arch3="arm"; arch4="arm64"
+    arch="arm64"; arch2="aarch64"; arch3="arm"; arch4="arm64"; lin="arm64"
   fi
 
   # repo|资产模板|二进制名
@@ -865,6 +1151,7 @@ jpillora/chisel|chisel_{ver}_linux_{arch}.gz|chisel
 OWASP/Amass|amass_linux_{arch}.tar.gz|amass
 hahwul/dalfox|dalfox-{verv}-linux-{arch2}.tar.gz|dalfox
 epi052/feroxbuster|{arch2}-linux-feroxbuster.tar.gz|feroxbuster
+OJ/gobuster|gobuster_Linux_{lin}.tar.gz|gobuster
 "
   local spec repo tmpl bin tag ver url asset file tmpd
   for spec in $specs; do
@@ -889,6 +1176,7 @@ epi052/feroxbuster|{arch2}-linux-feroxbuster.tar.gz|feroxbuster
     asset="${asset//\{arch2\}/$arch2}"
     asset="${asset//\{arch3\}/$arch3}"
     asset="${asset//\{arch4\}/$arch4}"
+    asset="${asset//\{lin\}/$lin}"
     url="https://github.com/$repo/releases/download/${tag}/${asset}"
     file="$TMP/$(basename "$asset")"
     tmpd="$TMP/ghtool"
@@ -943,6 +1231,41 @@ install_wordlists(){
   fi
 }
 
+# uv：内置 MCP「FOFA 资产测绘」用它拉起 stdio server（相对路径 mcp-servers/fofa）。
+#
+# 关键点（真实踩坑）：pojun 服务是 systemd 用户，PATH 只保证
+# /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin；pipx 以 root 安装
+# 会把 uv 放到 /root/.local/bin（服务用户既无权穿越 /root 也不在 PATH）——必须
+# 把二进制统一落到 /usr/local/bin，否则「预设能加、MCP 起不来」。best-effort：
+# 装不上只提示，不影响主服务。
+ensure_uv(){
+  local cand=""
+  for c in /usr/local/bin/uv /usr/bin/uv /root/.local/bin/uv "$HOME/.local/bin/uv"; do
+    if [ -x "$c" ]; then cand="$c"; break; fi
+  done
+  if [ -z "$cand" ]; then
+    if command -v pipx >/dev/null 2>&1; then
+      pipx install --global uv >/dev/null 2>&1 || pipx install uv >/dev/null 2>&1 || true
+    fi
+    if [ -z "$cand" ] && command -v python3 >/dev/null 2>&1; then
+      python3 -m pip install --break-system-packages -q uv >/dev/null 2>&1 || true
+    fi
+    for c in /usr/local/bin/uv /root/.local/bin/uv "$HOME/.local/bin/uv"; do
+      if [ -x "$c" ]; then cand="$c"; break; fi
+    done
+  fi
+  if [ -n "$cand" ] && [ "$cand" != "/usr/local/bin/uv" ]; then
+    cp -f "$cand" /usr/local/bin/uv 2>/dev/null || true
+    chmod 755 /usr/local/bin/uv 2>/dev/null || true
+  fi
+  if [ -x /usr/local/bin/uv ] && /usr/local/bin/uv --version >/dev/null 2>&1; then
+    ok "uv 就绪（/usr/local/bin/uv，FOFA MCP 可用）"
+  else
+    warn "uv 未就绪：FOFA MCP 预设需要它（pip install uv 后复制到 /usr/local/bin）"
+  fi
+  return 0
+}
+
 # pip 工具：wafw00f(WAF 识别)、impacket 的部分脚本。
 # 优先 pipx（隔离环境，不污染系统 Python，也不撞 PEP668 externally-managed），
 # 没有 pipx 就退回 python3 -m pip --break-system-packages。
@@ -959,9 +1282,11 @@ install_pip_tools(){
   # 包名|可执行文件名(空=该包不提供命令行)。已存在就跳过——
   # pipx 对已装的包会报错退出，不该当成"安装失败"。
   local specs="wafw00f|wafw00f
-netexec|netexec
 semgrep|semgrep
-pwntools|pwntools"
+pwntools|pwntools
+uv|uv"
+  # netexec 不装：NetExec 2026 起商业化，PyPI 发行文件已撤下（装必失败）；
+# 需要时从 GitHub 源码安装（hosttools netexec 条目有说明）。
   local spec pkg bin
   for spec in $specs; do
     pkg="$(printf '%s' "$spec" | cut -d'|' -f1)"
@@ -982,7 +1307,7 @@ pwntools|pwntools"
 # 再预置 chromium 浏览器，否则首次启动还要联网下载。
 #
 # 浏览器装到 /opt/ms-playwright 而不是 ~/.cache/ms-playwright：
-# 服务以 artex 用户跑，root 家目录里的缓存它看不见。
+# 服务以 pojun 用户跑，root 家目录里的缓存它看不见。
 install_browser_mcp(){
   command -v node >/dev/null 2>&1 || { warn "  没有 node，browser MCP 跳过"; return 0; }
   command -v npm >/dev/null 2>&1 || { warn "  没有 npm，browser MCP 跳过"; return 0; }
@@ -1021,7 +1346,13 @@ case "$MODE" in
   *) die "未知部署形态: $MODE" ;;
 esac
 
-if [ "$WITH_TOOLS" = "1" ]; then install_tools; fi
+if [ "$WITH_TOOLS" = "1" ]; then
+  if [ "$IS_MAC" = "1" ]; then
+    warn "--with-tools 在 macOS 不可用（工具安装器是 apt/dnf 体系）；请 brew install 按需装"
+  else
+    install_tools
+  fi
+fi
 
 # 代理要落地到运行期设置，宿主环境页的「一键安装」才用同一个代理。
 # 放在最后：此时服务已起、schema 已建。
@@ -1029,21 +1360,40 @@ persist_install_proxy
 
 # ── 健康检查 ─────────────────────────────────────
 PORT="${LISTEN_ADDR##*:}"
-for _ in $(seq 1 30); do
-  if curl -fsS -o /dev/null "http://127.0.0.1:${PORT}/api/health" 2>/dev/null; then
-    HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+for _n in $(seq 1 30); do
+  # 每轮失败打进度：装机现场「卡在哪一步」必须可见，也方便排障
+  # curl 的退出码显式捕获：set -e 下 if 条件本应豁免，但显式 rc 让「为什么退出」
+  # 直接可见（曾在此处出现无输出退出的怪象，靠这行定位）
+  health_rc=0
+  curl -fsS -o /dev/null "http://127.0.0.1:${PORT}/api/health" 2>/dev/null || health_rc=$?
+  echo "[*] health check #${_n}: rc=${health_rc}"
+  if [ "$health_rc" = "0" ]; then
+    # macOS 的 hostname 没有 -I（退出码 1），set -o pipefail 会把它传染整条管道、
+    # set -e 当场杀掉脚本——曾让 macOS 安装在 health 200 后静默退出
+    HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
     ok "服务已就绪 → http://${HOST_IP:-127.0.0.1}:${PORT}（首次访问设置管理员密码）"
+    info "下一步：①设置管理员密码 ②「LLM 配置」配通道 ③「系统→MCP」用预设接入 FOFA/Playwright ④建任务可套用内置 Playbook"
     if [ "$MODE" = "binary" ]; then
-      systemctl --no-pager status "$SERVICE" | head -5
+      if [ "$IS_MAC" = "1" ]; then
+        tail -5 "$INSTALL_DIR/pojun.launchd.log" 2>/dev/null || true
+        info "服务管理：launchctl kickstart -k gui/$(id -u)/com.pojun 重启 | launchctl bootout gui/$(id -u)/com.pojun 停止 | tail -f $INSTALL_DIR/pojun.launchd.log 看日志"
+      else
+        systemctl --no-pager status "$SERVICE" | head -5
+      fi
     else
       ( cd "$INSTALL_DIR" && docker compose ps )
     fi
     exit 0
   fi
+  info "等待服务就绪 (${_n}/30)..."
   sleep 2
 done
 if [ "$MODE" = "binary" ]; then
-  warn "60s 内未就绪，查看日志: journalctl -u $SERVICE -n 50"
+  if [ "$IS_MAC" = "1" ]; then
+    warn "60s 内未就绪，查看日志: tail -n 50 $INSTALL_DIR/pojun.launchd.log"
+  else
+    warn "60s 内未就绪，查看日志: journalctl -u $SERVICE -n 50"
+  fi
 else
   warn "60s 内未就绪，查看日志: cd $INSTALL_DIR && docker compose logs --tail 50"
 fi

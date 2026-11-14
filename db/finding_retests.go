@@ -257,3 +257,83 @@ func (d *DB) RecoverFindingRetests() error {
 	_, err := d.Exec(`UPDATE finding_retests SET status='stopped', error='服务重启，复测已中断，请重新发起', finished_at=now() WHERE status IN ('pending','running')`)
 	return err
 }
+
+// RetestCandidate is one finding eligible for a (re)test run: still pending and
+// without an active retest. 批量复测（v0.4.27）用它圈出「该测还没测」的清单。
+type RetestCandidate struct {
+	ID        int64  `json:"id"`
+	VulnClass string `json:"vulnclass"`
+	Name      string `json:"name"`
+	Severity  string `json:"severity"`
+	Summary   string `json:"summary"`
+}
+
+// RetestCandidates lists the task's pending findings of the given severities
+// (empty = all) that have no active (pending/running) retest, ordered
+// critical→high→… then oldest first. limit<=0 means 100.
+func (d *DB) RetestCandidates(taskID int64, severities []string, limit int) ([]RetestCandidate, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	sevFilter := ""
+	args := []any{taskID}
+	if len(severities) > 0 {
+		sevFilter = ` AND f.severity = ANY($2)`
+		args = append(args, severities)
+	}
+	args = append(args, limit)
+	pos := len(args)
+	rows, err := d.Query(`
+SELECT f.id, f.vulnclass, COALESCE(f.name,''), f.severity, COALESCE(f.summary,'')
+FROM findings f
+WHERE f.task_id=$1 AND f.status='pending'`+sevFilter+`
+  AND NOT EXISTS (SELECT 1 FROM finding_retests r WHERE r.finding_id=f.id AND r.status IN ('pending','running'))
+ORDER BY CASE f.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, f.id
+LIMIT $`+fmt.Sprintf("%d", pos), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []RetestCandidate{}
+	for rows.Next() {
+		var c RetestCandidate
+		if err := rows.Scan(&c.ID, &c.VulnClass, &c.Name, &c.Severity, &c.Summary); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// RetestState is the latest retest outcome for one finding (A9 batch view:
+// 列表/报告据此标注「已复测/未复测」）。
+type RetestState struct {
+	FindingID int64  `json:"finding_id"`
+	Status    string `json:"status"`
+	Verdict   string `json:"verdict"`
+}
+
+// RetestStatesByTask maps each of the task's findings to its latest retest
+// (id DESC = newest first via DISTINCT ON). Findings absent from the result
+// have never been retested.
+func (d *DB) RetestStatesByTask(taskID int64) (map[int64]RetestState, error) {
+	rows, err := d.Query(`
+SELECT DISTINCT ON (r.finding_id) r.finding_id, r.status, COALESCE(r.verdict,'')
+FROM finding_retests r
+JOIN findings f ON f.id=r.finding_id
+WHERE f.task_id=$1
+ORDER BY r.finding_id, r.id DESC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]RetestState{}
+	for rows.Next() {
+		var s RetestState
+		if err := rows.Scan(&s.FindingID, &s.Status, &s.Verdict); err != nil {
+			return nil, err
+		}
+		out[s.FindingID] = s
+	}
+	return out, rows.Err()
+}

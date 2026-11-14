@@ -1208,6 +1208,56 @@ func (s *AssetStore) CountsByTypeForTask(taskID int64) (map[string]int, error) {
 	return scanTypeCounts(rows)
 }
 
+// ResolveHostAssets matches hosts/URLs (usually extracted from a fact's free
+// text) back to task-owned asset ids, best match first: exact URL, then host
+// (domain) or root_domain. Used by record_fact's auto-anchor so a fact written
+// after Bash-curl probing still lands on the asset graph even when the model
+// never called list_assets — 任务 5 实测覆盖卡在 30% 的主因就是「测了但没归账」。
+// max caps the anchors per call (a fact name-dropping 20 hosts should not mark
+// 20 assets tested).
+func (s *AssetStore) ResolveHostAssets(taskID int64, hosts, urls []string, max int) ([]int64, error) {
+	if (len(hosts) == 0 && len(urls) == 0) || max <= 0 {
+		return nil, nil
+	}
+	if len(hosts) > 24 {
+		hosts = hosts[:24]
+	}
+	if len(urls) > 24 {
+		urls = urls[:24]
+	}
+	q := `SELECT a.id,
+       (CASE WHEN EXISTS (SELECT 1 FROM unnest($2::text[]) u WHERE u<>'' AND u=COALESCE(a.url,'')) THEN 0 ELSE 1 END) AS rank
+FROM assets a
+WHERE $1 = ANY(a.task_ids)
+  AND (
+        COALESCE(a.domain,'') = ANY($3::text[])
+     OR COALESCE(a.root_domain,'') = ANY($3::text[])
+     OR EXISTS (SELECT 1 FROM unnest($2::text[]) u
+                WHERE u<>'' AND COALESCE(a.url,'')<>''
+                  AND (left(a.url, length(u))=u OR left(u, length(a.url))=a.url))
+  )
+ORDER BY rank, a.id
+LIMIT $4`
+	rows, err := s.db.Query(q, taskID, urls, hosts, max)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	seen := map[int64]bool{}
+	out := []int64{}
+	for rows.Next() {
+		var id, rank int64
+		if err := rows.Scan(&id, &rank); err != nil {
+			return nil, err
+		}
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	return out, rows.Err()
+}
+
 // DeleteByTaskID removes assets owned only by taskID and detaches taskID from
 // assets shared with other tasks. Full task deletion uses the coordinated
 // transaction in DeleteTaskCascadePrepared; this method remains for callers

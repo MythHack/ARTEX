@@ -10,8 +10,9 @@ import (
 // right wrap-up words (per-run vs task-timeout). Attached to the run ctx by the
 // engine. Zero value = no task-level timeout (behaves exactly as before).
 type TaskClock struct {
-	DeadlineUnix int64 // absolute deadline (unix seconds); 0 = no task timeout
-	Final        bool  // coordinator-driven FINAL planner round (task ending now)
+	DeadlineUnix int64  // absolute deadline (unix seconds); 0 = no task timeout
+	Final        bool   // coordinator-driven FINAL planner round (task ending now)
+	FinalReason  string // "timeout" | "auto_idle" | "auto_coverage" | "auto_rounds"
 }
 
 type taskClockKey struct{}

@@ -340,6 +340,20 @@ WHERE id=$2 AND exploration_id=$3 AND kind='goal'`, string(raw), id, s.expID)
 	return err
 }
 
+// MergeIntentPayload merges fields into an intent node's payload (jsonb ||).
+// Used by the engine's run settlement to persist run telemetry (wall_ms 等) on
+// the intent itself, so「这条方向烧了多久」在图上是可审计的，而不只活在 activity。
+func (s *ExplorationStore) MergeIntentPayload(id int64, fields map[string]any) error {
+	if len(fields) == 0 {
+		return nil
+	}
+	raw, _ := json.Marshal(fields)
+	_, err := s.db.Exec(`UPDATE exploration_nodes
+SET payload = COALESCE(payload,'{}'::jsonb) || $1::jsonb
+WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, string(raw), id, s.expID)
+	return err
+}
+
 // UpdateGoalPayload rewrites a goal node's payload text (and optional vulnclass);
 // scoped to kind='goal' so it can never mutate an intent/fact by id. Returns an
 // error if no such goal exists in this exploration.
@@ -418,6 +432,22 @@ WHERE exploration_id=$1 AND kind='intent' AND state='blocked'`, s.expID)
 	return n, nil
 }
 
+// ReopenCanceledIntents 重开「因服务停止被取消」的 blocked 意图（部署重启的
+// 遗留物，不是真实失败——v0.4.56 复盘：任务 6/8/9 共 11 条此类意图永久卡在
+// blocked，任务看着完成实则漏测）。任务从终态复活时调用：继续 = 把没跑完的
+// 跑完。用户手动 block 的意图不在此列（原因不含 context canceled）。
+func (s *ExplorationStore) ReopenCanceledIntents() (int64, error) {
+	res, err := s.db.Exec(`UPDATE exploration_nodes
+SET state='open', completed_at=NULL, blocked_reason=NULL, content_version=content_version+1
+WHERE exploration_id=$1 AND kind='intent' AND state='blocked'
+  AND blocked_reason ILIKE '%context canceled%'`, s.expID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 func (s *ExplorationStore) SetIntentState(id int64, state string) error {
 	// terminal states stamp completed_at; reopening (back to open/running) clears it.
 	terminal := state == "done" || state == "blocked" || state == "exhausted" || state == "stopped"
@@ -456,6 +486,131 @@ type IntentCleanup struct {
 // 删除原因记入 delete_reason 字段,保留意图节点及其全部产出/血缘(不再像旧实现那样在图上
 // 另挂一条 fact)。返回删除前意图的 summary,供 planner 通知使用。副会话随删除态一并清理。
 // 调用方须先停掉运行中的 worker,避免其后续写入。
+// CountActiveIntents 返回未完成意图数（open+running），用于派发节流阈值。
+func (s *ExplorationStore) CountActiveIntents() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='intent' AND state IN ('open','running')`, s.expID).Scan(&n)
+	return n, err
+}
+
+// IntentHygiene 是规划轮「积压治理」的单条视图：这条 open 意图排了多久，
+// 以及它的锚点事实是否已被后续事实显式否定（例如 #5263 推翻 #5224 的目标）。
+type IntentHygiene struct {
+	ID       int64    `json:"id"`
+	Summary  string   `json:"summary"`
+	Priority int      `json:"priority"`
+	AgeHours float64  `json:"age_hours"`
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+// premiseNegationRe 识别「后续事实明确否定前一条」的措辞。#NNN 引用 + 否定词
+// 同时出现才算命中——只认这一种强信号，避免把「部分成立」「不排除」误判成作废。
+const premiseNegationRe = `(不成立|已推翻|推翻|否定|证伪|已过期|死目标|不可用|无效|与事实不符)`
+
+// OpenIntentHygiene 列出「排太久」或「前提疑似失效」的 open 意图。
+func (s *ExplorationStore) OpenIntentHygiene(staleAfter time.Duration, limit int) ([]IntentHygiene, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 40
+	}
+	rows, err := s.db.Query(`SELECT id, priority, created_at, COALESCE(payload->>'summary','')
+FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='intent' AND state='open'
+ORDER BY created_at ASC LIMIT $2`, s.expID, limit)
+	if err != nil {
+		return nil, err
+	}
+	type openIntent struct {
+		IntentHygiene
+		created time.Time
+	}
+	var all []openIntent
+	for rows.Next() {
+		var it openIntent
+		if err := rows.Scan(&it.ID, &it.Priority, &it.created, &it.Summary); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		all = append(all, it)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	out := make([]IntentHygiene, 0, len(all))
+	for _, it := range all {
+		it.AgeHours = now.Sub(it.created).Hours()
+		// 锚点事实（derived_from 的 fact 父节点）是否被更新的事实否定。
+		parents, err := s.db.Query(`SELECT n.id
+FROM exploration_edges e JOIN exploration_nodes n ON n.id=e.src_id AND n.kind='fact'
+WHERE e.exploration_id=$1 AND e.dst_id=$2 AND e.rel='derived_from'`, s.expID, it.ID)
+		if err != nil {
+			return nil, err
+		}
+		var pids []int64
+		for parents.Next() {
+			var pid int64
+			if err := parents.Scan(&pid); err != nil {
+				parents.Close()
+				return nil, err
+			}
+			pids = append(pids, pid)
+		}
+		parents.Close()
+		for _, pid := range pids {
+			var newer string
+			err := s.db.QueryRow(`SELECT COALESCE(payload->>'summary','') FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='fact' AND id > $2
+  AND payload->>'summary' ~ ('#' || $2 || '([^0-9]|$)')
+  AND payload->>'summary' ~ $3
+ORDER BY id DESC LIMIT 1`, s.expID, pid, premiseNegationRe).Scan(&newer)
+			if err == nil && newer != "" {
+				it.Warnings = append(it.Warnings, fmt.Sprintf("锚点 fact#%d 疑似被后续 fact 否定：%s", pid, clampRunes(newer, 80)))
+			} else if err != nil && err != sql.ErrNoRows {
+				return nil, err
+			}
+		}
+		if it.AgeHours >= staleAfter.Hours() || len(it.Warnings) > 0 {
+			out = append(out, it.IntentHygiene)
+		}
+	}
+	return out, nil
+}
+
+// clampRunes 截断到 n 个字符（用于把事实摘要塞进提示词/日志）。
+func clampRunes(s string, n int) string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) <= n {
+		return string(r)
+	}
+	return string(r[:n]) + "…"
+}
+
+// NodeStates 批量返回本任务内指定节点的 state（缺失 id 不出现在结果里）。
+// 用于领取意图时一次性判定 requires_intents 是否都已了结，避免每个候选逐条查库。
+func (s *ExplorationStore) NodeStates(ids []int64) (map[int64]string, error) {
+	out := make(map[int64]string, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.db.Query(`SELECT id, state FROM exploration_nodes
+WHERE exploration_id=$1 AND id = ANY($2)`, s.expID, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var st string
+		if err := rows.Scan(&id, &st); err != nil {
+			return nil, err
+		}
+		out[id] = st
+	}
+	return out, rows.Err()
+}
+
 func (s *ExplorationStore) SoftDeleteIntent(id int64, reason string) (string, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1876,6 +2031,37 @@ func (s *ExplorationStore) ActivityDetail(id int64) (string, error) {
 // scanTrace reads the summary-only column set shared by the worker-trace tools
 // (ActivityTrace / ActivityTraceSearch). Detail is never selected here — it is
 // pulled separately, on demand, via ActivityByIDs.
+// ActivityTraceTailTerminalIntent returns the LAST `limit` steps of a terminal
+// intent's trace (newest first, reversed to chronological order before return).
+// B2 exhausted-postmortems read 这里: the review trigger carries the tail so the
+// planner can compose the "what was tried" fact without a second trace read.
+// Requires the intent to already be terminal (joined on state like its sibling).
+func (s *ExplorationStore) ActivityTraceTailTerminalIntent(nodeID int64, limit int) ([]Activity, error) {
+	if limit <= 0 {
+		limit = 3
+	}
+	rows, err := s.db.Query(`SELECT a.id, a.node_id, COALESCE(a.worker,''), COALESCE(a.kind,''), COALESCE(a.tool,''), a.is_error, COALESCE(a.summary,'')
+	FROM activity a
+	JOIN exploration_nodes n ON n.id=a.node_id AND n.exploration_id=a.exploration_id
+	WHERE a.exploration_id=$1 AND a.node_id=$2 AND n.kind='intent'
+	  AND n.state IN ('done','blocked','exhausted','stopped')
+	  AND a.kind NOT IN ('thinking','usage')
+	ORDER BY a.id DESC LIMIT $3`, s.expID, nodeID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out, err := scanTrace(rows)
+	if err != nil {
+		return nil, err
+	}
+	// DESC scan → chronological so the caller reads "last steps in order".
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
 func scanTrace(rows *sql.Rows) ([]Activity, error) {
 	out := []Activity{}
 	for rows.Next() {
@@ -2159,4 +2345,21 @@ func (s *ExplorationStore) StallOverview() (rounds, recentNew, openCnt int, err 
 	err = s.db.QueryRow(`SELECT count(*) FROM exploration_nodes
 		WHERE exploration_id=$1 AND kind='intent' AND state='open'`, s.expID).Scan(&openCnt)
 	return
+}
+
+// RetroBindIntentEvidence 把意图运行目录下全部未归属证据一次性绑定到漏洞。
+// 触发时机：report_finding 落库后——worker 先 save_evidence、后 report_finding，
+// 同一意图目录（/i<intentID>/）下 finding_id 为空的证据天然属于这个漏洞。
+func (s *ExplorationStore) RetroBindIntentEvidence(taskID, intentID, findingID int64) (int, error) {
+	pattern := "%/i" + strconv.FormatInt(intentID, 10) + "/%"
+	res, err := s.db.Exec(`
+UPDATE task_artifacts
+SET finding_id=$3
+WHERE task_id=$1 AND finding_id IS NULL AND storage_path LIKE $2`,
+		taskID, pattern, findingID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
