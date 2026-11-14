@@ -5,7 +5,7 @@
 
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
-import { mockHandle } from "@/lib/mock/handler";
+import { mockHandle, mockTaskFileURL } from "@/lib/mock/handler";
 import type {
   ActiveFindingRetest,
   Activity,
@@ -102,6 +102,7 @@ import type {
   TaskAssetScopeMutation,
   TaskCategory,
   TaskConstraint,
+  TaskFileListing,
   TaskGoal,
   TaskIntelligence,
   TaskLLMResolutions,
@@ -405,6 +406,9 @@ export const api = {
     sourceTaskIds?: string[];
     companyIds?: number[];
     timeoutSeconds?: number;
+    noResultSeconds?: number;
+    noResultMinFindings?: number;
+    noResultMinSeverity?: "" | "low" | "medium" | "high" | "critical";
     seedFirstIntent?: boolean;
     planHeartbeatSeconds?: number;
     shareGlobalAssets?: boolean;
@@ -423,6 +427,9 @@ export const api = {
       source_task_ids: input.sourceTaskIds ?? [],
       company_ids: input.companyIds ?? [],
       timeout_seconds: input.timeoutSeconds ?? 0,
+      no_result_seconds: input.noResultSeconds ?? 0,
+      no_result_min_findings: input.noResultMinFindings ?? 1,
+      no_result_min_severity: input.noResultMinSeverity ?? "",
       seed_first_intent: input.seedFirstIntent ?? false,
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
       share_global_assets: input.shareGlobalAssets ?? false,
@@ -612,6 +619,33 @@ export const api = {
   deleteTaskScope: (id: string, scopeId: number) => del<{ ok: boolean }>(`/tasks/${id}/scope/${scopeId}`),
   // 某资产在本任务里关联的意图 / 事实 / 发现（覆盖图节点抽屉用）。
   taskAssetRefs: (id: string, assetId: number) => get<CoverageAssetRefs>(`/tasks/${id}/asset-refs?asset_id=${assetId}`),
+
+  taskFiles: (id: string, path = "") => get<TaskFileListing>(`/tasks/${id}/files?path=${encodeURIComponent(path)}`),
+  taskFilesAll: (id: string) => get<TaskFileListing>(`/tasks/${id}/files/all`),
+  taskFileRead: (id: string, path: string) =>
+    get<WorkspaceFile>(`/tasks/${id}/files/read?path=${encodeURIComponent(path)}`),
+  // Browser downloads stream to disk using the same auth cookie as SSE. Avoid
+  // fetching ZIPs into a Blob, which would buffer the entire archive in memory.
+  taskFileDownload: async (id: string, path: string, archive = false) => {
+    const action = archive ? "archive" : "download";
+    if (!MOCK) {
+      const token = getToken();
+      const response = await apiFetch(`/api/tasks/${id}/files/${action}?path=${encodeURIComponent(path)}`, {
+        method: "HEAD",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!response.ok) throw new Error(response.status === 404 ? "taskFiles.unavailable" : "taskFiles.failed");
+    }
+    const a = document.createElement("a");
+    a.href = MOCK ? mockTaskFileURL(path, action) : `/api/tasks/${id}/files/${action}?path=${encodeURIComponent(path)}`;
+    a.download = archive ? `${path.split("/").pop() || `task-${id}`}.zip` : path.split("/").pop() || "download";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    if (MOCK && a.href.startsWith("blob:")) setTimeout(() => URL.revokeObjectURL(a.href), 60_000);
+  },
+  taskFilePreview: (id: string, path: string) =>
+    MOCK ? mockTaskFileURL(path, "preview") : `/api/tasks/${id}/files/preview?path=${encodeURIComponent(path)}`,
 
   // ---- workspace file manager (workDir) ----
   workspaceList: (path = "") => get<WorkspaceListing>(`/workspace/list?path=${encodeURIComponent(path)}`),

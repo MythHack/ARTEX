@@ -38,6 +38,7 @@ import { MAX_TASK_REMARK_RUNES, MAX_TASK_WORKER_COUNT } from "../types";
 import * as D from "./data";
 import { createMockNotifications } from "./notifications";
 import { createMockSchedules } from "./schedules";
+import { mockTaskFileRead, mockTaskFiles } from "./task-files";
 
 const delay = (ms = 120) => new Promise((r) => setTimeout(r, ms));
 
@@ -1060,6 +1061,13 @@ export async function mockHandle<T>(method: string, rawPath: string, body?: Body
 
 function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Record<string, unknown>): unknown {
   const task = q.get("task") ?? undefined;
+  if (seg[0] === "tasks" && seg[2] === "files") {
+    if (!mockTasks.some((item) => item.id === seg[1] || mockTaskAssetID(item.id) === Number(seg[1])))
+      throw new Error("taskFiles.unavailable");
+    return seg[3] === "read"
+      ? mockTaskFileRead(q.get("path") ?? "")
+      : mockTaskFiles(q.get("path") ?? "", seg[3] === "all");
+  }
 
   if (seg[0] === "schedules") return mockSchedules(m, path, b, new Set(mockTaskAssetIDs.values()));
 
@@ -1274,6 +1282,11 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     const categoryID = mockIntegerField(b.category_id, "category_id") ?? undefined;
     const category = categoryID === undefined ? undefined : mockTaskCategories.find((item) => item.id === categoryID);
     if (categoryID !== undefined && !category) throw new Error("任务分类不存在");
+    const noResultSeconds = Math.max(0, mockIntegerField(b.no_result_seconds, "no_result_seconds") ?? 0);
+    const noResultSeverity = String(b.no_result_min_severity ?? "");
+    if (!["", "low", "medium", "high", "critical"].includes(noResultSeverity)) {
+      throw new Error("invalid no_result_min_severity");
+    }
     const created: Task = {
       id,
       name,
@@ -1282,6 +1295,10 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       category_name: category?.name,
       description: description || "新任务",
       goal,
+      no_result_seconds: noResultSeconds > 0 ? Math.max(60, noResultSeconds) : 0,
+      no_result_min_findings: Math.max(1, mockIntegerField(b.no_result_min_findings, "no_result_min_findings") ?? 1),
+      no_result_min_severity: noResultSeverity as Task["no_result_min_severity"],
+      stop_reason: "",
       worker_count: mockWorkerCount(b.worker_count),
       status: "created",
       created_at: now.toISOString(),
@@ -1783,8 +1800,24 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     };
 
   // ── 工作空间文件管理器（demo：静态示例树；写/建/删走下方写兜底 {ok:true}）──
-  if (path === "/workspace/list") return D.workspaceList(q.get("path") ?? "");
-  if (path === "/workspace/read") return D.workspaceRead(q.get("path") ?? "");
+  if (path === "/workspace/list") {
+    const value = q.get("path") ?? "";
+    const taskPath = value.match(/^tasks\/[^/]+(?:\/(.*))?$/);
+    if (taskPath) {
+      const result = mockTaskFiles(taskPath[1] ?? "");
+      return {
+        ...result,
+        path: value,
+        entries: result.entries.map((entry) => ({ ...entry, path: `tasks/${value.split("/")[1]}/${entry.path}` })),
+      };
+    }
+    return D.workspaceList(value);
+  }
+  if (path === "/workspace/read") {
+    const value = q.get("path") ?? "";
+    if (value.startsWith("tasks/")) return { ...mockTaskFileRead(value.split("/").slice(2).join("/")), path: value };
+    return D.workspaceRead(value);
+  }
 
   // ── stats ──
   if (path === "/stats") {
@@ -2093,6 +2126,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
         task_name: owner?.name ?? "",
         task_description: owner?.description ?? items[0]?.task_description ?? "",
         task_status: owner?.status ?? "",
+        task_stop_reason: owner?.stop_reason ?? "",
         count: items.length,
         critical: items.filter((finding) => finding.severity === "critical").length,
         high: items.filter((finding) => finding.severity === "high").length,
@@ -2804,3 +2838,5 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     ? []
     : {};
 }
+
+export { mockTaskFileURL } from "./task-files";

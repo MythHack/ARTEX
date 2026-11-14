@@ -13,8 +13,13 @@ Go 单体后端（内嵌 Next.js 前端）· PostgreSQL · 多 Agent 自主推�
 本仓库为独立维护的 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)，保留 https://github.com/Autumn-27/ARTEX 的原始提交历史与 AGPL-3.0 许可证。程序发布包从本仓库 Releases 下载，Docker 镜像 [ruoji6/artex](https://hub.docker.com/r/ruoji6/artex) 由本仓库 GitHub Actions 构建并发布。
 
 ---
-## 致谢
-致谢米斯特安全团队
+## 致谢 
+米斯特安全团队
+
+洺熙
+
+wowo
+
 
 ## 这是什么
 

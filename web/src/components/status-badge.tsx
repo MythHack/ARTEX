@@ -9,12 +9,14 @@ export function StatusBadge({
   domain,
   value,
   dot = false,
+  stopReason,
   className,
   title,
 }: {
   domain: StatusDomain;
   value: string;
   dot?: boolean;
+  stopReason?: string;
   className?: string;
   /** 悬停提示。用于把「为什么是这个状态」摆在状态徽章上（如意图的中断原因）。 */
   title?: string;
@@ -31,7 +33,9 @@ export function StatusBadge({
       )}
     >
       {dot && <span className={cn("size-1.5 rounded-full", toneDot[meta.tone])} />}
-      {meta.label}
+      {domain === "task" && value === "timeout" && stopReason === "no_result"
+        ? t("taskUI.noResultStopped")
+        : meta.label}
     </span>
   );
 }

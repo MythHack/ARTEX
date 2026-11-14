@@ -93,8 +93,18 @@ const summaryInstruction = "你只生成供独立旁路问答使用的简短摘�
 // 摘要请求的 system prompt 是固定的 summaryInstruction，这是它唯一且稳定的
 // 身份标记。
 func IsSummaryRequest(req llm.CompletionRequest) bool {
-	return len(req.System) == 1 && req.System[0] == summaryInstruction
+	// 前缀匹配：摘要重试请求会在 system 里追加 summaryRetryInstruction，
+	// 但首段始终是 summaryInstruction。
+	return len(req.System) >= 1 && req.System[0] == summaryInstruction
 }
+
+const summaryRetryInstruction = "上次摘要未满足完整性或长度要求。请直接输出完整、精简的摘要正文，控制在 600 tokens 内；合并重复证据，不逐条复述，不输出思考过程、开场白或工具调用。"
+
+const (
+	summaryOutputTokens      = 2048
+	summaryRetryOutputTokens = 8192
+	maxSummaryCalls          = 12
+)
 
 // Summaries themselves must fit. Process UTF-8-safe bounded chunks rather than
 // submitting the same oversized request to the summarizer. The call cap spans
@@ -104,11 +114,13 @@ func (b *contextBuilder) summarize(ctx context.Context, prior, text string) (str
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		if b.calls >= 12 {
+		if b.calls >= maxSummaryCalls {
 			return "", errors.New("旁路上下文整理已达到本次处理上限，请缩小问题范围后重试")
 		}
-		overhead := EstimateInputTokens(llm.CompletionRequest{System: []string{summaryInstruction}, Messages: []llm.Message{llm.UserText("[此前摘要]\n" + prior + "\n[新材料片段]\n")}})
-		chunkBytes := min(32000, b.window-2048-overhead-512) * 3
+		// Reserve the recovery budget before choosing a chunk so a retry can
+		// replay exactly the same source without overflowing a small window.
+		overhead := EstimateInputTokens(llm.CompletionRequest{System: []string{summaryInstruction, summaryRetryInstruction}, Messages: []llm.Message{llm.UserText("[此前摘要]\n" + prior + "\n[新材料片段]\n")}})
+		chunkBytes := min(32000, b.window-summaryRetryOutputTokens-overhead-512) * 3
 		if chunkBytes < 1024 {
 			return "", ErrContextBudget
 		}
@@ -126,8 +138,28 @@ func (b *contextBuilder) summarize(ctx context.Context, prior, text string) (str
 			// 整个摘要请求失败。这不是"没思考"的问题，是请求被拒。
 			// 压缩路径（agent/compaction.go）与裁决路径（server/intercept.go）
 			// 都为此改成不发该字段，这里保持一致。
-			System: []string{summaryInstruction}, MaxTokens: 2048,
+			System: []string{summaryInstruction}, MaxTokens: summaryOutputTokens,
 			Messages: []llm.Message{llm.UserText("[此前摘要]\n" + prior + "\n[新材料片段]\n" + part)},
+		}
+		result, err := b.summarizeChunk(ctx, req)
+		if err != nil {
+			return "", err
+		}
+		prior, text = result, text[n:]
+	}
+	return prior, nil
+}
+
+// Retry an unusable summary once with room for providers that still spend
+// output tokens on reasoning despite Thinking=disabled. Never continue from
+// partial output or persist it as memory; both attempts use the original data.
+func (b *contextBuilder) summarizeChunk(ctx context.Context, req llm.CompletionRequest) (string, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if b.calls >= maxSummaryCalls {
+			return "", errors.New("旁路上下文整理已达到本次处理上限，请缩小问题范围后重试")
 		}
 		if EstimateInputTokens(req)+req.MaxTokens+512 > b.window {
 			return "", ErrContextBudget
@@ -142,16 +174,27 @@ func (b *contextBuilder) summarize(ctx context.Context, prior, text string) (str
 		if err != nil {
 			return "", fmt.Errorf("旁路摘要失败：%w", err)
 		}
+		if len(msg.ToolUses()) > 0 {
+			return "", errors.New("旁路摘要未完整生成：模型返回了工具调用，请重试")
+		}
 		result := strings.TrimSpace(msg.Text())
-		if result == "" || stop == "max_tokens" || stop == "length" || len(msg.ToolUses()) > 0 {
-			return "", errors.New("旁路摘要未完整生成，请重试")
+		switch {
+		case stop == "max_tokens" || stop == "length":
+			err = fmt.Errorf("旁路摘要未完整生成：输出达到 %d tokens 上限（%s）", req.MaxTokens, stop)
+		case result == "":
+			err = errors.New("旁路摘要未完整生成：模型未返回摘要正文")
+		case EstimateInputTokens(llm.CompletionRequest{Messages: []llm.Message{llm.UserText(result)}}) > 2200:
+			err = errors.New("旁路摘要未缩减到预算内")
+		default:
+			return result, nil
 		}
-		if EstimateInputTokens(llm.CompletionRequest{Messages: []llm.Message{llm.UserText(result)}}) > 2200 {
-			return "", errors.New("旁路摘要未缩减到预算内，请重试")
+		if attempt == 1 {
+			return "", fmt.Errorf("%w，自动恢复后仍失败，请重试或调整模型配置", err)
 		}
-		prior, text = result, text[n:]
+		req.MaxTokens = summaryRetryOutputTokens
+		req.System = append(req.System, summaryRetryInstruction)
 	}
-	return prior, nil
+	panic("unreachable")
 }
 
 func (b *contextBuilder) foldHistory(ctx context.Context, count int) error {

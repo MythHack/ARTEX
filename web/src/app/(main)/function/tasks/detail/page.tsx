@@ -44,6 +44,7 @@ import type { LLMProfile, Task } from "@/lib/types";
 import { AssetsTab } from "./_tabs/assets-tab";
 import { BroadcastTab } from "./_tabs/broadcast-tab";
 import { CoverageGraphTab } from "./_tabs/coverage-graph-tab";
+import { FilesTab } from "./_tabs/files-tab";
 import { FindingsTab } from "./_tabs/findings-tab";
 import { GraphTab } from "./_tabs/graph-tab";
 import { IdentitiesTab } from "./_tabs/identities-tab";
@@ -62,6 +63,7 @@ const TABS = (ui: UITranslate) => [
   { value: "intelligence", label: ui("screen.bfaee3ed1f063c") },
   { value: "retests", label: ui("screen.d95315ddeb80c2") },
   { value: "traffic", label: ui("screen.81a9d0b5a2a24f") },
+  { value: "files", label: ui("taskFiles.tab") },
   { value: "assets", label: ui("screen.e3a1dbbaefc3d7") },
   { value: "coverage", label: ui("screen.8bd56c272abd3c") },
   { value: "intercept", label: ui("screen.b4c245b6421a35") },
@@ -423,7 +425,12 @@ function TaskDetailInner() {
           </code>
           <Separator orientation="vertical" className="mx-1 hidden h-4 sm:block" />
           <TaskLLMControl task={task} profiles={profiles} onUpdated={load} />
-          <StatusBadge domain={terminal ? "task" : "engine"} value={terminal ? task.status : engineMode} dot />
+          <StatusBadge
+            stopReason={task.stop_reason}
+            domain={terminal ? "task" : "engine"}
+            value={terminal ? task.status : engineMode}
+            dot
+          />
           {canArchive ? (
             <AlertDialog>
               <AlertDialogTrigger asChild>{archiveTrigger}</AlertDialogTrigger>
@@ -552,6 +559,9 @@ function TaskDetailInner() {
         </TabsContent>
         <TabsContent value="retests" className="mt-0">
           <RetestsTab key={id} taskId={id} />
+        </TabsContent>
+        <TabsContent value="files" className="mt-0">
+          <FilesTab key={id} task={task} active={tab === "files"} />
         </TabsContent>
         <TabsContent value="assets" className="mt-0">
           <AssetsTab taskId={id} />
