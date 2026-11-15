@@ -97,7 +97,9 @@ func TestPythonModuleSourceResolutionWithoutExecution(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	python := filepath.Join(bin, "python3.12")
+	// Windows 反斜杠在 sh 语法里是转义符（未加引号时吃掉分隔符），夹具统一
+	// 用正斜杠——Git Bash / Linux 语义一致。
+	python := filepath.ToSlash(filepath.Join(bin, "python3.12"))
 	if err := os.WriteFile(python, []byte("\x7fELF not executable test metadata"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -157,11 +159,11 @@ func TestPythonModuleSourceResolutionWithoutExecution(t *testing.T) {
 	}
 	extra := filepath.Join(root, "extra")
 	write(filepath.Join(extra, "one.py"), "EXTRA=1\n")
-	in = reviewCommandForTest(t, cwd, "PYTHONPATH="+extra+" "+python+" -m one")
+	in = reviewCommandForTest(t, cwd, "PYTHONPATH="+filepath.ToSlash(extra)+" "+python+" -m one")
 	if in.ScriptCaptureStatus != "complete" || in.Scripts[0].Content != "EXTRA=1\n" {
 		t.Fatalf("ignored explicit PYTHONPATH: %+v", in)
 	}
-	in = reviewCommandForTest(t, cwd, "PYTHONPATH="+extra+" "+python+" -E -m one")
+	in = reviewCommandForTest(t, cwd, "PYTHONPATH="+filepath.ToSlash(extra)+" "+python+" -E -m one")
 	if in.ScriptCaptureStatus != "incomplete" {
 		t.Fatal("ignored -E environment isolation")
 	}

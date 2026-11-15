@@ -135,6 +135,34 @@ func applyStaticSed(content string, subs []staticSedSubstitution) (string, bool)
 	return content, true
 }
 
+// trustedSedPath 判定解析出的 sed 是否来自本执行环境的可信核心工具目录。
+// 旧实现硬编码 /bin/sed、/usr/bin/sed——Windows（Git Bash 部署）下 sed 在
+// Git 的 usr\bin，永远不命中，静态快照退化为 incomplete。信任锚改为：
+// sed 与即将执行这条命令的 bash 解析到同一目录（Unix 的 /usr/bin、
+// Windows 的 Git\usr\bin 都满足）；PATH 注入的假 sed 目录不同，自然拒绝。
+func trustedSedPath(executable string) bool { return trustedCoreutilPath(executable, "sed") }
+
+// trustedCoreutilPath 判定解析出的核心工具（sed/cat/mkdir/chmod）是否来自本
+// 执行环境的可信核心工具目录，见 trustedSedPath 的锚点说明。
+func trustedCoreutilPath(executable, tool string) bool {
+	base := filepath.Base(executable)
+	if base != tool && base != tool+".exe" {
+		return false
+	}
+	dir := filepath.Dir(executable)
+	// Unix：/usr/bin、/bin 是发行版核心工具目录，目录内同源 bash 即可信。
+	if _, err := os.Stat(filepath.Join(dir, "bash")); err == nil {
+		return true
+	}
+	// Windows（Git Bash 部署）：核心工具在 <git>\usr\bin，sed 与 bash 同目录
+	//（<git>\bin\bash.exe 只是转发器）。注意不能用 exec.LookPath("bash") 当
+	// 锚——Windows 上它常命中 System32 的 WSL bash，与本进程实际执行环境
+	//（Git Bash）不同源。
+	if _, err := os.Stat(filepath.Join(dir, "bash.exe")); err == nil {
+		return true
+	}
+	return false
+}
 func generatedSedSnapshot(stmt *syntax.Stmt, args []*syntax.Word, dir, target string, generated map[string]scriptReference) (string, string, bool) {
 	if len(args) != 3 {
 		return "", "", false
@@ -148,7 +176,7 @@ func generatedSedSnapshot(stmt *syntax.Stmt, args []*syntax.Word, dir, target st
 		return "", "", false
 	}
 	executable, err = filepath.EvalSymlinks(executable)
-	if err != nil || (executable != "/bin/sed" && executable != "/usr/bin/sed") || !nativeInterpreterFile(executable) {
+	if err != nil || !trustedSedPath(executable) || !nativeInterpreterFile(executable) {
 		return "", "", false
 	}
 	program, known := staticWord(args[1])
@@ -306,13 +334,22 @@ func staticSedPrefixKnown(tree *syntax.File, target *syntax.Stmt, remaining *int
 					safe = false
 				}
 			case "cat", "mkdir", "chmod", "sed":
+				// 前缀准备语句（cat/mkdir/chmod）只要求 native 二进制：它们的
+				// 输出仅作为 sed 的输入材料，形态已由 staticScriptPreparation
+				// 限制；且 Windows 常见多套 coreutils 混装（cat 与 sed 分属
+				// 不同目录），同目录锚点会误拒。快照等价性只由 sed 自身的
+				// trustedSedPath 锚定保证。
 				executable, err := exec.LookPath(name)
 				if err != nil {
 					safe = false
 					break
 				}
 				executable, err = filepath.EvalSymlinks(executable)
-				if err != nil || (executable != "/bin/"+base && executable != "/usr/bin/"+base) || !nativeInterpreterFile(executable) {
+				if err != nil || !nativeInterpreterFile(executable) {
+					safe = false
+					break
+				}
+				if base == "sed" && !trustedSedPath(executable) {
 					safe = false
 					break
 				}

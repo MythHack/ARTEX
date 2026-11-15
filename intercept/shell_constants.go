@@ -139,7 +139,7 @@ func constantWordFields(word *syntax.Word, constants map[string]shellConstant) (
 	if value, ok := constants["IFS"]; ok && !value.end.After(word.Pos()) && !seen["IFS"] {
 		pairs = append(pairs, "IFS="+value.value)
 	}
-	fields, err := expand.Fields(&expand.Config{Env: expand.ListEnviron(pairs...), NoUnset: true}, word)
+	fields, err := expand.Fields(&expand.Config{Env: staticEnviron(pairs), NoUnset: true}, word)
 	return fields, err == nil
 }
 

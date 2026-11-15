@@ -15,6 +15,26 @@ const maxInlineParses = 256
 // Inline code is a shell string, not a filename. Accept escaped source text
 // and simple quoted parameters proven by finite, unmodified enclosing loops.
 // Expansion has no host environment, subprocess or filesystem callbacks.
+
+// staticEnviron is a case-sensitive expand.Environ. expand.ListEnviron
+// uppercases every name on Windows (mirroring the platform's env semantics),
+// which breaks analyzing scripts that use lowercase loop/constant variables —
+// `$p` against ListEnviron("p=80") errors "unbound" because it stored P=80.
+// The static analyzer must behave identically on every OS, so it carries its
+// own exact-match environ instead.
+type staticEnviron []string
+
+func (e staticEnviron) Get(name string) expand.Variable {
+	for _, pair := range e {
+		if rest, ok := strings.CutPrefix(pair, name+"="); ok {
+			return expand.Variable{Kind: expand.String, Str: rest}
+		}
+	}
+	return expand.Variable{}
+}
+
+func (e staticEnviron) Each(fn func(string, expand.Variable) bool) {} // Fields 只需要 Get
+
 func inlineShellWords(w *syntax.Word, bindings map[string][]string) ([]string, bool) {
 	if w == nil {
 		return nil, false
@@ -67,7 +87,7 @@ func inlineShellWords(w *syntax.Word, bindings map[string][]string) ([]string, b
 	}
 	var words []string
 	for _, env := range envs {
-		fields, err := expand.Fields(&expand.Config{Env: expand.ListEnviron(env...), NoUnset: true}, w)
+		fields, err := expand.Fields(&expand.Config{Env: staticEnviron(env), NoUnset: true}, w)
 		if err != nil || len(fields) != 1 || len(fields[0]) > maxReviewScriptBytes {
 			return nil, false
 		}
