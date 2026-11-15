@@ -7,16 +7,52 @@
 | 项目 | 当前记录 |
 | --- | --- |
 | 仓库 | [MythHack/ARTEX](https://github.com/MythHack/ARTEX) |
-| 源码基线 | main；[675479c881bf27f6ceebfb3347a2319f0f170dff](https://github.com/MythHack/ARTEX/commit/675479c881bf27f6ceebfb3347a2319f0f170dff) |
+| 初始完整源码基线（历史） | main；[675479c881bf27f6ceebfb3347a2319f0f170dff](https://github.com/MythHack/ARTEX/commit/675479c881bf27f6ceebfb3347a2319f0f170dff) |
 | 提交时间 | 2026-11-01 00:51:12，Asia/Shanghai |
-| 核验日期 | 2026-11-01，Asia/Shanghai |
+| 初始完整核验日期 | 2026-11-01，Asia/Shanghai |
+| 本轮增量核验 | 2026-11-15，Asia/Shanghai；[当前 HEAD](https://github.com/MythHack/ARTEX/commit/ca3b706669c035bb48398221861de8e7af9b602c)；具体范围见增量核验节 |
+| 当前 SHA 的 CI | 未取得匹配的工作流或 commit status 证据；不沿用旧结论 |
 | 范围 | 服务装配、核心 Agent/LLM、上下文、双图、证据、MCP/工具、后台服务、报告及相关前端 |
 | 方法 | 静态源码与必要调用方核对；读取匹配提交已有的 GitHub CI 记录 |
 | 部署状态 | 未取得实际部署的配置、进程或服务日志；运行可用性未验证 |
-| CI 概况 | 前端构建、后端 Build/Vet 成功；后端 Test 失败 |
+| 初始基线 CI（历史） | 前端构建、后端 Build/Vet 成功；后端 Test 失败；**非当前 SHA** |
 | 维护 | 每日检查默认分支、接线和 CI；有实质变化时更新文档并提交维护 PR |
 
 **已实现**表示找到具体实现；**已接线**表示找到调用或注册；**条件接线**需要开关、绑定或外部依赖；**运行未验证**表示缺少部署证据。库函数存在、设计文档、CI 成功和实际可用性分别记录。
+
+## 2026-11-15 增量核验：当前 main（Asia/Shanghai）
+
+**本轮核验源码**：[ca3b706669c035bb48398221861de8e7af9b602c](https://github.com/MythHack/ARTEX/commit/ca3b706669c035bb48398221861de8e7af9b602c)（提交时间 2026-11-14 22:22:08 Asia/Shanghai）。相对上次完整基线 `675479c8`，GitHub compare 返回 **59 个提交**；本节为对变更路径的增量静态核验，以下旧基线段落和固定链接保留作为历史证据，**不得将旧 CI 或旧 SHA 的能力断言直接当作本轮重新验证**。未访问生产实例、配置数据库或外部模型服务。
+
+### 增量架构关系（与下方四张历史基线图配合阅读）
+
+当前仍以 Go Server/Engine、Agent、PostgreSQL 双图与本地流量/证据文件为核心。新增或调整的可见数据关系：
+
+- Server 启动装配 `wireAgentAugment`、`wireTools`，恢复持久化任务后运行 Scheduler；Notifier 独立运行，并异步发现空 MCP 工具缓存。MCP 工具 **schema 延迟向模型暴露** 不等于延迟建立连接：`wireAgentAugment` 在 agent run 中对启用且可见/Skill 引用的 MCP 调用 `connectMCP` 和工具列表；Skill 触发后才解锁相应工具。失败连接有十分钟跳过重试机制。[启动](https://github.com/MythHack/ARTEX/blob/ca3b706669c035bb48398221861de8e7af9b602c/server/server.go)、[MCP 装配](https://github.com/MythHack/ARTEX/blob/ca3b706669c035bb48398221861de8e7af9b602c/server/assembly.go)
+- LLM 任务路由存在 profile 选择、切换审计和严格额度耗尽判断；**冷图 Compactor 仍使用 Planner runtime**：`NewCompactor(plannerRuntime, "task-router")`，不能写成独立 Compactor 模型已接线。NOA、Norma 内置会话压缩、冷图摘要仍为不同机制；本次未验证外部 norma SDK 的内部执行语义。[任务路由](https://github.com/MythHack/ARTEX/blob/ca3b706669c035bb48398221861de8e7af9b602c/server/task_llm.go)
+- 报告路径增加交付状态排除、资产可读名、复测记录和封面信息；**Word 流量证据装配疑点仍存在**：`exportTaskDocx` 从 `ListFindingsForExport` 读取并直接调用模板，`exportFindingDocx` 从 `GetFinding` 直接调用模板；所读代码未见补充 `TrafficBindings` 切片。任务 Word 的 `QueryByType` 资产附录未在此处传入任务范围。不能将 Word 流量证据和资产范围标记为端到端通过。[报告 HTTP 路径](https://github.com/MythHack/ARTEX/blob/ca3b706669c035bb48398221861de8e7af9b602c/server/report_export.go)
+- 新增 `task_artifacts` 元数据、可选 finding 关联及文档预览状态；附件的实际文件仍在任务目录，本轮未确认所有导出格式都包含该类附件。Office/PDF 取样预览为单独组件，需调用接线和外部渲染环境支持。[附件表](https://github.com/MythHack/ARTEX/blob/ca3b706669c035bb48398221861de8e7af9b602c/db/task_artifacts.go)、[预览组件](https://github.com/MythHack/ARTEX/blob/ca3b706669c035bb48398221861de8e7af9b602c/docpreview/preview.go)
+- `deepSeekTools` 只有在 WebSearch 已开启、backend 为 deepseek 且 API Key 非空时才返回搜索/抓取工具；工具构造存在不等于已绑定到全部角色。[工具](https://github.com/MythHack/ARTEX/blob/ca3b706669c035bb48398221861de8e7af9b602c/agent/deepseek_search.go)
+- Jev / System One 存在独立客户端及配置测试入口，Server 显式拒绝将该格式作为聊天 Provider；仅可按专用判断模型路径使用。外部服务可用性未知。[客户端](https://github.com/MythHack/ARTEX/blob/ca3b706669c035bb48398221861de8e7af9b602c/intercept/jev/client.go)、[服务端](https://github.com/MythHack/ARTEX/blob/ca3b706669c035bb48398221861de8e7af9b602c/server/server.go)
+- `db/task_auth.go`、`db/task_scope_guard.go`、`db/task_progress.go`、`db/task_no_result.go` 等已增加持久化实现；数据库文件存在不能单独证明所有 API/UI、任务生命周期及开关条件均已接线。[任务鉴权数据](https://github.com/MythHack/ARTEX/blob/ca3b706669c035bb48398221861de8e7af9b602c/db/task_auth.go)、[范围约束数据](https://github.com/MythHack/ARTEX/blob/ca3b706669c035bb48398221861de8e7af9b602c/db/task_scope_guard.go)
+
+### 增量能力与验证矩阵
+
+| 能力/变更 | 实现 | 调用或入口 | 条件及外部依赖 | 当前 CI / 运行 |
+| --- | --- | --- | --- | --- |
+| Server 后台任务恢复、Scheduler、Notifier | 已见 | Server 启动及恢复路径已接线 | PostgreSQL、持久化状态、通知配置 | 当前 SHA 无可用匹配检查；部署未知 |
+| MCP 可见性、Skill 延迟 schema | 已见 | Agent run 装配、连接和解锁已接线 | MCP enabled、角色可见性、外部可执行程序及网络 | 当前 SHA 无可用匹配检查；实际连接未知 |
+| 任务 LLM 选择与切换审计 | 已见 | taskLLMRuntime 已接线 | profile、凭据、模型 API、可选模型池 | 当前 SHA 无可用匹配检查；运行未知 |
+| 冷图 Compactor | 已见 | 仍复用 Planner runtime | 图压缩阈值、模型、预算 | 当前 SHA 无可用匹配检查；压缩质量未知 |
+| Word 导出增强 | 已见 | 两个 HTTP 导出函数已接线 | 数据库、模板、文档渲染 | 当前 SHA 无可用匹配检查；流量绑定/任务资产范围待验证 |
+| 任务附件与文档预览 | 已见 | DB 接口及独立预览组件存在；完整入口链本轮未核完 | 本地文件、预览渲染依赖 | CI 与部署均未知 |
+| DeepSeek Web Search | 已见 | 条件性工具构造；角色级绑定待核 | enabled、backend、API Key、外部 API | CI 与外部服务均未知 |
+| Jev / System One 判断客户端 | 已见 | 服务端测试入口；聊天 Provider 显式拒绝 | 专用判断配置、外部 API | CI 与部署均未知 |
+| 任务鉴权、范围约束、进度与无成果数据 | 已见 | DB 实现存在；完整生命周期接线待核 | 数据库迁移、调用入口及开关 | CI 与部署均未知 |
+
+**当前提交的 CI 证据边界：** GitHub 连接器对 `ca3b706669c035bb48398221861de8e7af9b602c` 查询的 PR 触发工作流返回空列表，combined commit statuses 也为空；这些接口不足以证明没有其他类型的 Actions run。当前提交的 Build、Vet、Test、前端构建均标记 **未取得匹配检查证据**，不能沿用 2026-11-01 的旧 CI 成败。没有主动重跑工作流。
+
+**存储与业务模型边界：** PostgreSQL 仍为任务/资产/探索/配置等主数据；SQLite 为流量索引，流量正文、证据、附件、转录和工作区为本地文件。资产图与探索图不自动等于独立业务状态机；录入校验不等于状态更新全过程的不变量。缓存区分上游会话协作、MCP 工具缓存和冷摘要版本复用，不声称存在通用语义响应缓存。未读取部署开关或凭据。
 
 ## 整体架构
 
