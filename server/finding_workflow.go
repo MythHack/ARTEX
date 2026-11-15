@@ -117,6 +117,12 @@ func objectProperty(parent map[string]any, key string) map[string]any {
 }
 
 func (s *Server) agentFindingTrafficAccess(ctx context.Context, id int64, write bool) error {
+	// fork：归并审阅会话对原始漏洞只读（审阅产出统一进归并报告）。
+	if write {
+		if err := s.checkCaseReviewScope(ctx, "bind_finding_traffic", findingCaseRequest{}); err != nil {
+			return err
+		}
+	}
 	if id <= 0 {
 		return errors.New("finding_id 必须为独立漏洞记录 ID；不是探索节点 ID")
 	}

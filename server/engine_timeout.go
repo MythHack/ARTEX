@@ -3,8 +3,8 @@ package server
 import (
 	"context"
 
-	"github.com/Autumn-27/artex/intercept"
 	"fmt"
+	"github.com/Autumn-27/artex/intercept"
 	"log"
 	"strconv"
 	"sync/atomic"
@@ -190,11 +190,33 @@ func (e *Engine) deadlineCoordinator(ctx context.Context, t *Task) {
 			return
 		default:
 		}
+		// fork 无成果止损恢复：进程重启前已提交失败检查点（NoResultCheckedAt>0
+		// 且 StopReason=no_result）但没收尾——恢复后由协调器补收尾。
+		state := t.lifecycleSnapshot()
+		if state.NoResultCheckedAt > 0 && state.StopReason == db.StopReasonNoResult && !isTerminalStatus(e.m.TaskStatus(t.ID)) {
+			e.settleTaskWithReason(ctx, t, db.StopReasonNoResult, "无成果止损（恢复）")
+			e.coordStarted.Delete(t.ID)
+			return
+		}
 		if isTerminalStatus(e.m.TaskStatus(t.ID)) {
+			// fork：终态退出时清掉本协调器的启动标记——复活（resetTerminalRevival
+			// 只在走 HTTP 复活路径时清）之外的路径（终验直接判完成）不能留下
+			// 残留标记，否则同进程内任务重启后永远起不了新协调器。
+			e.coordStarted.Delete(t.ID)
 			return // already finished (goals met / failed) — nothing to time out
 		}
 		dl := e.taskDeadline(t)
 		if dl <= 0 {
+			// fork：没有 deadline 也没有待办的 no-result 职责时协调器直接退出——
+			// 否则纯 no-result 任务在检查完成后仍每 2s 空转直到 ctx 取消（测试
+			// 用 t.Context() 无超时，直接挂死）。有 no-result 待办时保持轮询。
+			if t.TimeoutSeconds <= 0 {
+				s := t.lifecycleSnapshot()
+				if t.NoResultSeconds <= 0 || s.NoResultCheckedAt > 0 {
+					e.coordStarted.Delete(t.ID)
+					return
+				}
+			}
 			if sleepCtx(ctx, deadlinePollInterval) { // not yet stamped (task hasn't really run)
 				return
 			}
@@ -239,6 +261,11 @@ func taskGoalProgress(t *Task) (met, total int) {
 // （超时 / 自动空转 / 覆盖度 / 轮数上限），终态一律 timeout——UI 据此显示
 // 「未完成」，而不是把做了一半的任务标成完成。totalGoals==0 的任务沿用旧语义。
 func settleTerminalStatus(allGoalsMet bool, reason string, finalRoundMet bool) string {
+	// fork 无成果止损：这是「人工设定的止损停车」，不是「跑完没达标」——
+	// 状态复用 timeout（终态语义不变），但 settle 本身已表明任务被主动停止。
+	if reason == db.StopReasonNoResult {
+		return "timeout"
+	}
 	if !allGoalsMet {
 		return "timeout"
 	}
@@ -362,7 +389,13 @@ func (e *Engine) settleTaskWithReason(ctx context.Context, t *Task, reason, deta
 	if status == "timeout" && !allGoalsMet {
 		log.Printf("[settle] task %s 目标未全部达成(%d/%d)，终态记 timeout（未完成）而非 done", t.ID, metGoals, totalGoals)
 	}
-	won, err := e.m.SetTaskStatusGuarded(t.ID, status)
+	// fork 无成果止损：StopReason 必须随终态落库（SetTaskStatusGuarded 不带
+	// reason 会清掉 no-result 语义，界面与复活判断都依赖它）。
+	stopReasonForSettle := ""
+	if reason == db.StopReasonNoResult {
+		stopReasonForSettle = db.StopReasonNoResult
+	}
+	won, err := e.m.SetTaskStatusGuardedReason(t.ID, status, stopReasonForSettle)
 	switch {
 	case err != nil:
 		log.Printf("[settle] task %s 落终态失败: %v", t.ID, err)

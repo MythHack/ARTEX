@@ -7,10 +7,11 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/traffic")
+	"github.com/Autumn-27/artex/traffic"
+)
 
 // DTO/serialization layer: each handler emits EXACTLY the frontend's spec shapes
-// (pojun/web/src/lib/types.ts). These reshape db package structs so the
+// (artex/web/src/lib/types.ts). These reshape db package structs so the
 // internal DB model never leaks over the API. The db structs and the frontend are
 // the canonical contracts; this file maps one onto the other.
 

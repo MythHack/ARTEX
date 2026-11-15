@@ -25,6 +25,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/hostd"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/intercept/jev"
 	"github.com/Autumn-27/artex/listener"
 	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
@@ -350,6 +351,12 @@ func (s *Server) restoreTaskRuntimes() {
 	// FIFO. Paused loops remain idle; queued tasks are admitted below as slots allow.
 	for _, t := range m.List() {
 		lifecycle := t.lifecycleSnapshot()
+		// created = 从未真正开跑（无 deadline、无活动）。重启恢复不应把这类
+		// 任务拉起转 running——它们还没被人工/调度开过（fork 语义；Pojun 的
+		// created→running 写入只应发生在真正被开跑的路径上）。
+		if lifecycle.Status == "created" {
+			continue
+		}
 		if !lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
 			s.engine.Run(s.ctx, t)
 		}
@@ -743,9 +750,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/update/apply", s.updateApply)
 	mux.HandleFunc("POST /api/update/rollback", s.updateRollback)
 	mux.HandleFunc("GET /api/update/stream", s.updateStream)
+	mux.HandleFunc("GET /api/update/settings", s.getUpdateSettings)
+	mux.HandleFunc("PUT /api/update/settings", s.putUpdateSettings)
 
 	mux.HandleFunc("GET /api/tasks", s.listTasks)
 	mux.HandleFunc("POST /api/tasks", s.createTask)
+	// 计划任务（fork/RuoJi6）：日历式调度。
+	mux.HandleFunc("GET /api/schedules", s.listSchedules)
+	mux.HandleFunc("POST /api/schedules", s.createSchedule)
+	mux.HandleFunc("GET /api/schedules/{id}", s.getSchedule)
+	mux.HandleFunc("PATCH /api/schedules/{id}", s.updateSchedule)
+	mux.HandleFunc("PATCH /api/schedules/{id}/remark", s.updateScheduleMetadata)
+	mux.HandleFunc("PATCH /api/schedules/{id}/metadata", s.updateScheduleMetadata)
+	mux.HandleFunc("DELETE /api/schedules/{id}", s.deleteSchedule)
+	mux.HandleFunc("POST /api/schedules/{id}/pause", s.pauseSchedule)
+	mux.HandleFunc("POST /api/schedules/{id}/resume", s.resumeSchedule)
+	mux.HandleFunc("POST /api/schedules/{id}/run-now", s.runScheduleNow)
 	mux.HandleFunc("GET /api/task-categories", s.pgListTaskCategories)
 	mux.HandleFunc("POST /api/task-categories", s.pgCreateTaskCategory)
 	mux.HandleFunc("PATCH /api/task-categories/{id}", s.pgRenameTaskCategory)
@@ -834,6 +854,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exploration/findings/groups", s.findingGroups)
 	mux.HandleFunc("GET /api/exploration/findings/asset-tree", s.findingAssetTree)
 	mux.HandleFunc("GET /api/exploration/findings/stats", s.findingStats)
+	// 漏洞归并（fork）：案件 CRUD + 审阅 + 建议 + 资产树。
+	mux.HandleFunc("GET /api/exploration/finding-cases", s.listFindingCases)
+	mux.HandleFunc("POST /api/exploration/finding-cases", s.mergeFindingCase)
+	mux.HandleFunc("GET /api/exploration/finding-cases/{id}", s.getFindingCase)
+	mux.HandleFunc("GET /api/exploration/finding-cases/{id}/members", s.getFindingCaseMembers)
+	mux.HandleFunc("DELETE /api/exploration/finding-cases/{id}/members/{fid}", s.removeFindingCaseMember)
+	mux.HandleFunc("PUT /api/exploration/finding-cases/{id}/report", s.updateCaseReport)
+	mux.HandleFunc("GET /api/exploration/finding-case-suggestions", s.caseSuggestions)
+	mux.HandleFunc("POST /api/exploration/finding-case-suggestions/{id}", s.resolveCaseSuggestion)
+	mux.HandleFunc("POST /api/exploration/finding-case-review", s.reviewFindingCases)
+	mux.HandleFunc("GET /api/exploration/finding-case-review", s.caseReviewRuns)
 	mux.HandleFunc("GET /api/exploration/findings/export", s.findingsExport)
 	s.registerFindingTraffic(mux)
 	mux.HandleFunc("GET /api/exploration/findings/{id}", s.getFinding)
@@ -1080,12 +1111,14 @@ func (s *Server) Handler() http.Handler {
 // 公网部署时 service 名与精确版本号是最容易被测绘引擎（FOFA/shodan 类）
 // 当作 body 指纹的内容。版本查询走鉴权的 /api/version。
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"ok": true, "status": "ok"})
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 // version 是鉴权的版本查询（更新卡轮询换装完成用）。
 func (s *Server) version(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"service": "pojun", "version": BuildVersion})
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, 200, map[string]any{"version": BuildVersion})
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
@@ -1571,6 +1604,45 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	if strings.TrimSpace(req.Provider) == "jev" {
+		apiKey := strings.TrimSpace(req.APIKey)
+		baseURL, model := strings.TrimSpace(req.BaseURL), strings.TrimSpace(req.Model)
+		if req.ProfileID != nil {
+			if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
+				if apiKey == "" {
+					apiKey = p.APIKey
+				}
+				if baseURL == "" {
+					baseURL = p.BaseURL
+				}
+				if model == "" {
+					model = p.Model
+				}
+			}
+		}
+		if apiKey == "" {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": "未提供 API Key"})
+			return
+		}
+		if model == "" {
+			model = jev.DefaultModel
+		}
+		proxy := strings.TrimSpace(req.Proxy)
+		if proxy == "" && req.ProfileID != nil {
+			if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
+				proxy = p.Proxy
+			}
+		}
+		testCtx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		lat, reply, err := (jev.Config{BaseURL: baseURL, APIKey: apiKey, Model: model, Proxy: proxy}).TestConnection(testCtx)
+		if err != nil {
+			writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "latency_ms": lat.Milliseconds(), "model": model, "reply": truncateReply(reply)})
+		return
+	}
 	cfg := agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
 	// mirror production: send the SAME thinking params so a provider that rejects the
 	// reasoning_effort/thinking field fails the test too (no false "test ok, run 400").
@@ -1638,10 +1710,13 @@ type createTaskReq struct {
 	CategoryID           *int64   `json:"category_id,omitempty"`
 	Description          string   `json:"description"`
 	Goal                 string   `json:"goal"`
-	LLMProfileID         *int64   `json:"llm_profile_id,omitempty"`    // 指定运行本任务的 LLM 配置;省略/null=用激活配置
-	LLMProfileIDs        []int64  `json:"llm_profile_ids,omitempty"`   // 有序任务级配置链;第一项初始生效
-	SourceTaskIDs        []string `json:"source_task_ids,omitempty"`   // 仅直接、只读继承的来源任务
-	CompanyIDs           []int64  `json:"company_ids,omitempty"`       // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
+	LLMProfileID         *int64   `json:"llm_profile_id,omitempty"`  // 指定运行本任务的 LLM 配置;省略/null=用激活配置
+	LLMProfileIDs        []int64  `json:"llm_profile_ids,omitempty"` // 有序任务级配置链;第一项初始生效
+	SourceTaskIDs        []string `json:"source_task_ids,omitempty"` // 仅直接、只读继承的来源任务
+	CompanyIDs           []int64  `json:"company_ids,omitempty"`     // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
+	NoResultSeconds      int      `json:"no_result_seconds"`
+	NoResultMinFindings  int      `json:"no_result_min_findings"`
+	NoResultMinSeverity  string   `json:"no_result_min_severity"`
 	TimeoutSeconds       int      `json:"timeout_seconds"`             // 任务级超时(秒);0/省略=不限时
 	PlanHeartbeatSeconds int      `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
 	SeedFirstIntent      *bool    `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
@@ -1661,6 +1736,10 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(req.Description) == "" {
 		req.Description = "未命名任务"
+	}
+	if err := db.NormalizeNoResultOptions(&db.TaskCreateOptions{NoResultSeconds: req.NoResultSeconds, NoResultMinFindings: req.NoResultMinFindings, NoResultMinSeverity: req.NoResultMinSeverity}); err != nil {
+		writeErr(w, 400, err.Error())
+		return
 	}
 	if len(req.LLMProfileIDs) == 0 && req.LLMProfileID != nil {
 		req.LLMProfileIDs = []int64{*req.LLMProfileID}
@@ -2300,7 +2379,8 @@ func (s *Server) resolveAssetIDs(ids []int64) map[int64]*db.Asset {
 // findingStats serves the whole-table aggregates (stat cards + vuln-class filter)
 // for the paginated 发现 page.
 func (s *Server) findingStats(w http.ResponseWriter, r *http.Request) {
-	st, err := s.m.pg.FindingStats()
+	// fork：统计跟随列表过滤条件（RuoJi6 #126 过滤统计），不传参数 = 全量。
+	st, err := s.m.pg.FilteredFindingStats(findingFilterFromQuery(r.URL.Query()))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -2391,7 +2471,15 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stage, err := os.MkdirTemp("", "pojun-finding-export-")
+	var casePlan *findingCaseExportPlan
+	if q.Get("mode") == "consolidated" {
+		fs, casePlan, err = s.prepareFindingCaseExport(fs)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	stage, err := os.MkdirTemp("", "artex-finding-export-")
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -2400,6 +2488,13 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 	if err = s.evidenceStore().StageFindingsExport(r.Context(), fs, stage, format == "md-zip"); err != nil {
 		evidenceError(w, err)
 		return
+	}
+	if casePlan != nil {
+		fs, err = s.consolidateFindingCaseExport(fs, casePlan, q.Get("include_originals") == "true")
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
 	}
 	now := time.Now()
 	stamp := now.Format("20060102-150405")
@@ -3614,7 +3709,7 @@ func (s *Server) settingsPayload() map[string]any {
 		"workers":               s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
 		// 冷节点压缩的输出预算与墙钟上限。0 = 用默认值(32768 token / 20 分钟)。
 		"compaction_max_tokens":      s.m.CompactionTokens(),
-		"compaction_thinking":       s.m.CompactionThinking(),
+		"compaction_thinking":        s.m.CompactionThinking(),
 		"compaction_timeout_seconds": s.m.CompactionTimeout(),
 		"compaction_max_members":     s.m.CompactionMaxMembers(),
 		// B10:压缩器钉住的 LLM 配置 id。0=跟随规划器(历史行为);>0=压缩调用永远
@@ -3658,14 +3753,14 @@ func (s *Server) settingsPayload() map[string]any {
 		"notify_public_base_url":     notifyPublicBaseURL(s.m.pg),
 		"notify_digest_interval_min": notifyDigestIntervalMin(s.m.pg),
 		// 漏洞情报/回连配置(net_context 工具读取展示给 agent)
-		"egress_hint":     egressHint(s.m.pg),
-		"task_intelligence_enabled":            s.m.pg.GetBool(db.SettingTaskIntelligence, false),
-		"credential_agent_enabled":             s.m.pg.GetBool(db.SettingCredentialAgent, false),
-		"credential_traffic_binding":           s.m.pg.GetBool(db.SettingCredentialTraffic, false),
-		"task_auto_title_enabled":              s.m.pg.GetBool(db.SettingTaskAutoTitle, false),
-		"chat_auto_title_enabled":              s.m.pg.GetBool(db.SettingChatAutoTitle, false),
-		"egress_probe_url":                    s.m.EgressProbeURL(),
-		"egress_port_map": egressPortMap(s.m.pg),
+		"egress_hint":                egressHint(s.m.pg),
+		"task_intelligence_enabled":  s.m.pg.GetBool(db.SettingTaskIntelligence, false),
+		"credential_agent_enabled":   s.m.pg.GetBool(db.SettingCredentialAgent, false),
+		"credential_traffic_binding": s.m.pg.GetBool(db.SettingCredentialTraffic, false),
+		"task_auto_title_enabled":    s.m.pg.GetBool(db.SettingTaskAutoTitle, false),
+		"chat_auto_title_enabled":    s.m.pg.GetBool(db.SettingChatAutoTitle, false),
+		"egress_probe_url":           s.m.EgressProbeURL(),
+		"egress_port_map":            egressPortMap(s.m.pg),
 	}
 }
 
@@ -3710,13 +3805,13 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		TrafficCapture      *bool `json:"traffic_capture"`
 		AgentTrafficBinding *bool `json:"agent_traffic_binding"`
-		TaskIntelligence   *bool `json:"task_intelligence_enabled"`
+		TaskIntelligence    *bool `json:"task_intelligence_enabled"`
 		// 凭据 agent 门控：agent 开启依赖 task_intelligence；traffic 绑定依赖 agent。
-		CredentialAgent     *bool `json:"credential_agent_enabled"`
-		CredentialTraffic   *bool `json:"credential_traffic_binding"`
-		TaskAutoTitle       *bool `json:"task_auto_title_enabled"`
-		ChatAutoTitle       *bool `json:"chat_auto_title_enabled"`
-		LLMRecord           *bool `json:"llm_record"` // LLM 录制开关（默认关）；即时生效，无需重建 agent
+		CredentialAgent   *bool `json:"credential_agent_enabled"`
+		CredentialTraffic *bool `json:"credential_traffic_binding"`
+		TaskAutoTitle     *bool `json:"task_auto_title_enabled"`
+		ChatAutoTitle     *bool `json:"chat_auto_title_enabled"`
+		LLMRecord         *bool `json:"llm_record"` // LLM 录制开关（默认关）；即时生效，无需重建 agent
 		// Web search. WebSearchEnabled/Backend toggle the tool + backend; BraveKey/TavilyKey
 		// are optional — omit (null) to leave a stored key untouched, send "" to clear.
 		WebSearchEnabled *bool   `json:"web_search_enabled"`
@@ -3731,9 +3826,9 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		// 冷节点压缩的输出预算与墙钟上限。null=不改，<=0=恢复默认。
 		// 见 agent.Compactor.outTokens:思考型模型的思考长度随 max_tokens 预算
 		// 线性膨胀,预算给小了模型会一直想、正文一个字都吐不出来。
-		CompactionMaxTokens  *int `json:"compaction_max_tokens"`
-		CompactionTimeoutSec *int `json:"compaction_timeout_seconds"`
-		CompactionMaxMembers *int `json:"compaction_max_members"`
+		CompactionMaxTokens  *int    `json:"compaction_max_tokens"`
+		CompactionTimeoutSec *int    `json:"compaction_timeout_seconds"`
+		CompactionMaxMembers *int    `json:"compaction_max_members"`
 		CompactionThinking   *string `json:"compaction_thinking"`
 		// B10:压缩器钉住的 LLM 配置 id。null=不改；<=0=清空(恢复跟随规划器)；
 		// >0=钉住该 id。生效时机：对运行中任务的下一轮(重建 bundle)与之后的新任务。
@@ -3783,9 +3878,9 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		NotifyDigestMins *int    `json:"notify_digest_interval_min"`
 		// 漏洞情报/回连:对外可达地址说明与端口映射说明(自由文本,net_context
 		// 工具读取展示给 agent)。null=不改,空串=清空。
-		EgressHint    *string `json:"egress_hint"`
+		EgressHint     *string `json:"egress_hint"`
 		EgressProbeURL *string `json:"egress_probe_url"` // null=不改；空串=默认公共探测服务
-		EgressPortMap *string `json:"egress_port_map"`
+		EgressPortMap  *string `json:"egress_port_map"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -4118,7 +4213,6 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		// built under the OLD switch state — drop them so they pick up the new one.
 		s.invalidateProfileAgents()
 	}
-	if req.TaskIntelligence != nil || req.CredentialAgent != nil || req.CredentialTraffic != nil {
 	if req.TaskAutoTitle != nil {
 		if err := s.m.pg.SetBool(db.SettingTaskAutoTitle, *req.TaskAutoTitle); err != nil {
 			writeErr(w, 500, err.Error())
@@ -4131,6 +4225,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.TaskIntelligence != nil || req.CredentialAgent != nil || req.CredentialTraffic != nil {
 		if err := s.m.pg.SetIntelligenceSettings(r.Context(), req.TaskIntelligence, req.CredentialAgent, req.CredentialTraffic); err != nil {
 			intelligenceError(w, err)
 			return

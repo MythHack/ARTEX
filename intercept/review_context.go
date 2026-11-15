@@ -96,5 +96,10 @@ func BuildReviewInput(ctx context.Context, tool string, arguments json.RawMessag
 		}
 	}
 	in.Scripts, in.ScriptCaptureStatus = captureScripts(in.WorkingDir, tool, arguments)
+	// Pojun 兼容：没有捕获到脚本时（not_applicable）不输出该字段——审阅信封
+	// 保持 5 键（version/working_directory/background/tool_name/arguments）。
+	if in.ScriptCaptureStatus == "not_applicable" {
+		in.ScriptCaptureStatus = ""
+	}
 	return in, nil
 }

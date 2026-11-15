@@ -276,14 +276,14 @@ func queryTokenAllowed(r *http.Request) bool {
 }
 
 // extractToken reads the JWT from Authorization: Bearer header, or the
-// pojun_token cookie. ?token= query is only honored on the SSE stream endpoints
+// artex_token cookie. ?token= query is only honored on the SSE stream endpoints
 // (queryTokenAllowed) — elsewhere the token would leak into access logs and
 // Referer headers without giving up anything the cookie doesn't already do.
 func extractToken(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		return strings.TrimPrefix(h, "Bearer ")
 	}
-	if c, err := r.Cookie("pojun_token"); err == nil && c.Value != "" {
+	if c, err := r.Cookie("artex_token"); err == nil && c.Value != "" {
 		return c.Value
 	}
 	if queryTokenAllowed(r) {
