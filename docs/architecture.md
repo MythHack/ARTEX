@@ -20,9 +20,9 @@
 
 **已实现**表示找到具体实现；**已接线**表示找到调用或注册；**条件接线**需要开关、绑定或外部依赖；**运行未验证**表示缺少部署证据。库函数存在、设计文档、CI 成功和实际可用性分别记录。
 
-## 2026-11-15 增量核验：当前 main（Asia/Shanghai）
+## 2026-11-15 当前 main 增量核验与完整变化领域盘点（Asia/Shanghai）
 
-**本轮核验源码**：[ca3b706669c035bb48398221861de8e7af9b602c](https://github.com/MythHack/ARTEX/commit/ca3b706669c035bb48398221861de8e7af9b602c)（提交时间 2026-11-14 22:22:08 Asia/Shanghai）。相对上次完整基线 `675479c8`，GitHub compare 返回 **59 个提交**；本节为对变更路径的增量静态核验，以下旧基线段落和固定链接保留作为历史证据，**不得将旧 CI 或旧 SHA 的能力断言直接当作本轮重新验证**。未访问生产实例、配置数据库或外部模型服务。
+**本轮核验源码**：[ca3b706669c035bb48398221861de8e7af9b602c](https://github.com/MythHack/ARTEX/commit/ca3b706669c035bb48398221861de8e7af9b602c)（提交时间 2026-11-14 22:22:08 Asia/Shanghai）。相对上次完整基线 `675479c8`，GitHub compare 返回 **59 个提交**；本节为对变更路径的分组静态核验，以下旧基线段落和固定链接保留作为历史证据，**不得将旧 CI 或旧 SHA 的能力断言直接当作本轮重新验证**。未访问生产实例、配置数据库或外部模型服务。
 
 ### 增量架构关系（与下方四张历史基线图配合阅读）
 
@@ -53,6 +53,33 @@
 **当前提交的 CI 证据边界：** GitHub 连接器对 `ca3b706669c035bb48398221861de8e7af9b602c` 查询的 PR 触发工作流返回空列表，combined commit statuses 也为空；这些接口不足以证明没有其他类型的 Actions run。当前提交的 Build、Vet、Test、前端构建均标记 **未取得匹配检查证据**，不能沿用 2026-11-01 的旧 CI 成败。没有主动重跑工作流。
 
 **存储与业务模型边界：** PostgreSQL 仍为任务/资产/探索/配置等主数据；SQLite 为流量索引，流量正文、证据、附件、转录和工作区为本地文件。资产图与探索图不自动等于独立业务状态机；录入校验不等于状态更新全过程的不变量。缓存区分上游会话协作、MCP 工具缓存和冷摘要版本复用，不声称存在通用语义响应缓存。未读取部署开关或凭据。
+
+### 全量差异分组核验与产品入口（2026-11-15）
+
+对初始基线至当前 HEAD 的 GitHub compare 结果进行了分组：59 次提交，接口返回 300 个变更路径（**该返回可能截断，不能将 300 当作全仓变更文件总数**）。按 Agent、Server、DB、前端、部署与外围集成检查变更范围；对核心链路读取当前源码的实现与相应入口。测试文件、README 和历史 PR 说明仅作索引，以下状态以所列当前源码为准。**静态核验不等于实际运行测试，也不表示已逐行审计全部变更文件。**
+
+| 变化领域 | 当前实现与实际接线 | 配置/依赖与边界 | CI / 部署 |
+| --- | --- | --- | --- |
+| Agent 规划、执行与证据输出 | `agent/planner.go`、`worker.go`、`mainagent.go`、`tools.go` 提供各角色执行入口；`agent/tool_outputs.go` 存在工具输出证据核对账本；`server/engine.go` 负责任务运行协调 | 证据核对模式、工具绑定、角色模型及任务状态会影响生效；工具输出校验不证明外部事实真实性 | 当前提交检查未知；实例未验证 |
+| 无成果止损、任务进度与约束 | `db/task_no_result.go` 实现阈值检查，`server/task_runtime.go` 计算实际运行时间，`server/server.go` 的任务创建参数包含止损字段，`web/src/lib/api.ts` 序列化对应字段；`db/task_progress.go` 记录进度 | 止损为可选参数；不能从字段存在推断已开启。暂停/排队与累计时间区别需保留 | 当前提交检查未知；实例未验证 |
+| 资产作用域与任务鉴权 | `db/task_scope_guard.go` 对任务自有、来源及外部资产分类；`db/task_auth.go` 解析和规范化任务鉴权配置；任务范围和授权条件影响可访问资源 | 数据层分类/解析已实现；不把它等同于所有入口的完整访问控制证明 | 当前提交检查未知；实例未验证 |
+| 任务附件与文件交付 | `db/task_artifacts.go` 保存附件元数据；`server/task_files.go` 提供任务文件列表、读取、预览、归档；`server/server.go` 注册 `/api/tasks/{id}/files*`；`web/src/lib/api.ts` 与任务 FilesTab 调用对应 API | 附件记录与工作区文件是不同对象；完整证据包自动装配不能由文件下载 API 推断 | 当前提交检查未知；实例未验证 |
+| 结构化数据预览与文档取样 | `server/artifact_data_preview.go` 解析 JSON/JSONL/CSV/文本并处理预览；`docpreview/preview.go` 提供 Office/PDF 取样组件 | 预览、原件下载、报告附件是不同数据流；Office/PDF 渲染可能需要外部程序，实际环境未验证 | 当前提交检查未知；实例未验证 |
+| 报告与证据交付 | `server/report_export.go` 的 Word 路径新增状态过滤、资产名、复测、委托方/时间信息；`report/docx_image.go`、`docx_fonts.go` 为图片/字体组件；前端 ReportTab 调用 `downloadTaskDocx` | Word 流量绑定仍未见补齐数据切片；任务资产附录查询未传任务范围。字体/图片处理存在不代表每种文档渲染通过 | 当前提交检查未知；实例未验证 |
+| 拦截与外部判断 | `server/intercept.go` 在 Jev profile 分支调用 `intercept/jev/client.go` 并记录判断用量；`server/server.go` 排除 Jev 聊天 Provider；系统 Intercept 页面支持选择及测试 | Jev 仅为专用判断协议，依赖 profile/密钥/网络；不是普通聊天模型 | 当前提交检查未知；外部服务未验证 |
+| 搜索与情报 | `server/manager.go` 读取搜索配置、条件启动漏洞情报同步；`server/server.go` 按 Agent 可见性过滤搜索；`agent/chat.go`、`planner.go`、`worker.go`、`mainagent.go` 条件追加 DeepSeek 工具 | DeepSeek backend + API Key + agent WebSearch；情报同步独立受设置和网络影响。同步开关默认值不等于实例已启用 | 当前提交检查未知；外部服务未验证 |
+| 网络出口与代理 | `server/proxy_pool.go` 管理代理池状态，`proxy_autoresume.go` 处理故障与恢复，`egress_probe.go` 提供出口检测；系统代理池页面和管理 API 为配置入口 | 代理池、流量捕获 MITM、WebSearch 出口代理分别配置；探测通过不能证明所有 Agent 流量均走同一路径 | 当前提交检查未知；实例未验证 |
+| 工作区及任务文件安全 | `server/workspace.go` 的路径解析与保护、`server/task_files.go` 的受限任务根目录文件操作；对应前端 Workspace/FilesTab | 路径检查为代码防护，不能代替实际平台权限与符号链接回归验证 | 当前提交检查未知；实例未验证 |
+| Scheduler、Notifier、恢复与运维 | `server/server.go` 中恢复任务、独立 Scheduler/Notifier、MCP 缓存发现及代理监督；`server/report_recovery.go` 存在空报告恢复函数；`cmd/artex-maint/main.go` 提供独立维护 CLI | 后台循环需持久化状态及配置；独立 CLI 存在不表示主服务自动执行其全部操作 | 当前提交检查未知；实例未验证 |
+| 费用、计量与记录 | `db/llm_usage.go` 维护调用用量，`server/cost.go` 提供按模型估算费用的 API；LLM Records 页面可切换完整录制 | 估算价格表不能代表实时账单；完整录制开关与轻量用量账本分离 | 当前提交检查未知；实例未验证 |
+| Web UI / API | 任务、文件、报告、拦截、LLM、通知、计划、漏洞、代理池等页面均存在 API 客户端调用；对应服务端注册/函数在本轮重点核对 | 页面存在及编译成功（若有）不能代替浏览器端到端交互、权限、部署测试 | 当前提交检查未知；实例未验证 |
+| 安装、容器与发布 | `Dockerfile`、`docker/docker-entrypoint.sh`、`install.sh`、`start.sh`、`build.sh` 及 `.github/workflows/release.yml` 在变更范围；`.github/workflows/ci.yml` 定义后端 Build/Vet/Test 和前端静态构建 | 脚本和工作流配置是可执行路径的定义，不证明当前 SHA 通过、镜像已发布或生产部署健康 | 当前提交无匹配检查证据；部署未知 |
+
+**当前 CI 精确口径：** `.github/workflows/ci.yml` 定义 `go build ./...`、`go vet ./...`、`go test -p 1 ./... -count=1` 与 `npm run build:static`；当前 HEAD 的 GitHub PR workflow-run 查询和 combined statuses 均未返回匹配结果。由于连接器仅查询部分事件/页，状态应记为“**本次未取得可核对的当前 SHA run/attempt**”，而不是“没有 CI”或“CI 失败”。没有重跑、没有读取生产部署，也不将旧 attempt 的结果迁移到本次。
+
+**验证分级：** 表中“已实现”=源码可见，“已接线”=可见的调用/路由/UI 链，“条件接线”=需要开关、角色绑定或外部服务；CI 只有相同 SHA、run attempt 的具体 job 结果才能确认；“运行已验证”需要部署实例与对应操作证据，本轮全部保留未知。
+
+**四张 Mermaid 图的阅读约定：** 下方四图分别是整体服务、LLM/上下文、数据/证据和后台服务的高层依赖关系。箭头表示数据或调用关系而非“部署已运行”；图中没有展示的新增模块（如任务附件预览、Jev 判断、代理池）由本节矩阵补充，不能凭图未画出推断不存在。
 
 ## 整体架构
 
