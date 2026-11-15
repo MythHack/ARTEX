@@ -2,7 +2,7 @@
 # Docker 镜像内置工具安装（构建期执行，docker/install-tools.sh）。
 #
 # 与二进制形态 install.sh --with-tools 的工具集对齐——Docker 形态没有
-# pojun-hostd 一键安装（特权助手只服务 systemd 部署），所以宿主环境
+# artex-hostd 一键安装（特权助手只服务 systemd 部署），所以宿主环境
 # 「体检」页看到的工具必须在镜像里就带全，否则永远显示缺失。
 #
 # 差异说明（相对 --with-tools）：

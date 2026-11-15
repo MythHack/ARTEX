@@ -148,8 +148,6 @@ type ToolSet struct {
 	intentAdded int
 	// retiredThisRun 是本轮规划已退役的意图数（护栏：每轮 6 条）。
 	retiredThisRun int
-	// intentRequiresGate 控制 requires_intents 串行闸门是否生效（默认关）。
-	intentRequiresGate bool
 	// killWork, if set, terminates a running work by intent id (engine callback,
 	// wired by the planner). nil = the kill_work tool reports unavailable.
 	killWork func(intentID int64) error
@@ -1509,9 +1507,6 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 
 // SetIntentQueueLimit 安装派发阈值 resolver（nil = 不限制）。
 func (t *ToolSet) SetIntentQueueLimit(fn func() (int, int)) { t.intentQueue = fn }
-
-// SetIntentRequiresGate 控制 requires_intents 串行闸门（默认关，只作记录）。
-func (t *ToolSet) SetIntentRequiresGate(on bool) { t.intentRequiresGate = on }
 
 // queueBudget 返回派发阈值与 worker 数；nil resolver = 0,0（不限制）。
 func (t *ToolSet) queueBudget() (limit, workers int) {

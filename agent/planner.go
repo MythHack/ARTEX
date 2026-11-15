@@ -438,6 +438,11 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// runs in a detached goroutine so it never adds latency to this round.
 	p.compactor.OnPlannerRound(ctx, ts)
 	tsx := NewToolSet(ts, "planner")
+	proxyAddr := p.proxyAddr
+	if p.proxyAddrFn != nil {
+		proxyAddr = p.proxyAddrFn()
+	}
+	tsx.SetEgressProxy(proxyAddr, p.proxyCACert)
 	tsx.SetFindingRecorder(p.findingRecorder)
 	tsx.SetScopeFlags(p.scopeGuard, p.scopeInheritWrites, p.crossTaskNotifyDedup)
 	if p.intentQueue != nil {
@@ -500,10 +505,6 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	settle := wrapupSettlement("planner", nil)
 	if tc.DeadlineUnix > 0 {
 		settle = wrapupSettlementForTask("planner", nil, clamped)
-	}
-	proxyAddr := p.proxyAddr
-	if p.proxyAddrFn != nil {
-		proxyAddr = p.proxyAddrFn()
 	}
 	opts := agentcore.Options{
 		Provider:        p.prov,

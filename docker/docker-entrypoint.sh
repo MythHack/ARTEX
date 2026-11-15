@@ -1,6 +1,6 @@
 #!/bin/sh
 # 容器入口：后台拉起特权安装助手 hostd + 首次启动后台预装工具，再把控制权交给
-# start.sh（pojun 守护）。
+# start.sh（artex 守护）。
 #
 # 为什么这样分层（v0.4.69，参考「主程序与工具环境解耦」的部署思路）：
 #   - 主镜像只带运行时依赖与核心工具，保持精简（发布/拉取快）；
@@ -13,15 +13,15 @@
 #   ARTEX_PREINSTALL_TOOLS=force  强制重跑（升级 binary 后想重新核对工具时用）
 set -u
 
-HOSTD_SOCK="/run/pojun/hostd.sock"
+HOSTD_SOCK="/run/artex/hostd.sock"
 PREINSTALL_MARK="/app/data/.tools-preinstall-done"
 PREINSTALL_LOG="/app/data/tools-preinstall.log"
 mkdir -p "$(dirname "$HOSTD_SOCK")" /app/data
 
 # ── hostd：常驻 unix socket，供「宿主环境」页一键装/重装 ──
-if [ -x /app/pojun-hostd ]; then
+if [ -x /app/artex-hostd ]; then
   if [ ! -S "$HOSTD_SOCK" ]; then
-    /app/pojun-hostd -socket "$HOSTD_SOCK" >>/app/data/hostd.log 2>&1 &
+    /app/artex-hostd -socket "$HOSTD_SOCK" >>/app/data/hostd.log 2>&1 &
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       [ -S "$HOSTD_SOCK" ] && break
       sleep 0.3
@@ -39,7 +39,7 @@ if [ -x /app/pojun-hostd ]; then
     if [ "$mode" = "force" ] || [ ! -f "$PREINSTALL_MARK" ]; then
       (
         echo "[preinstall] $(date '+%F %T') 开始 catalog 预装（后台，不影响主服务）" >>"$PREINSTALL_LOG"
-        if /app/pojun-hostd -install-all >>"$PREINSTALL_LOG" 2>&1; then
+        if /app/artex-hostd -install-all >>"$PREINSTALL_LOG" 2>&1; then
           echo "[preinstall] $(date '+%F %T') 完成（失败项见上方 [fail] 行）" >>"$PREINSTALL_LOG"
           touch "$PREINSTALL_MARK"
         else
@@ -50,8 +50,8 @@ if [ -x /app/pojun-hostd ]; then
     fi
   fi
 else
-  echo "[entrypoint] warn: 未找到 /app/pojun-hostd（页面一键安装不可用）"
+  echo "[entrypoint] warn: 未找到 /app/artex-hostd（页面一键安装不可用）"
 fi
 
-# exec 让 start.sh 成为 PID 1 的替代进程，docker stop 的 SIGTERM 直接到 pojun。
+# exec 让 start.sh 成为 PID 1 的替代进程，docker stop 的 SIGTERM 直接到 artex。
 exec /app/start.sh "$@"

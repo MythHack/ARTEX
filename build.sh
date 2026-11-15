@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# POJUN cross-platform release builder.
+# ARTEX cross-platform release builder.
 #
 # The default mode builds one target and embeds the already-exported frontend.
 # `./build.sh --release` builds and packages all supported desktop/server targets.
@@ -9,7 +9,7 @@
 #   ARTEX_TARGET_ARCH=amd64           One target arch in single-target mode.
 #   ARTEX_TARGETS=linux/amd64,...     Comma-separated targets for multi-target mode.
 #   ARTEX_BUILD_VERSION=v0.3.3        Version embedded in the binary and archive name.
-#   ARTEX_OUTPUT=/path/to/pojun       Explicit binary path in single-target mode.
+#   ARTEX_OUTPUT=/path/to/artex       Explicit binary path in single-target mode.
 #   ARTEX_OUTPUT_DIR=dist             Directory for default binary paths.
 #   ARTEX_PACKAGE=1                   Create a zip archive for each target.
 #   ARTEX_PACKAGE_DIR=dist            Directory for release archives.
@@ -165,7 +165,7 @@ package_binary() {
   binary="$1"
   goos="$2"
   goarch="$3"
-  package_name="pojun-${ARTEX_BUILD_VERSION}-${goos}-${goarch}"
+  package_name="artex-${ARTEX_BUILD_VERSION}-${goos}-${goarch}"
   package_root="${ARTEX_PACKAGE_DIR}/${package_name}"
   archive="${ARTEX_PACKAGE_DIR}/${package_name}.zip"
 
@@ -174,19 +174,14 @@ package_binary() {
   mkdir -p "$package_root"
   cp "$binary" "$package_root/"
   # 安装助手跟着 Linux 包走(它是「一键安装」的执行体,由 install.sh 装成 root 常驻服务)
-  if [ -f "$(dirname "$binary")/pojun-hostd" ]; then
-    cp "$(dirname "$binary")/pojun-hostd" "$package_root/"
+  if [ -f "$(dirname "$binary")/artex-hostd" ]; then
+    cp "$(dirname "$binary")/artex-hostd" "$package_root/"
   fi
-<<<<<<< ours
   if [ -f "$(dirname "$binary")/artex-maint" ]; then
     cp "$(dirname "$binary")/artex-maint" "$package_root/"
-=======
-  if [ -f "$(dirname "$binary")/pojun-maint" ]; then
-    cp "$(dirname "$binary")/pojun-maint" "$package_root/"
->>>>>>> theirs
   fi
   # 守护启动脚本是正式入口：页面上的一键更新要靠它在进程退出后重新拉起，
-  # 直接跑 pojun 本体的话更新完就再也起不来了。按目标系统只带对应的那一份。
+  # 直接跑 artex 本体的话更新完就再也起不来了。按目标系统只带对应的那一份。
   if [ "$goos" = "windows" ]; then
     cp start.bat "$package_root/"
   else
@@ -216,12 +211,12 @@ build_target() {
     *) die "不支持的系统：$goos（支持 linux、darwin、windows）" ;;
   esac
 
-  binary_name="pojun"
-  [ "$goos" = "windows" ] && binary_name="pojun.exe"
+  binary_name="artex"
+  [ "$goos" = "windows" ] && binary_name="artex.exe"
   if [ -n "${ARTEX_OUTPUT:-}" ] && [ "$ARTEX_RELEASE" != "1" ]; then
     output="$ARTEX_OUTPUT"
   else
-    output="${ARTEX_OUTPUT_DIR}/pojun-${goos}-${goarch}/${binary_name}"
+    output="${ARTEX_OUTPUT_DIR}/artex-${goos}-${goarch}/${binary_name}"
   fi
   mkdir -p "$(dirname "$output")"
 
@@ -235,7 +230,7 @@ build_target() {
     -trimpath \
     -ldflags "-s -w -buildid= -X main.version=${ARTEX_BUILD_VERSION}" \
     -o "$output" \
-    ./cmd/pojun
+    ./cmd/artex
 
   compress_binary "$output" "$goos"
   if command -v file >/dev/null 2>&1; then file "$output"; fi
@@ -243,7 +238,7 @@ build_target() {
   # 主服务被 NoNewPrivileges/ProtectSystem=strict 锁死无法提权,「一键安装」
   # 由这个 root 常驻的助手执行,所以它必须随发行包一起发布。
   if [ "$goos" = "linux" ]; then
-    hostd_output="$(dirname "$output")/pojun-hostd"
+    hostd_output="$(dirname "$output")/artex-hostd"
     info "编译 ${goos}/${goarch} 安装助手"
     GOSUMDB="$ARTEX_GOSUMDB" \
     CGO_ENABLED=0 \
@@ -253,16 +248,11 @@ build_target() {
       -trimpath \
       -ldflags "-s -w -buildid= -X main.version=${ARTEX_BUILD_VERSION}" \
       -o "$hostd_output" \
-      ./cmd/pojun-hostd
+      ./cmd/artex-hostd
     compress_binary "$hostd_output" "$goos"
     # 离线维护工具（历史数据修补：附件补登记 / 内置提示词更新）。仅在
-<<<<<<< ours
     # Linux 包内分发；install.sh 装到 /opt/artex/artex-maint。
     maint_output="$(dirname "$output")/artex-maint"
-=======
-    # Linux 包内分发；install.sh 装到 /opt/pojun/pojun-maint。
-    maint_output="$(dirname "$output")/pojun-maint"
->>>>>>> theirs
     info "编译 ${goos}/${goarch} 维护工具"
     GOSUMDB="$ARTEX_GOSUMDB" \
     CGO_ENABLED=0 \
@@ -272,11 +262,7 @@ build_target() {
       -trimpath \
       -ldflags "-s -w -buildid= -X main.version=${ARTEX_BUILD_VERSION}" \
       -o "$maint_output" \
-<<<<<<< ours
       ./cmd/artex-maint
-=======
-      ./cmd/pojun-maint
->>>>>>> theirs
     compress_binary "$maint_output" "$goos"
   fi
   if [ "$ARTEX_PACKAGE" = "1" ]; then package_binary "$output" "$goos" "$goarch"; fi

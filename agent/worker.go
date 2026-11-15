@@ -560,6 +560,11 @@ func firstCancel(cs []func(error)) func(error) {
 
 func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, intent *db.Node, hooks harness.HookRunner, emit func(db.Activity), enr EnrichTrigger, notifyFinding func(int64, string), requestID, message string, workCancel func(error)) (harness.TerminalReason, WriteCounts, error) {
 	tsx := NewToolSet(ts, name)
+	proxyAddr := w.proxyAddr
+	if w.proxyAddrFn != nil {
+		proxyAddr = w.proxyAddrFn()
+	}
+	tsx.SetEgressProxy(proxyAddr, w.proxyCACert)
 	tsx.SetScopeFlags(w.scopeGuard, w.scopeInheritWrites, w.crossTaskNotifyDedup)
 	tsx.SetFindingRecorder(w.findingRecorder)
 	tsx.SetTaskID(taskID)
@@ -599,10 +604,6 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// 血缘、意图 token 台账、coverage、related_tasks 等）不进 worker 视图，省掉每次
 	// 启动的重建计算与注入前缀。worker 只需要「别人发现了什么」做去重与联想。
 	overview := renderWorkerGraphOverview(tsx.workerOverviewData())
-	proxyAddr := w.proxyAddr
-	if w.proxyAddrFn != nil {
-		proxyAddr = w.proxyAddrFn()
-	}
 	sysBody := workerSystem(proxyAddr, w.proxyCACert, w.workDir, runDir)
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守

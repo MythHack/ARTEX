@@ -1,9 +1,6 @@
 package agent
 
-import (
-	"encoding/json"
-	"strings"
-)
+import "strings"
 
 // 意图维度（v0.7.0）：用于「同资产×同手法零产出」的确定性去重。
 // planner 可以显式给 dimension，也可以由 summary 推断；两者都归一到这里。
@@ -88,32 +85,4 @@ func intentDimension(explicit, summary string) string {
 		return d
 	}
 	return inferDimension(summary)
-}
-
-// IsExploitDimension 判断该维度是否属于「利用/深挖」类：这类意图经常需要
-// 连续几十次请求、多步链（拿凭据→登录→提权→取数），租约墙钟要放宽。
-func IsExploitDimension(dim string) bool {
-	switch dim {
-	case dimInjection, dimUpload, dimSSRF, dimRCE, dimCredReuse, dimDataExport, dimPayment, dimPrivesc, dimLateral:
-		return true
-	}
-	return false
-}
-
-// ExploitDimensionFromPayload 从意图节点 payload（JSON）取 dimension/summary 并判定。
-// payload 解析失败时返回 false（保守：不放宽）。
-func ExploitDimensionFromPayload(payload json.RawMessage) bool {
-	if len(payload) == 0 {
-		return false
-	}
-	var m map[string]any
-	if json.Unmarshal(payload, &m) != nil {
-		return false
-	}
-	explicit, _ := m["dimension"].(string)
-	summary, _ := m["summary"].(string)
-	if summary == "" {
-		summary, _ = m["title"].(string)
-	}
-	return IsExploitDimension(intentDimension(explicit, summary))
 }

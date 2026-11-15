@@ -108,9 +108,6 @@ type Task struct {
 // AutopilotEnabled reports whether this task is running in autopilot mode.
 func (t *Task) AutopilotEnabled() bool { return t != nil && t.autopilot.Load() }
 
-// SetAutopilot flips the runtime mirror (persistence happens in db.SetTaskAutopilot).
-func (t *Task) SetAutopilot(on bool) { t.autopilot.Store(on) }
-
 // NotifyAutopilotStall wakes the planner with an autopilot stall trigger.
 //
 // 刻意**不复用 hint**：hint 会进 freshDirection（新增方向），在 auto_finish 里

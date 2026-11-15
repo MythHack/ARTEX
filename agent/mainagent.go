@@ -141,6 +141,11 @@ func mainAgentSystem(goal, dataDir, workDir string) string {
 // worker/planner sessions — not just the final answer.
 func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.AssetStore, ts *db.ExplorationStore, goal, message string, emit func(db.Activity), notify, resume func(), notifyGoal, notifyHint func([]string)) (string, error) {
 	tsx := NewToolSet(ts, "human")
+	proxyAddr := m.proxyAddr
+	if m.proxyAddrFn != nil {
+		proxyAddr = m.proxyAddrFn()
+	}
+	tsx.SetEgressProxy(proxyAddr, m.proxyCACert)
 	tsx.SetFindingRecorder(m.findingRecorder)
 	tsx.SetScopeFlags(m.scopeGuard, m.scopeInheritWrites, m.crossTaskNotifyDedup)
 	if as != nil {
@@ -164,10 +169,6 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	mainDir := ensureRunDir(m.workDir, taskID, 0)
 	ctx = intercept.WithReviewWorkingDirectory(ctx, mainDir)
 	system, boundary := deferredSystem(mainAgentSystem(goal, m.workDir, mainDir), def)
-	proxyAddr := m.proxyAddr
-	if m.proxyAddrFn != nil {
-		proxyAddr = m.proxyAddrFn()
-	}
 	opts := agentcore.Options{
 		Provider:        m.prov,
 		SystemPrompt:    system,

@@ -196,6 +196,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.jwtKey.Store(key)
+	m.SetTaskControlMutex(&s.concMu)
+	s.engine.SetProxyFailureHandler(s.handleProxyFailure)
+	s.engine.SetWorkerResolver(s.workerForTaskSlot)
 	s.listeners = listener.NewManager()
 	agent.SetListenerManager(s.listeners)
 	agent.SetConnectBackResolver(func(port int) agent.ConnectBack {
@@ -275,7 +278,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		}
 		wireAgentAugment(m.pg, s.skillDir, s.hostTools)        // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
 		agent.SetCweSkillIndex(BuildCweSkillIndex(s.skillDir)) // CWE→方法论 skill 联动（漏洞情报工具输出 related_skills）
-		domainReg := buildDomainReg(m.Assets())
+		domainReg := buildDomainReg(m.Assets(), m.ProxyAddr(), m.ProxyCACert())
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
 		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
@@ -533,7 +536,7 @@ func (s *Server) applyLLM(cfg agent.Config) error {
 	}
 	if prov == nil {
 		var err error
-		prov, err = cfg.NewProvider()
+		prov, err = cfg.NewProviderWithLimiter(s.requestLimiterForProfile(0))
 		if err != nil {
 			return err
 		}
@@ -668,7 +671,7 @@ func (s *Server) providerForProfile(id int64) (llm.Provider, agent.Config, bool)
 	if !ok {
 		return nil, agent.Config{}, false
 	}
-	prov, err := cfg.NewProvider()
+	prov, err := cfg.NewProviderWithLimiter(s.requestLimiterForProfile(id))
 	if err != nil {
 		log.Printf("[engine] build provider for LLM profile %d failed: %v", id, err)
 		return nil, agent.Config{}, false
@@ -825,6 +828,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/tasks/{id}/assets", s.attachTaskAssets)
 	mux.HandleFunc("DELETE /api/tasks/{id}/assets/{assetID}", s.detachTaskAsset)
 	mux.HandleFunc("GET /api/tasks/{id}/intent-assets", s.taskIntentAssets)
+
+	mux.HandleFunc("GET /api/tasks/{id}/files", s.taskFilesList)
+	mux.HandleFunc("GET /api/tasks/{id}/files/all", s.taskFilesAll)
+	mux.HandleFunc("GET /api/tasks/{id}/files/read", s.taskFilesServe)
+	mux.HandleFunc("GET /api/tasks/{id}/files/download", s.taskFilesServe)
+	mux.HandleFunc("GET /api/tasks/{id}/files/preview", s.taskFilesServe)
+	mux.HandleFunc("GET /api/tasks/{id}/files/archive", s.taskFilesArchive)
 
 	// 工作空间文件管理器（针对 workDir）
 	mux.HandleFunc("GET /api/workspace/list", s.wsList)

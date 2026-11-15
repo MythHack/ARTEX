@@ -81,9 +81,9 @@
   时由 catalog 后台预装；其余工具分层不变。实测镜像 7.76GB → **4.99GB**。
 - **首次启动后台预装 catalog 全量工具**：entrypoint 拉起常驻 hostd 后，后台执行
   `-install-all`（不阻塞主服务），日志 `data/tools-preinstall.log`，「宿主环境」页
-  实时反映；装完写标记，重启不重复；`POJUN_PREINSTALL_TOOLS=0` 可关闭、
+  实时反映；装完写标记，重启不重复；`ARTEX_PREINSTALL_TOOLS=0` 可关闭、
   `=force` 强制重跑。
-- **hostd 常驻容器内**：镜像新增 pojun-hostd，entrypoint 拉起后「宿主环境」页可
+- **hostd 常驻容器内**：镜像新增 artex-hostd，entrypoint 拉起后「宿主环境」页可
   运行期一键装/重装工具（此前 Docker 形态完全没有 hostd）。
 - **构建源可配置**：`--build-arg DEBIAN_MIRROR= / PIP_INDEX_URL= / NODESOURCE_URL=`，
   受限网络可直接换镜像源构建（CI 默认官方源不受影响）。
@@ -101,11 +101,11 @@
   `--retry 3 --connect-timeout 15 --max-time 600`。
 - `install.sh --with-tools` 的 apt 组补齐 11 项（hashcat/openssl/openssh-client/
   testssl.sh/default-jre-headless/apktool/adb/aapt/awscli/tcpdump/sshuttle）。
-- CI：Linux 二进制产物新增 pojun-hostd，供 Docker 构建复用。
+- CI：Linux 二进制产物新增 artex-hostd，供 Docker 构建复用。
 
 ### 验证
 
-- **Linux 真机（Kali）**：`pojun-hostd -install-all` → 缺失 0、失败 0；
+- **Linux 真机（Kali）**：`artex-hostd -install-all` → 缺失 0、失败 0；
   `/api/hostenv/status` → **90/90 可用**。
 - **Docker（compose 全套）**：镜像 4.99GB；容器启动后 health 200、初始化/登录/
   仪表盘正常；核心工具（nmap/sqlmap/nuclei/ffuf/LibreOffice/Node20/Python3.11）
@@ -153,7 +153,7 @@
   （path / dir / python:module）与 `{arch5}` 模板；「宿主环境」页如实展示。
 - 安装加固：GitHub 下载 3 次重试 + UA、pip `--no-cache-dir`/`--ignore-installed`
   回退、root 下 pipx `--global`、可写 HOME/缓存目录、Ruby 编译依赖。
-- `pojun-hostd -install-all` + `install.sh --with-tools` 按目录预装缺失项
+- `artex-hostd -install-all` + `install.sh --with-tools` 按目录预装缺失项
   （与 Web 一键安装同一套清单，避免两处漂移）。
 
 ### 修复（安全与稳定性审计）
@@ -239,7 +239,7 @@
 ### 说明
 
 - macOS 上主服务、引擎、情报、报告、MCP、一键更新全部可用；特权助手
-  （pojun-hostd 批量装工具）为 Linux 体系不可用，工具用 brew 按需自装，
+  （artex-hostd 批量装工具）为 Linux 体系不可用，工具用 brew 按需自装，
   缺失工具在「宿主环境」页如实显示；Windows 仍走 Docker Desktop 路径。
 
 ## [0.4.65] - 2026-11-12
@@ -531,7 +531,7 @@
 
 > Docker 镜像内置工具补齐：此前镜像只有 recon 基础件（nmap/nuclei/
 > Playwright/LibreOffice），与二进制形态 --with-tools 的工具集差一大截，
-> 而 Docker 形态没有 pojun-hostd 一键安装——缺的工具永远显示缺失。
+> 而 Docker 形态没有 artex-hostd 一键安装——缺的工具永远显示缺失。
 
 ### 新增
 
@@ -2226,7 +2226,7 @@ done 18 / exhausted 99 / blocked 82——**exhausted 是 done 的 5.5 倍**，�
 
 ### 新增的功能
 
-- **特权安装助手随主程序自动换装**：`pojun-hostd` 装在 root 拥有的 `/usr/local/bin`，主服务受 `ProtectSystem=strict` 限制写不进去，升级只能由助手自己完成——它从官方 Release 下载、按 `SHA256SUMS` 校验、冒烟测试后原子替换（旧版留 `.prev`），再由 systemd 拉起。主服务只负责发现版本不一致并通知，能影响的只有「装哪个已发布版本」，影响不到「装什么内容」。
+- **特权安装助手随主程序自动换装**：`artex-hostd` 装在 root 拥有的 `/usr/local/bin`，主服务受 `ProtectSystem=strict` 限制写不进去，升级只能由助手自己完成——它从官方 Release 下载、按 `SHA256SUMS` 校验、冒烟测试后原子替换（旧版留 `.prev`），再由 systemd 拉起。主服务只负责发现版本不一致并通知，能影响的只有「装哪个已发布版本」，影响不到「装什么内容」。
 - 抽出 `FetchVerifiedZip` / `ExtractMember` / `ReplaceBinary` / `SmokeTestBinary`，主程序与助手共用同一套校验逻辑。
 
 ### 修复的问题
@@ -2258,7 +2258,7 @@ done 18 / exhausted 99 / blocked 82——**exhausted 是 done 的 5.5 倍**，�
 
 ### 新增的功能
 
-- **宿主工具体检 + 一键安装**：缺失工具可在宿主环境页直接安装，执行者是随包发布的特权助手 `pojun-hostd`（root 常驻、只监听一个 Unix socket、只认内置白名单工具 id）；体检清单与安装配方共用同一份 catalog，不存在「列了装不上」。
+- **宿主工具体检 + 一键安装**：缺失工具可在宿主环境页直接安装，执行者是随包发布的特权助手 `artex-hostd`（root 常驻、只监听一个 Unix socket、只认内置白名单工具 id）；体检清单与安装配方共用同一份 catalog，不存在「列了装不上」。
 - **装机代理**：只作用于 apt 与 GitHub 下载，与目标流量代理、搜索代理、LLM 代理彼此独立。
 
 ### 变更

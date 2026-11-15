@@ -27,6 +27,7 @@ type taskAgentBundle struct {
 	pl             *agent.Planner
 	wk             *agent.Worker
 	main           *agent.MainAgent
+	pinnedWorkers  map[int64]*agent.Worker
 }
 
 type llmAuditProfile struct {
@@ -55,6 +56,8 @@ type taskLLMRuntime struct {
 	// 覆盖 agent 绑定和任务链；profile 失效（被删/无 key）时落回原链继续跑。
 	// 不推进任务链的故障转移状态（绑定语义），也不参与链轮转。
 	pin int64
+	// Worker-pool pins must never fall back to another profile.
+	strictPin bool
 }
 
 type taskLLMError struct {
@@ -127,6 +130,9 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 		if prov, cfg, ok := r.s.providerForProfile(r.pin); ok {
 			return taskLLMSelection{provider: prov, retry: cfg.Retry}, nil
 		}
+		if r.strictPin {
+			return taskLLMSelection{}, fmt.Errorf("LLM profile #%d is missing or invalid", r.pin)
+		}
 	}
 	taskNum, err := parseTaskID(r.taskID)
 	if err != nil {
@@ -176,6 +182,9 @@ func (r *taskLLMRuntime) activeCfg() (agent.Config, bool) {
 	if r.pin > 0 {
 		if _, cfg, ok := r.s.providerForProfile(r.pin); ok {
 			return cfg, true
+		}
+		if r.strictPin {
+			return agent.Config{}, false
 		}
 	}
 	taskNum, err := parseTaskID(r.taskID)
@@ -288,6 +297,13 @@ func (r *taskLLMRuntime) withoutThinking() (llm.Provider, error) {
 	// current() 已经把配置解析好了，但只把 provider 交出来；这里需要 cfg 本身
 	// 才能重建。故按同样的优先级再解析一次配置。
 	cfg, ok := r.s.configForSelection(r.agentKey, sel)
+	if r.pin > 0 {
+		if _, pinnedCfg, pinnedOK := r.s.providerForProfile(r.pin); pinnedOK {
+			cfg, ok = pinnedCfg, true
+		} else if r.strictPin {
+			ok = false
+		}
+	}
 	if !ok {
 		return nil, fmt.Errorf("无法解析 LLM 配置以降级重试（profile %d）", sel.profileID)
 	}
@@ -697,7 +713,6 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	workerRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "worker"}
 	mainRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "mainagent"}
 	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
-	window := workerRuntime.CompactionWindow()
 	// 授权边界守卫开关（v0.4.63）：每个 agent bundle 装配时读一次设置。
 	var scopeGuard, scopeInherit, notifyDedup bool
 	if s.m.PG() != nil {
@@ -707,28 +722,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	} else {
 		scopeGuard, notifyDedup = true, true
 	}
-	wk := agent.NewWorker(workerRuntime, "task-router", s.m.dir, tx, window, s.agentMaxTurns("worker"))
-	wk.SetScopeFlags(scopeGuard, scopeInherit, notifyDedup)
-	wk.SetFindingRecorder(s.evidenceStore())
-	wk.SetArtifactRecorder(s) // v0.5.0 证据附件：save_evidence 落盘登记
-	wk.SetCompactionWindowResolver(workerRuntime.CompactionWindow)
-	wk.SetNonStreaming(workerRuntime.nonStreaming) // 按任务当前激活 profile 的流式开关(每轮读)
-	wk.SetMaxTokens(workerRuntime.maxTokens)       // 同上,输出上限也跟随当前激活 profile
-	wk.SetNoaEnabled(s.m.NoaCompactionEnabled)     // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
-	wk.SetRunTimeout(time.Duration(s.agentRunSeconds("worker")) * time.Second)
-	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
-	wk.SetWebSearch(s.webSearchFor("worker"))
-	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
-	// 任务级登录凭据（v0.4.8）：装配时读一次并注入 worker system prompt。
-	// 认证配置当前只在创建任务时录入；若以后加编辑接口，需要在保存后 invalidate
-	// 本任务的 agent bundle 让下一轮重新装配。
-	if s.m.PG() != nil {
-		if id64, err := strconv.ParseInt(t.ID, 10, 64); err == nil {
-			if pgTask, err2 := s.m.PG().GetTask(id64); err2 == nil && pgTask != nil && pgTask.AuthConfig != nil && pgTask.AuthConfig.Enabled {
-				wk.SetTaskAuthBlock(pgTask.AuthConfig.PromptBlock())
-			}
-		}
-	}
+	wk := s.newTaskWorker(t, workerRuntime)
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
 	pl.SetScopeFlags(scopeGuard, scopeInherit, notifyDedup)
 	pl.SetIntentQueueLimit(s.intentQueueBudget) // 派发节流（v0.4.68）：本轮新增上限
@@ -784,6 +778,63 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	}
 	s.taskAgents[t.ID] = bundle
 	return bundle
+}
+
+func (s *Server) newTaskWorker(t *Task, runtime *taskLLMRuntime) *agent.Worker {
+	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
+	var scopeGuard, scopeInherit, notifyDedup bool
+	if s.m.PG() != nil {
+		scopeGuard = s.m.PG().GetBool("scope_write_guard", true)
+		scopeInherit = s.m.PG().GetBool("scope_inherit_writes", false)
+		notifyDedup = s.m.PG().GetBool("notify_cross_task_dedup", true)
+	} else {
+		scopeGuard, notifyDedup = true, true
+	}
+	wk := agent.NewWorker(runtime, "task-router", s.m.dir, tx, runtime.CompactionWindow(), s.agentMaxTurns("worker"))
+	wk.SetScopeFlags(scopeGuard, scopeInherit, notifyDedup)
+	wk.SetFindingRecorder(s.evidenceStore())
+	wk.SetArtifactRecorder(s)
+	wk.SetCompactionWindowResolver(runtime.CompactionWindow)
+	wk.SetNonStreaming(runtime.nonStreaming)
+	wk.SetMaxTokens(runtime.maxTokens)
+	wk.SetNoaEnabled(s.m.NoaCompactionEnabled)
+	wk.SetRunTimeout(time.Duration(s.agentRunSeconds("worker")) * time.Second)
+	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	wk.SetWebSearch(s.webSearchFor("worker"))
+	wk.SetConstraintInject(s.constraintInjectWorker)
+	if s.m.PG() != nil {
+		if id64, err := strconv.ParseInt(t.ID, 10, 64); err == nil {
+			if pgTask, err := s.m.PG().GetTask(id64); err == nil && pgTask != nil && pgTask.AuthConfig != nil && pgTask.AuthConfig.Enabled {
+				wk.SetTaskAuthBlock(pgTask.AuthConfig.PromptBlock())
+			}
+		}
+	}
+	return wk
+}
+
+func (s *Server) workerForTaskSlot(t *Task, slot WorkerSlot) (*agent.Worker, error) {
+	if slot.ProfileID <= 0 {
+		return nil, errors.New("worker slot is not pinned")
+	}
+	if _, _, ok := s.providerForProfile(slot.ProfileID); !ok {
+		return nil, fmt.Errorf("LLM profile #%d is missing or invalid", slot.ProfileID)
+	}
+	bundle := s.agentsForTask(t)
+	s.taskAgentMu.Lock()
+	defer s.taskAgentMu.Unlock()
+	if current := s.taskAgents[t.ID]; current != nil {
+		bundle = current
+	}
+	if worker := bundle.pinnedWorkers[slot.ProfileID]; worker != nil {
+		return worker, nil
+	}
+	if bundle.pinnedWorkers == nil {
+		bundle.pinnedWorkers = make(map[int64]*agent.Worker)
+	}
+	runtime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "worker", pin: slot.ProfileID, strictPin: true}
+	worker := s.newTaskWorker(t, runtime)
+	bundle.pinnedWorkers[slot.ProfileID] = worker
+	return worker, nil
 }
 
 func (s *Server) syncTaskLLMState(pt *db.Task) {

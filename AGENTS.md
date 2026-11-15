@@ -23,14 +23,14 @@ cd web && NEXT_EXPORT=1 npx next build
 
 # 全量测试：连真 PG（Docker），-p 1 不能去（跨包死锁），先给新鲜库（共享库跑多轮会撞
 # 固定名 fixture 的唯一键，产生假失败）
-docker run -d --name pojun-audit-pg -e POSTGRES_PASSWORD=pojuntest -e POSTGRES_USER=pojun \
-  -e POSTGRES_DB=pojun -p 15432:5432 postgres:16-alpine
-docker exec pojun-audit-pg psql -U pojun -d postgres -c "DROP DATABASE IF EXISTS pojun_ci; CREATE DATABASE pojun_ci OWNER pojun"
-POJUN_PG_DSN="postgres://pojun:pojuntest@127.0.0.1:15432/pojun_ci?sslmode=disable" go test -p 1 ./... -count=1
+docker run -d --name artex-audit-pg -e POSTGRES_PASSWORD=artextest -e POSTGRES_USER=artex \
+  -e POSTGRES_DB=artex -p 15432:5432 postgres:16-alpine
+docker exec artex-audit-pg psql -U artex -d postgres -c "DROP DATABASE IF EXISTS artex_ci; CREATE DATABASE artex_ci OWNER artex"
+ARTEX_PG_DSN="postgres://artex:artextest@127.0.0.1:15432/artex_ci?sslmode=disable" go test -p 1 ./... -count=1
 
 # 发版构建（本机交叉编译验证用；正式发版靠 CI）
-POJUN_SKIP_FRONTEND=1 POJUN_SKIP_NPM_CI=1 POJUN_COMPRESS=0 POJUN_PACKAGE=0 \
-  POJUN_OUTPUT=/abs/path/pojun ./build.sh --target linux/amd64
+ARTEX_SKIP_FRONTEND=1 ARTEX_SKIP_NPM_CI=1 ARTEX_COMPRESS=0 ARTEX_PACKAGE=0 \
+  ARTEX_OUTPUT=/abs/path/artex ./build.sh --target linux/amd64
 ```
 
 ## 2. 测试基线（判定 FAIL 是否与你有关）
@@ -52,10 +52,10 @@ POJUN_SKIP_FRONTEND=1 POJUN_SKIP_NPM_CI=1 POJUN_COMPRESS=0 POJUN_PACKAGE=0 \
 
 ## 4. 关键坑（真实踩过的）
 
-- **默认构建不含前端**：`go build ./cmd/pojun` 出的是 stub（页面报「前端未内嵌」）。内嵌必须
+- **默认构建不含前端**：`go build ./cmd/artex` 出的是 stub（页面报「前端未内嵌」）。内嵌必须
   `-tags embedui` 且先 `cp -r web/out server/webui/dist`。别把无 tags 的现场编译版当正式版部署。
 - **dev 版本号禁用一键更新**：`CompareVersions` 只认纯净三段式；`0.3.95-dev` 这类会被判不可比较。
-  本机交叉编译验证时传 `POJUN_BUILD_VERSION` 要注意。
+  本机交叉编译验证时传 `ARTEX_BUILD_VERSION` 要注意。
 - **next build 的 cwd 必须是 `web/`**——曾在 `web/src` 下误跑，产物 `.next` 被 `git add -A` 带进仓库。
 - **短 sleep 等定时器的测试不许写**：`1ms 超时 + sleep 2ms 断言` 在 CI 高负载翻车（本地必过）。
   用有界轮询。
@@ -71,7 +71,7 @@ POJUN_SKIP_FRONTEND=1 POJUN_SKIP_NPM_CI=1 POJUN_COMPRESS=0 POJUN_PACKAGE=0 \
 ## 5. 目录速览
 
 ```
-cmd/            入口（pojun / pojun-hostd 特权助手 / pojun-maint 维护工具）
+cmd/            入口（artex / artex-hostd 特权助手 / artex-maint 维护工具）
 agent/          多 Agent 层（planner/worker/mainagent 提示词与工具；三张工具清单在 tools.go/tools_insert.go）
 db/             PostgreSQL 唯一存储（schema.sql 幂等迁移；拦截规则 seed 批次 v1-v5）
 server/         HTTP 面与引擎调度（全部路由注册在 server.go:680-1000 一带）
