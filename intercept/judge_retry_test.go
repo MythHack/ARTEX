@@ -124,7 +124,7 @@ func TestJudgeRetriesBeforeApplyingFailurePolicy(t *testing.T) {
 			if got.RuleID != 0 || len(got.ModelInput) == 0 || got.ModelInputDigest == "" || got.ConfigDigest == "" {
 				t.Fatalf("missing audit data: %+v", got)
 			}
-			if got.Action == "ask" && (!got.TimeoutEnabled || got.TimeoutSeconds != 300 || got.TimeoutAction != "deny") {
+			if got.Action == "ask" && (!got.TimeoutEnabled || got.TimeoutSeconds != 180 || got.TimeoutAction != "allow") {
 				t.Fatal("human approval timeout lost")
 			}
 			if tc.wantFallback && !strings.Contains(got.Message, "temporary model failure") {

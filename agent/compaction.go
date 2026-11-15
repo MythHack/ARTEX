@@ -66,6 +66,13 @@ type Compactor struct {
 	lastRun map[int64]time.Time
 	// consecFails 记录每个探索连续几轮压缩失败,用于失败退避(见 cooldownForLocked)。
 	consecFails map[int64]int
+
+	// subChunkCache 缓存已成功的压缩子块（外部审查验证发现：原先任一子块
+	// 失败整块作废，重试把已成功子块重烧一遍——16 节点块 6+6+4 三个子请求，
+	// 第 3 个失败时前两个的结果直接丢弃）。键 = 块签名+子块序号+代次，值 =
+	// 压缩正文。进程内生命周期：compactor 常驻，节点内容/提示词/模型任一
+	// 变化都会改变块签名（blockSignature 含 content_version），缓存自然失效。
+	subChunkCache map[string]string
 }
 
 // Defaults for the §4 compress call. MaxTokens must cover the reasoning tokens a
@@ -132,6 +139,7 @@ func NewCompactor(prov llm.Provider, model string) *Compactor {
 		running:         map[int64]bool{},
 		lastRun:         map[int64]time.Time{},
 		consecFails:     map[int64]int{},
+		subChunkCache:   map[string]string{},
 	}
 }
 
@@ -331,6 +339,9 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 	allOK := true
 	for _, b := range blocks {
 		if ctx.Err() != nil {
+			// ctx 超时也计入失败（外部审查验证发现：这条路径绕过
+			// recordResult，不进指数退避——昂贵的超时轮反复从零开始）。
+			c.recordResult(ts.ID(), false)
 			return
 		}
 		if !c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, nil)) {
@@ -338,6 +349,7 @@ func (c *Compactor) minor(ctx context.Context, ts *db.ExplorationStore) {
 		}
 	}
 	if ctx.Err() != nil {
+		c.recordResult(ts.ID(), false)
 		return
 	}
 	c.recordResult(ts.ID(), allOK)
@@ -395,8 +407,15 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 		}
 		toCreate = append(toCreate, b)
 	}
-	// Supersede stale digests FIRST (atomic drop of their covers edges) so a member
-	// is never covered by both an old and a new digest (§5.1 one-member-one-digest).
+	// 事务性切换（外部审查验证发现的重复压缩循环修复）：
+	// 旧实现先 eager Supersede 再建新摘要——major 的重建一旦失败（子块超时/
+	// 网关错），旧摘要的 covers 已被删，成员变回「未压缩」，minor 下轮重新
+	// 付费，再下轮 major 又作废一次，稳定图上形成「压缩→作废→再压缩」循环
+	// （144 节点链复现：每 7 轮重烧 21 次子请求，覆盖反复退回原点）。
+	// 现在顺序改为：先建新摘要，成功后再退役旧摘要——且只退役「成员已全部
+	// 被本轮新建/保留摘要覆盖」的旧摘要。建新失败时旧摘要原样保留，成员
+	// 始终有覆盖。过渡期的双覆盖由 CoveredMembers 的最小 id 去重兜底
+	// （db/digest.go §6.1 注释），最终态仍满足 one-member-one-digest。
 	var stale []int64
 	for _, d := range active {
 		sig, _ := digestSigGen(d)
@@ -404,19 +423,44 @@ func (c *Compactor) major(ctx context.Context, ts *db.ExplorationStore) {
 			stale = append(stale, d.ID)
 		}
 	}
-	if ctx.Err() != nil {
-		return
-	}
-	if err := ts.SupersedeDigests(stale); err != nil {
-		log.Printf("[compaction] supersede exp=%d: %v", ts.ID(), err)
-	}
 	allOK := true
 	for _, b := range toCreate {
 		if ctx.Err() != nil {
+			c.recordResult(ts.ID(), false) // 同 minor：超时也进退避
 			return
 		}
 		if !c.foldBlock(ctx, ts, g, b, nodeByID, cvers, c.generationFor(b, active)) {
 			allOK = false
+		}
+	}
+	// 新摘要落库后再判定可安全退役的旧摘要。
+	if len(stale) > 0 {
+		covered, err := ts.CoveredMembers()
+		if err != nil {
+			log.Printf("[compaction] supersede-check exp=%d: %v", ts.ID(), err)
+			return
+		}
+		var safe []int64
+		for _, dID := range stale {
+			members, err := ts.DigestMembers(dID)
+			if err != nil {
+				continue // 查不到就保守保留
+			}
+			replaced := true
+			for _, m := range members {
+				if cov, ok := covered[m]; !ok || cov == dID {
+					replaced = false // 该成员仍只被这个旧摘要覆盖
+					break
+				}
+			}
+			if replaced {
+				safe = append(safe, dID)
+			}
+		}
+		if len(safe) > 0 {
+			if err := ts.SupersedeDigests(safe); err != nil {
+				log.Printf("[compaction] supersede exp=%d: %v", ts.ID(), err)
+			}
 		}
 	}
 	c.recordResult(ts.ID(), allOK)
@@ -434,7 +478,7 @@ func (c *Compactor) foldBlock(ctx context.Context, ts *db.ExplorationStore, g *c
 	}
 	// 超大块会被切成若干子块分别压缩(见 compressChunked 的注释:思考型模型能否
 	// 收尾取决于单次输入规模)。多段 body 拼成一段,语义与原来的一段等价。
-	bodies, err := c.compressChunked(ctx, g, b, nodeByID)
+	bodies, err := c.compressChunked(ctx, g, b, nodeByID, cvers)
 	if err != nil {
 		log.Printf("[compaction] compress exp=%d block=%v: %v", ts.ID(), b.Members, err)
 		return false
@@ -724,6 +768,12 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 		if conf := nodeConfidence(n); conf != "" {
 			line += fmt.Sprintf(" (confidence=%s)", conf)
 		}
+		// 停止原因（外部审查验证发现）：压缩提示词要求区分「方向已穷尽 / 步数
+		// 不够 / 外部故障」，但输入里从没带 BlockedReason——模型只能瞎猜，把
+		// 「没来得及完成」摘要成「已穷尽」，直接影响后续续派判断。
+		if n != nil && n.BlockedReason != "" {
+			line += fmt.Sprintf(" [stop_reason=%s]", n.BlockedReason)
+		}
 		sb.WriteString(line)
 		sb.WriteByte('\n')
 	}
@@ -810,7 +860,7 @@ func (c *Compactor) compress(ctx context.Context, g *coldGraph, b block, nodeByI
 // 反而全失败;4 路并发把 66 分钟压到约 17 分钟,稳稳落在 20 分钟上限内。
 // 单个子块失败仍然让整块失败(宁可重试也不要写半截摘要),但**成功的子块
 // 结果会被保留**,失败重试时不必从头再来。
-func (c *Compactor) compressChunked(ctx context.Context, g *coldGraph, b block, nodeByID map[int64]*db.Node) ([]string, error) {
+func (c *Compactor) compressChunked(ctx context.Context, g *coldGraph, b block, nodeByID map[int64]*db.Node, cvers map[int64]int) ([]string, error) {
 	limit := c.maxBlockMembers
 	if limit <= 0 || len(b.Members) <= limit {
 		body, err := c.compress(ctx, g, b, nodeByID)
@@ -827,10 +877,21 @@ func (c *Compactor) compressChunked(ctx context.Context, g *coldGraph, b block, 
 	}
 	subs := make([]subResult, nSubs)
 
+	// 子块缓存键：块签名 + 子块序号 + 代次。foldBlock 传进来的 block 在
+	// 压缩期间成员可能复活收缩，这里用「原始块签名」作键——重试时同一块
+	// 的成员/内容版本不变即命中（内容变了 blockSignature 变，自然失效）。
+	sig := blockSignature(b, cvers)
+	subKey := func(k int) string { return fmt.Sprintf("%s#%d", sig, k) }
+
 	// 并发执行,限制并发度。
 	sem := make(chan struct{}, compactionSubConcurrency)
 	var wg sync.WaitGroup
 	for k := 0; k < nSubs; k++ {
+		// 命中缓存：直接复用，不烧 LLM（外部审查验证发现的重复计费修复）。
+		if body, ok := c.subChunkGet(subKey(k)); ok {
+			subs[k] = subResult{body: body}
+			continue
+		}
 		wg.Add(1)
 		go func(k int) {
 			defer wg.Done()
@@ -843,6 +904,9 @@ func (c *Compactor) compressChunked(ctx context.Context, g *coldGraph, b block, 
 			}
 			sub := block{Members: b.Members[i:j], Anchors: b.Anchors}
 			body, err := c.compress(ctx, g, sub, nodeByID)
+			if err == nil {
+				c.subChunkPut(subKey(k), body) // 成功即缓存，失败块重试时同批成功子块免重烧
+			}
 			subs[k] = subResult{body: body, err: err}
 		}(k)
 	}
@@ -852,11 +916,39 @@ func (c *Compactor) compressChunked(ctx context.Context, g *coldGraph, b block, 
 	for k, s := range subs {
 		if s.err != nil {
 			// 某个子块失败：整块视为失败(宁可重试也不要写半截摘要)。
+			// 成功子块已在缓存里，重试只补失败位。
 			return nil, fmt.Errorf("子块 %d/%d 压缩失败: %w", k+1, nSubs, s.err)
 		}
 		out = append(out, s.body)
 	}
+	// 全块成功：摘要已落库，块签名会随 covers 变化失效，顺手清掉这批子缓存。
+	for k := 0; k < nSubs; k++ {
+		c.subChunkDel(subKey(k))
+	}
 	return out, nil
+}
+
+
+func (c *Compactor) subChunkGet(key string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v, ok := c.subChunkCache[key]
+	return v, ok
+}
+
+func (c *Compactor) subChunkPut(key, body string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.subChunkCache) > 512 { // 简单上限：防极端图把内存拖爆
+		c.subChunkCache = map[string]string{}
+	}
+	c.subChunkCache[key] = body
+}
+
+func (c *Compactor) subChunkDel(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.subChunkCache, key)
 }
 
 // countThinking 数一数消息里有几个思考块。用于区分「模型只思考没正文」

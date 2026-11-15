@@ -79,13 +79,16 @@ func (s *Server) wireInterceptReviewer() {
 			//
 			// 两种「解析失败」要分开看：
 			//   - 回复为空：思考把预算烧光，正文一个字没轮到（长命令常见）。
-			//   - 回复被截断成 `{"decision":"al`：JSON 没写完，也是预算不够。
-			// 两者都指向同一个解法：给足预算 + 升预算重试。上面
-			// streamCollectTextBudget 已经处理了「空回复」的情形；这里再补
-			// 「有内容但解析不出来」的升预算重试。
-			if retryText, retryErr := reviewCompletionEscalate(ctx, prov, prompt, input, text); retryErr == nil {
-				text = retryText
-				v = intercept.ParseVerdict(text)
+			//     —— streamCollectTextBudget 的阶梯 [32768→65536→131072] 已处理，
+			//     空文重跑同档位只会得到同样的空文（外部审查验证发现的双层重试
+			//     重复：最坏 5 次调用里有 2 次纯浪费）。
+			//   - 回复被截断成 `{"decision":"al`：JSON 没写完，升预算有新信息量。
+			// 因此 escalate 只在有正文时触发；空文路径交给内层阶梯。
+			if strings.TrimSpace(text) != "" {
+				if retryText, retryErr := reviewCompletionEscalate(ctx, prov, prompt, input, text); retryErr == nil {
+					text = retryText
+					v = intercept.ParseVerdict(text)
+				}
 			}
 		}
 		if v.Action == "" {
@@ -216,10 +219,14 @@ func streamCollectTextBudget(ctx context.Context, prov llm.Provider, system, use
 func oneCompletion(ctx context.Context, prov llm.Provider, system, user string, maxTokens int) (string, error) {
 	temp := 0.0
 	req := llm.CompletionRequest{
-		System:      []string{system},
-		Messages:    []llm.Message{llm.UserText(user)},
-		MaxTokens:   maxTokens,
-		Temperature: &temp,
+		System: []string{system},
+		// 裁判 system 是稳定前缀（外部审查验证发现：此前不带缓存边界，
+		// Anthropic 通道每轮裁决都全价重算这段入口 token）。boundary=1
+		// 走现有显式缓存路径，不改正文。
+		DynamicBoundary: 1,
+		Messages:        []llm.Message{llm.UserText(user)},
+		MaxTokens:       maxTokens,
+		Temperature:     &temp,
 	}
 	var sb strings.Builder
 	for ev, err := range prov.Stream(ctx, req) {

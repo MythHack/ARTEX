@@ -8,6 +8,7 @@ import (
 )
 
 func TestPythonPrecedingShellEffectsWithoutExecution(t *testing.T) {
+	symlinkPrivilegeUnavailable(t)
 	root := t.TempDir()
 	bin := filepath.Join(root, "bin")
 	lib := filepath.Join(root, "lib", "python3.12")
@@ -101,5 +102,16 @@ func TestPythonPrecedingShellEffectsWithoutExecution(t *testing.T) {
 	in := reviewCommandForTest(t, cwd, "cat > virtual.env <<'ENV'\nTOKEN=literal\nENV\nsource virtual.env; python3 -m one")
 	if in.ScriptCaptureStatus != "complete" || !strings.Contains(in.Scripts[0].Content, "TOKEN=literal") {
 		t.Fatalf("virtual source ignored: %+v", in)
+	}
+}
+
+// symlinkPrivilegeUnavailable reports whether this host cannot create symlinks
+// (Windows without developer mode/admin). The python-env fixtures rely on
+// symlinks; skip those tests instead of failing.
+func symlinkPrivilegeUnavailable(t *testing.T) {
+	t.Helper()
+	probe := filepath.Join(t.TempDir(), "probe")
+	if err := os.Symlink(".", probe); err != nil {
+		t.Skipf("symlink privilege unavailable: %v", err)
 	}
 }

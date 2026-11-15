@@ -112,12 +112,14 @@ type IntentTokenUsage struct {
 }
 
 // TokenByIntent aggregates one exploration's llm_usage rows grouped by intent.
-// 总消耗口径 = input + cache_read + cache_write + output（「为拿到这段输出花了多少
-// token」）。供 graph_overview 给意图节点标消耗（哪个方向烧了多少钱）。
+// 总消耗口径 = input + output。input_tokens 已含 cache_read/cache_write（Norma
+// anthropicUsage.norm() 把缓存折进 InputTokens，OpenAI 口径 prompt_tokens 语义），
+// 不能再加 cache 列——那是把缓存部分算两遍（外部审查验证发现）。
+// cache_read/cache_write 列保留作分项统计（缓存命中分析），不参与总量。
 func (s *ExplorationStore) TokenByIntent() ([]IntentTokenUsage, error) {
 	rows, err := s.db.Query(`
 SELECT intent_id, COUNT(*) AS calls,
-       COALESCE(SUM(input_tokens+cache_read+cache_write),0),
+       COALESCE(SUM(input_tokens),0),
        COALESCE(SUM(output_tokens),0)
 FROM llm_usage
 WHERE exploration_id=$1 AND intent_id>0

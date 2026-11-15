@@ -623,6 +623,20 @@ func Summary() map[string]any {
 //
 // 曾经这个函数定义了却没有调用方：工具清单只进了 planner 的唤醒提示，
 // 而真正动手的 worker 看不到它——于是新装的一批工具一次都没被用起来。
+
+// MissingNames 返回缺失工具名列表（worker 态势去重用：system 已有全量清单，
+// 态势只需要「哪些手段没有」）。
+func MissingNames() []string {
+	inv := Inventory()
+	var missing []string
+	for _, t := range inv {
+		if !t.Available {
+			missing = append(missing, t.Name)
+		}
+	}
+	return missing
+}
+
 func SummaryText() string {
 	var b strings.Builder
 	avail := 0

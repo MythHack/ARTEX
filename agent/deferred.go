@@ -19,7 +19,11 @@ func deferredSystem(sysText string, def DeferredInfo) (system []string, boundary
 	sysText += def.FindingGuidance + def.CaseGuidance + def.IntelligenceGuidance
 	block := actool.RenderDeferredToolsBlock(def.GlobalNames)
 	if block == "" {
-		return []string{sysText}, 0
+		// 无全局 deferred 工具也要发缓存标记：sysText 本身是稳定前缀（角色说明），
+		// boundary=1 让这一段进入 Anthropic 显式缓存路径。此前返回 0 导致 worker/
+		// planner/main/chat 在无 deferred 工具时永远不带 cache_control（外部审查
+		// 验证发现）。这不改变正文，只是让现有缓存机制对这段生效。
+		return []string{sysText}, 1
 	}
 	system = []string{sysText, block}
 	boundary = len(system) // b >= len → whole system prompt cached (SDK guard)

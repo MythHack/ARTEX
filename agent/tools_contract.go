@@ -185,7 +185,7 @@ func WriteContractScript(dir string) (string, error) {
 //     "found": true/false,
 //     "api_count": 12,                          // 接口总数
 //     "endpoints": [ {path, method, summary, auth_required, params:[{name,in,required}]} ],
-//     "auth_endpoints": [ ... ],                // 需要鉴权的那批（越权挖掘先看这批）
+//     "auth_endpoint_indices": [0,3,7],         // 需要鉴权的接口下标（越权挖掘先看这批；下标指向 endpoints）
 //     "auth_schemes": ["bearer","apiKey"],     // 契约里声明的鉴权方式
 //   }
 //
@@ -333,7 +333,7 @@ def main():
         "found": False,
         "api_count": 0,
         "endpoints": [],
-        "auth_endpoints": [],
+        "auth_endpoint_indices": [],
         "auth_schemes": [],
     }
     if not raw.strip():
@@ -357,8 +357,13 @@ def main():
     out["found"] = bool(eps)
     out["api_count"] = len(eps)
     out["endpoints"] = eps
-    out["auth_endpoints"] = [e for e in eps if e.get("auth_required")]
-    print(json.dumps(out, ensure_ascii=False, indent=2))
+    # 鉴权接口改用索引引用（外部审查验证发现：完整对象复制使输出翻倍——
+    # 20 个鉴权接口实测 12.1KB→3.5KB）。索引指向 endpoints 数组下标，可完整还原。
+    out["auth_endpoint_indices"] = [i for i, e in enumerate(eps) if e.get("auth_required")]
+    # auth_schemes 沿用契约级声明（endpoints 本身不带 auth 对象）。
+    if "auth_schemes" not in out:
+        out["auth_schemes"] = []
+    print(json.dumps(out, ensure_ascii=False, separators=(",", ":")))
     return 0
 
 

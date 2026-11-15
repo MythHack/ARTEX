@@ -358,22 +358,39 @@ func intentAssetIDs(intent *db.Node) []int64 {
 }
 
 func renderIntentTask(intent *db.Node) string {
-	// hypothesis/success_criteria 结构化渲染（v0.3.95 B3）：planner 写了就带出，
-	// worker 的「复述假设→判成没成」作业程序直接以此为锚。
-	extra := ""
+	// hypothesis/success_criteria 只渲染一次（外部审查验证发现：原先先打全量
+	// Payload 再单独复述这两个字段，同一信息在上下文里出现两份）。带这两个
+	// 字段时从 Payload 里剔除后再打，结构化行作为唯一呈现。
 	var p struct {
 		Hypothesis      string `json:"hypothesis"`
 		SuccessCriteria string `json:"success_criteria"`
 	}
-	if err := json.Unmarshal(intent.Payload, &p); err == nil {
-		if h := strings.TrimSpace(p.Hypothesis); h != "" {
-			extra += fmt.Sprintf("\n本方向假设（H）：%s", h)
-		}
-		if sc := strings.TrimSpace(p.SuccessCriteria); sc != "" {
-			extra += fmt.Sprintf("\n成功判据（怎么算成了/没成）：%s", sc)
+	payload := intent.Payload
+	_ = json.Unmarshal(payload, &p)
+	hasH := strings.TrimSpace(p.Hypothesis) != ""
+	hasSC := strings.TrimSpace(p.SuccessCriteria) != ""
+	if hasH || hasSC {
+		var trimmed map[string]any
+		if json.Unmarshal(payload, &trimmed) == nil {
+			if hasH {
+				delete(trimmed, "hypothesis")
+			}
+			if hasSC {
+				delete(trimmed, "success_criteria")
+			}
+			if b, err := json.Marshal(trimmed); err == nil {
+				payload = b
+			}
 		}
 	}
-	return fmt.Sprintf("\n\n【你领到的意图（本次唯一任务：只做这一条、只产生事实、做完即停）】：\n%s%s\n意图 id: %d（写回 record_fact / report_finding 时传它）%s", string(intent.Payload), extra, intent.ID, premiseCheckHint)
+	extra := ""
+	if hasH {
+		extra += fmt.Sprintf("\n本方向假设（H）：%s", strings.TrimSpace(p.Hypothesis))
+	}
+	if hasSC {
+		extra += fmt.Sprintf("\n成功判据（怎么算成了/没成）：%s", strings.TrimSpace(p.SuccessCriteria))
+	}
+	return fmt.Sprintf("\n\n【你领到的意图（本次唯一任务：只做这一条、只产生事实、做完即停）】：\n%s%s\n意图 id: %d（写回 record_fact / report_finding 时传它）%s", string(payload), extra, intent.ID, premiseCheckHint)
 }
 
 // premiseCheckHint 是「前提核对」硬提醒：意图是 planning 时的快照，排队期间目标

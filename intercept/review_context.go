@@ -47,6 +47,31 @@ type ReviewInput struct {
 	EvidenceTruncated   bool              `json:"evidence_truncated,omitempty"`
 }
 
+// MarshalJSON keeps the judge envelope at the pojun 5-key base shape
+// (version/working_directory/background/tool_name/arguments) when nothing was
+// captured: scripts/script_capture_status are fork additions and only ride
+// along when they carry information ("incomplete"/"complete" + files). The
+// struct itself keeps "not_applicable" for internal policy checks
+// (applyIncompleteScriptPolicy) and direct tests.
+func (in ReviewInput) MarshalJSON() ([]byte, error) {
+	type alias struct {
+		Version             int               `json:"version"`
+		WorkingDir          string            `json:"working_directory,omitempty"`
+		Background          *ReviewBackground `json:"background,omitempty"`
+		ScriptCaptureStatus string            `json:"script_capture_status,omitempty"`
+		Scripts             []ReviewScript    `json:"script_files,omitempty"`
+		Tool                string            `json:"tool_name"`
+		Arguments           json.RawMessage   `json:"arguments"`
+		EvidenceTruncated   bool              `json:"evidence_truncated,omitempty"`
+	}
+	a := alias(in)
+	if a.ScriptCaptureStatus == "not_applicable" {
+		a.ScriptCaptureStatus = ""
+		a.Scripts = nil
+	}
+	return json.Marshal(a)
+}
+
 type reviewContextKey struct{}
 type reviewEnvironment struct {
 	workingDir string
@@ -96,10 +121,5 @@ func BuildReviewInput(ctx context.Context, tool string, arguments json.RawMessag
 		}
 	}
 	in.Scripts, in.ScriptCaptureStatus = captureScripts(in.WorkingDir, tool, arguments)
-	// Pojun 兼容：没有捕获到脚本时（not_applicable）不输出该字段——审阅信封
-	// 保持 5 键（version/working_directory/background/tool_name/arguments）。
-	if in.ScriptCaptureStatus == "not_applicable" {
-		in.ScriptCaptureStatus = ""
-	}
 	return in, nil
 }

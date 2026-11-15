@@ -10,10 +10,11 @@ import (
 )
 
 func TestDeferredSystem_NoGlobal(t *testing.T) {
-	// No global MCP names → plain single-segment system, no cache boundary.
+	// No global MCP names → plain single-segment system with cache boundary 1
+	// (审查修复：稳定 system 前缀也走显式缓存路径，不再返回 0)。
 	sys, boundary := deferredSystem("SYS", DeferredInfo{})
-	if len(sys) != 1 || sys[0] != "SYS" || boundary != 0 {
-		t.Fatalf("expected [SYS],0 — got %v,%d", sys, boundary)
+	if len(sys) != 1 || sys[0] != "SYS" || boundary != 1 {
+		t.Fatalf("expected [SYS],1 — got %v,%d", sys, boundary)
 	}
 }
 

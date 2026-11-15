@@ -519,7 +519,7 @@ func jsonResult(v any) (actool.Result, error) {
 
 func (t *ToolSet) graphOverview() actool.CoreTool {
 	return t.readExpTool("graph_overview",
-		"(探索链路图)探索态势蒸馏摘要：资产计数、无接口的站点、frontier、发现、hints(人类/主 agent 的战略提示，生成意图时须纳入)。规划时先调它。",
+		"(探索链路图)探索态势蒸馏摘要：资产计数、无接口的站点、frontier、发现、hints(人类/主 agent 的战略提示，生成意图时须纳入)。规划唤醒已随轮附带本摘要——仅当本轮未附带、或需要刷新变化时才调用。",
 		obj(map[string]any{}),
 		func(context.Context, json.RawMessage) (actool.Result, error) {
 			return jsonResult(t.graphOverviewData())
@@ -816,7 +816,13 @@ func (t *ToolSet) workerOverviewData() map[string]any {
 		recentFacts = append(recentFacts, m)
 	}
 	out["recent_facts"] = recentFacts
-	out["tools"] = hosttools.Summary()
+	// 工具清单去重（外部审查验证发现）：system 里的 hosttools.SummaryText()
+	// 已带可用工具+用途；worker 态势里再放全量 Summary() 是同一信息第二份。
+	// 这里只保留缺失项——worker 需要知道「哪些手段没有」来换路线，不需要
+	// 再看一遍已有清单。
+	if missing := hosttools.MissingNames(); len(missing) > 0 {
+		out["missing_tools"] = missing
+	}
 	if t.as != nil && t.taskID > 0 {
 		if hosts, err := t.as.HostsByTaskWithSources(t.taskID); err == nil {
 			out["host_count"] = len(hosts)

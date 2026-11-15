@@ -188,7 +188,7 @@ func TestCompressSplitsOversizedBlock(t *testing.T) {
 	}
 	g := &coldGraph{}
 	b := block{Members: members}
-	bodies, err := c.compressChunked(context.Background(), g, b, nodeByID)
+	bodies, err := c.compressChunked(context.Background(), g, b, nodeByID, nil)
 	if err != nil {
 		t.Fatalf("compressChunked 失败: %v", err)
 	}
@@ -278,7 +278,7 @@ func TestCompressChunkedRunsSubBlocksConcurrently(t *testing.T) {
 		ms[i] = int64(i + 1)
 		nodeByID[ms[i]] = &db.Node{ID: ms[i], Kind: db.KindFact, State: "confirmed"}
 	}
-	bodies, err := c.compressChunked(context.Background(), &coldGraph{}, block{Members: ms}, nodeByID)
+	bodies, err := c.compressChunked(context.Background(), &coldGraph{}, block{Members: ms}, nodeByID, nil)
 	if err != nil {
 		t.Fatalf("compressChunked 失败: %v", err)
 	}

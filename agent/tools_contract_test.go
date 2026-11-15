@@ -164,10 +164,22 @@ func TestContractScriptParsesOpenAPI3(t *testing.T) {
 	if e2["auth_required"] != false {
 		t.Error("操作级 security:[] 表示公开，不应标为需鉴权")
 	}
-	// 需要鉴权的接口要单独列出（越权挖掘的入口）。
-	authEps, _ := out["auth_endpoints"].([]any)
-	if len(authEps) != 4 {
-		t.Errorf("需鉴权接口应为 4 条（/api/health 不需要），实际 %d", len(authEps))
+	// 需要鉴权的接口用索引列出（审查修复：完整对象→索引引用，去重减体积）。
+	authIdx, _ := out["auth_endpoint_indices"].([]any)
+	if len(authIdx) != 4 {
+		t.Errorf("需鉴权接口索引应为 4 项（/api/health 不需要），实际 %d", len(authIdx))
+	}
+	eps2, _ := out["endpoints"].([]any)
+	for _, i := range authIdx {
+		idx, ok := i.(float64)
+		if !ok || idx < 0 || int(idx) >= len(eps2) {
+			t.Errorf("鉴权索引越界: %v", i)
+			continue
+		}
+		e := eps2[int(idx)].(map[string]any)
+		if e["auth_required"] != true {
+			t.Errorf("索引 %v 指向的接口未标 auth_required", i)
+		}
 	}
 	// 鉴权方式要列出来。
 	schemes, _ := out["auth_schemes"].([]any)
@@ -499,7 +511,7 @@ func TestApiContractEndToEndWithRealServer(t *testing.T) {
 	if n, _ := parsed["api_count"].(float64); n != 5 {
 		t.Errorf("接口数应为 5，实际 %v", parsed["api_count"])
 	}
-	authEps, _ := parsed["auth_endpoints"].([]any)
+	authEps, _ := parsed["auth_endpoint_indices"].([]any)
 	if len(authEps) != 4 {
 		t.Errorf("需鉴权接口应为 4 条，实际 %d", len(authEps))
 	}

@@ -24,7 +24,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/artex/db")
+	"github.com/Autumn-27/artex/db"
+)
 
 // ctxKey is the unexported context key type to avoid collisions.
 type ctxKey int
@@ -409,7 +410,7 @@ const (
 //     放行只是让这一次调用继续，事后仍可在「拦截审批」页看到记录并追认。
 //     真要防破坏，防线应该放在「规则命中 → 模型裁决」这一层，而不是
 //     「人没及时点确认」这一层。
-//   - 人工审批超时 180s：3 分钟，够操作员回来看一眼。
+//   - 人工审批超时 180s：3 分钟；无人值守 allow 兜底（可配置）。
 const (
 	// defaultJudgeTimeoutSecs 是模型裁决的墙钟上限。
 	//
@@ -417,9 +418,12 @@ const (
 	// 长命令——几百到上千字符的 shell 脚本——明显更久），而且正文为空时会
 	// 升预算重试（32768 → 65536），重试要挤在同一个超时窗口内。时间给短了
 	// 就会把「模型其实能裁决」误判成超时失败。
-	defaultJudgeTimeoutSecs      = 180
-	defaultJudgeRetryCount       = 3
-	defaultJudgeFailAction       = "ask"
+	defaultJudgeTimeoutSecs = 180
+	defaultJudgeRetryCount  = 3
+	defaultJudgeFailAction  = "ask"
+	// ask 审批兜底：Pojun 语义（180s 后 allow）——与 Autopilot 无人值守方向
+	// 一致（deny 会让自主任务在每次 ask 上静默死亡）；界面可改 llm_judge_ask_
+	// timeout_action 切回 fail-closed。
 	defaultJudgeAskTimeoutSecs   = 180
 	defaultJudgeAskTimeoutAction = "allow"
 	defaultJudgeConfidence       = 0.55
