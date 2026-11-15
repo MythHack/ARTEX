@@ -2580,7 +2580,21 @@ func (t *ToolSet) setConstraints() actool.CoreTool {
 				Constraints    []constraintItem `json:"constraints"`
 				constraintItem                  // 单条模式:顶层 text/type
 			}
+			// RuoJi6 #143：模型偶尔把 constraints 传成 JSON 字符串（内嵌数组的序列化文本）
+			// 而不是数组。先按原样解；失败或为空时尝试字符串→数组二段解，兼容这一常见
+			// 形态，避免整轮工具调用直接报 invalid tool input。
 			_ = json.Unmarshal(in, &a)
+			if len(a.Constraints) == 0 {
+				var probe struct {
+					Constraints json.RawMessage `json:"constraints"`
+				}
+				if err := json.Unmarshal(in, &probe); err == nil && len(probe.Constraints) > 0 {
+					var s string
+					if json.Unmarshal(probe.Constraints, &s) == nil && strings.HasPrefix(strings.TrimSpace(s), "[") {
+						_ = json.Unmarshal([]byte(s), &a.Constraints)
+					}
+				}
+			}
 			batch := len(a.Constraints) > 0
 			items := a.Constraints
 			if !batch {

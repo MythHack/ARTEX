@@ -5,6 +5,7 @@ package server
 import (
 	"embed"
 	"io/fs"
+	"mime"
 	"net/http"
 	"path"
 	"strings"
@@ -26,6 +27,8 @@ func (s *Server) webuiHandler() http.Handler {
 	if err != nil {
 		panic(err)
 	}
+	// RuoJi6 #158：启动时把内容寻址静态资源预压缩进内存（约省 70% 首屏体积）。
+	webuiGzip.compressAll(root, "webui")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
 		if p == "" {
@@ -64,6 +67,18 @@ func serveFileIfExists(w http.ResponseWriter, r *http.Request, fsys fs.FS, name 
 	_ = f.Close()
 	if statErr != nil || st.IsDir() {
 		return false
+	}
+	// #158：命中预压缩副本且客户端接受 gzip 时直接回内存字节。
+	if gz := webuiGzip.get("webui", name); gz != nil && strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Del("Content-Length")
+		ctype := mime.TypeByExtension(path.Ext(name))
+		if ctype != "" {
+			w.Header().Set("Content-Type", ctype)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(gz)
+		return true
 	}
 	http.ServeFileFS(w, r, fsys, name)
 	return true
