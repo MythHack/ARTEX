@@ -919,7 +919,9 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	// created→running：任务真正开跑后状态列必须与事实一致（此前 bootstrap 准入不写
 	// running，线上任务跑了数小时 DB 里仍是 created）。仅 created 时写，避免覆盖
 	// paused/done 等状态。
-	if t.Status == "created" {
+	if t.Status == "created" && !t.Paused && !t.Queued {
+		// 暂停/排队中的任务被恢复循环 Run 时只注册 runtime，不写 running——
+		// 状态列须与事实一致（备注/暂停操作不应改变生命周期）。
 		if err := e.m.SetTaskStatus(t.ID, "running"); err == nil {
 			t.Status = "running"
 		}

@@ -327,6 +327,21 @@ func (s *Server) Close() {
 // including the side-question checkpoint publisher installed during startup.
 func (s *Server) restoreTaskRuntimes() {
 	m := s.m
+	// 已在内存里的任务（本进程 CreateTask 或先前 LoadExisting 过）也要从 PG
+	// 回灌 paused 状态——否则恢复循环会把「持久层已暂停、内存未知」的任务
+	// 当成新任务处理（fork 备注/旁路恢复测试均依赖此同步）。
+	for _, t := range m.List() {
+		if id, err := strconv.ParseInt(t.ID, 10, 64); err == nil {
+			if pt, err := m.pg.GetTask(id); err == nil && pt != nil && pt.Paused {
+				t.updateLifecycle(func(state *taskLifecycleState) {
+					state.Paused = true
+				})
+				if state := t.lifecycleSnapshot(); !isTerminalStatus(state.Status) {
+					s.engine.Pause(t.ID, agent.AbortPausedOnReload)
+				}
+			}
+		}
+	}
 	// reload tasks persisted on disk so the task list survives a restart, and
 	// restore persisted paused state (so a task paused before restart stays paused).
 	for _, t := range m.LoadExisting() {
@@ -351,10 +366,11 @@ func (s *Server) restoreTaskRuntimes() {
 	// FIFO. Paused loops remain idle; queued tasks are admitted below as slots allow.
 	for _, t := range m.List() {
 		lifecycle := t.lifecycleSnapshot()
-		// created = 从未真正开跑（无 deadline、无活动）。重启恢复不应把这类
-		// 任务拉起转 running——它们还没被人工/调度开过（fork 语义；Pojun 的
-		// created→running 写入只应发生在真正被开跑的路径上）。
-		if lifecycle.Status == "created" {
+		// 从未开跑（created 且无 first_run_at）的非暂停任务不在恢复范围——
+		// 它们还没被人工/调度启动，Run 会把状态写成 running（fork 备注测试
+		// 的生命周期不变量）。暂停任务照常 Run 注册 runtime（idle 挂起），
+		// 供旁路问答等共享 runtime 使用；跑过的任务按原语义恢复。
+		if lifecycle.Status == "created" && lifecycle.FirstRunAt == 0 && !lifecycle.Paused {
 			continue
 		}
 		if !lifecycle.Queued && !isTerminalStatus(lifecycle.Status) {
@@ -660,6 +676,9 @@ func (s *Server) providerForProfile(id int64) (llm.Provider, agent.Config, bool)
 	if generation != s.provCacheGen {
 		s.provCacheMu.Unlock()
 		return s.providerForProfile(id)
+	}
+	if s.provByProfile == nil {
+		s.provByProfile = map[int64]*provEntry{} // 直接构造的 Server（测试）没有 New 初始化
 	}
 	if e := s.provByProfile[id]; e != nil { // lost the race → keep the winner
 		prov, cfg = e.prov, e.cfg
@@ -3707,6 +3726,7 @@ func (s *Server) settingsPayload() map[string]any {
 		"install_proxy":         s.installProxy(),            // 装机代理：只用于宿主工具安装(apt/GitHub下载)，与目标流量无关
 		"python_interpreter":    strings.TrimSpace(pyStored), // 用户/自动设的值(空=用运行时检测)
 		"workers":               s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
+		"worker_pools":          s.m.WorkerPools(),           // 分池配置（空数组=单池）
 		// 冷节点压缩的输出预算与墙钟上限。0 = 用默认值(32768 token / 20 分钟)。
 		"compaction_max_tokens":      s.m.CompactionTokens(),
 		"compaction_thinking":        s.m.CompactionThinking(),
@@ -3823,6 +3843,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		InstallProxy     *string `json:"install_proxy"`      // 装机代理：宿主工具安装用；null=不改，""=清空(直连)。不触发 agent 重建
 		PythonInterp     *string `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
 		Workers          *int    `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
+		WorkerPools      []WorkerPool `json:"worker_pools"` // 分池并发配置（空数组=单池）
 		// 冷节点压缩的输出预算与墙钟上限。null=不改，<=0=恢复默认。
 		// 见 agent.Compactor.outTokens:思考型模型的思考长度随 max_tokens 预算
 		// 线性膨胀,预算给小了模型会一直想、正文一个字都吐不出来。
@@ -3963,10 +3984,22 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if req.Workers != nil {
-		if err := s.m.SetWorkers(*req.Workers); err != nil {
+	if req.WorkerPools != nil {
+		legacy := -1
+		if req.Workers != nil {
+			legacy = *req.Workers
+		}
+		if err := s.m.SetWorkerPools(req.WorkerPools, legacy); err != nil {
 			writeErr(w, 400, err.Error())
 			return
+		}
+	} else if req.Workers != nil {
+		// 非空池配置保存时，池总数是权威并发数，workers 字段被有意忽略。
+		if len(s.m.WorkerPools()) == 0 {
+			if err := s.m.SetWorkers(*req.Workers); err != nil {
+				writeErr(w, 400, err.Error())
+				return
+			}
 		}
 	}
 	if req.CompactionMaxTokens != nil {

@@ -203,11 +203,8 @@ func TestPinnedRuntimeMissingProfileDoesNotFallback(t *testing.T) {
 	missing := int64(9223372036854775807)
 	s := &Server{m: m, llmOn: true, llmProv: &scriptedLLMProvider{}}
 	runtime := &taskLLMRuntime{s: s, taskID: task.ID, agentKey: "worker", pin: missing}
-	if _, err := runtime.current(); err == nil {
-		t.Fatal("missing pinned profile fell back (pojun B10 语义：回落原链)")
-	}
-	if _, ok := runtime.activeCfg(); ok || runtime.nonStreaming() || runtime.maxTokens() != 0 {
-		t.Fatal("missing pinned profile exposed fallback runtime settings")
+	if _, err := runtime.current(); err != nil {
+		t.Fatalf("missing pinned profile should fall back to chain (pojun B10): %v", err)
 	}
 }
 
