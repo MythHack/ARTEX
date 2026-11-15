@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/internal/httpidentity"
+
 	"github.com/miekg/dns"
 	"github.com/projectdiscovery/dnsx/libs/dnsx"
 )
@@ -229,7 +231,7 @@ func (e *Engine) doHTTP(id int64, rawURL string) {
 	if err != nil {
 		return
 	}
-	req.Header.Set("User-Agent", "pojun-enrich/1.0")
+	httpidentity.Apply(req)
 	resp, err := e.client.Do(req)
 	if err != nil {
 		return

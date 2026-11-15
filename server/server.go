@@ -72,6 +72,12 @@ type Server struct {
 	// 并留证。绑定端口无需特权（1024+），不经 hostd。
 	listeners *listener.Manager
 
+	// mcpStoreOverride replaces the PostgreSQL-backed MCP server store in tests.
+	mcpStoreOverride mcpStore
+	// mcpCreateMu serializes MCP task creation so a token's quota check and the
+	// creation it guards cannot interleave with another request on the same token.
+	mcpCreateMu sync.Mutex
+
 	// concMu serializes concurrency-cap decisions (admission + reconcile) so a
 	// scheduler tick and an HTTP settings change / task creation can't both count
 	// free slots off the same snapshot and over-promote past the limit.
@@ -1049,6 +1055,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mcp", s.pgSaveMCP)
 	mux.HandleFunc("DELETE /api/mcp/{id}", s.pgDeleteMCP)
 	mux.HandleFunc("GET /api/mcp/{id}/tools", s.pgMCPTools)
+	// MCP 服务端(ARTEX 对外暴露的 /mcp)：开关、访问令牌、调用审计
+	mux.HandleFunc("GET /api/mcp-server/settings", s.getMCPServerSettings)
+	mux.HandleFunc("PUT /api/mcp-server/settings", s.putMCPServerSettings)
+	mux.HandleFunc("GET /api/mcp-server/tokens", s.listMCPServerTokens)
+	mux.HandleFunc("POST /api/mcp-server/tokens", s.createMCPServerToken)
+	mux.HandleFunc("POST /api/mcp-server/tokens/{id}/revoke", s.revokeMCPServerToken)
+	mux.HandleFunc("DELETE /api/mcp-server/tokens/{id}", s.deleteMCPServerToken)
+	mux.HandleFunc("GET /api/mcp-server/audit", s.listMCPServerAudit)
 	mux.HandleFunc("POST /api/mcp/{id}/refresh", s.pgRefreshMCP)
 	// 资产同步 — ScopeSentry 数据源
 	mux.HandleFunc("GET /api/sync/scopesentry/status", s.syncSSStatus)
@@ -1121,7 +1135,13 @@ func (s *Server) Handler() http.Handler {
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.Handle("/", s.webuiHandler())
-	return s.requireBasicAuth(root)
+	// /mcp sits outside the Basic Auth gate on purpose: an external MCP client has
+	// one Authorization header and it carries the access token, so it could never
+	// satisfy both. The endpoint authenticates with access tokens only.
+	top := http.NewServeMux()
+	top.HandleFunc(mcpEndpointPath, s.serveMCP)
+	top.Handle("/", s.requireBasicAuth(root))
+	return top
 }
 
 // --- handlers ---
@@ -1133,6 +1153,26 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
+
+func (s *Server) resolvedTaskStatusFromSnapshot(t *Task, lifecycle taskLifecycleState) string {
+	switch {
+	case isTerminalStatus(lifecycle.Status):
+		return lifecycle.Status
+	case lifecycle.Queued:
+		return "queued"
+	case lifecycle.Paused || s.engine.IsPaused(t.ID):
+		return "paused"
+	case t.llmStateSnapshot().FailoverState == "chain_exhausted" && s.engine.Started(t.ID):
+		// LLM readiness is an execution dependency, not lifecycle state. Keeping
+		// an exhausted task running lets the user edit/reset its chain directly.
+		return "running"
+	case s.engine.ReadyFor(t) && s.engine.Started(t.ID):
+		return "running"
+	default:
+		return "created"
+	}
+}
+
 
 // version 是鉴权的版本查询（更新卡轮询换装完成用）。
 func (s *Server) version(w http.ResponseWriter, r *http.Request) {
@@ -1725,26 +1765,37 @@ func truncateReply(s string) string {
 }
 
 type createTaskReq struct {
-	Name                 string   `json:"name,omitempty"` // 可选任务名称;省略/空=未命名
-	CategoryID           *int64   `json:"category_id,omitempty"`
-	Description          string   `json:"description"`
-	Goal                 string   `json:"goal"`
-	LLMProfileID         *int64   `json:"llm_profile_id,omitempty"`  // 指定运行本任务的 LLM 配置;省略/null=用激活配置
-	LLMProfileIDs        []int64  `json:"llm_profile_ids,omitempty"` // 有序任务级配置链;第一项初始生效
-	SourceTaskIDs        []string `json:"source_task_ids,omitempty"` // 仅直接、只读继承的来源任务
-	CompanyIDs           []int64  `json:"company_ids,omitempty"`     // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
-	NoResultSeconds      int      `json:"no_result_seconds"`
-	NoResultMinFindings  int      `json:"no_result_min_findings"`
-	NoResultMinSeverity  string   `json:"no_result_min_severity"`
-	TimeoutSeconds       int      `json:"timeout_seconds"`             // 任务级超时(秒);0/省略=不限时
-	PlanHeartbeatSeconds int      `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
-	SeedFirstIntent      *bool    `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
-	CoverageEnabled      *bool    `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
+	Name                string   `json:"name,omitempty"` // 可选任务名称;省略/空=未命名
+	CategoryID          *int64   `json:"category_id,omitempty"`
+	Description         string   `json:"description"`
+	Goal                string   `json:"goal"`
+	LLMProfileID        *int64   `json:"llm_profile_id,omitempty"`  // 指定运行本任务的 LLM 配置;省略/null=用激活配置
+	LLMProfileIDs       []int64  `json:"llm_profile_ids,omitempty"` // 有序任务级配置链;第一项初始生效
+	SourceTaskIDs       []string `json:"source_task_ids,omitempty"` // 仅直接、只读继承的来源任务
+	CompanyIDs          []int64  `json:"company_ids,omitempty"`     // 关联企业范围并快照关联当前企业资产;不复制资产或强制生成意图
+	NoResultSeconds     int      `json:"no_result_seconds"`
+	NoResultMinFindings int      `json:"no_result_min_findings"`
+	NoResultMinSeverity string   `json:"no_result_min_severity"`
+	// 建任务时顺带建计划（RuoJi6 v0.3.30）：start_immediately=false 则建后不入队。
+	Schedule             *scheduleRequest `json:"schedule"`
+	WorkerCount          int              `json:"worker_count"`
+	Remark               string           `json:"remark"`
+	TimeoutSeconds       int              `json:"timeout_seconds"`             // 任务级超时(秒);0/省略=不限时
+	PlanHeartbeatSeconds int              `json:"plan_heartbeat_seconds"`      // planner 心跳触发间隔(秒);0/省略=默认600(10min);下限=默认=600,低于自动抬到600
+	SeedFirstIntent      *bool            `json:"seed_first_intent,omitempty"` // 创建时直接下发一条种子意图(内容=描述+目标),让 worker 免等首轮 planner 直接开跑;省略/null=默认关闭,走标准先规划再执行。显式传 true 才开(CTF 常一 work 解决时可省掉开跑前的 planner 轮)。
+	CoverageEnabled      *bool            `json:"coverage_enabled,omitempty"`  // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
 	// AuthConfig 任务级目标登录凭据（v0.4.8）：worker 先登录再测；创建后可用
 	// POST /api/tasks/{id}/auth-check 做一次登录自检。密码/TOTP 只进 DB。
 	AuthConfig *db.TaskAuthConfig `json:"auth_config,omitempty"`
+}
+
+// taskCreateError is a rejected task creation: an HTTP-style status plus a
+// message that is safe to show to the caller.
+type taskCreateError struct {
+	Status int
+	Msg    string
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
@@ -1753,61 +1804,85 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
+	t, cerr := s.createTaskFromRequest(req)
+	if cerr != nil {
+		writeErr(w, cerr.Status, cerr.Msg)
+		return
+	}
+	writeJSON(w, 201, taskDTO(t, s.resolvedTaskStatus(t)))
+}
+
+// createTaskFromRequest validates a creation request, stores the task and
+// launches it. It is the single creation path shared by POST /api/tasks and the
+// MCP spawn_task tool, so both apply identical validation.
+func (s *Server) createTaskFromRequest(req createTaskReq) (*Task, *taskCreateError) {
 	if strings.TrimSpace(req.Description) == "" {
 		req.Description = "未命名任务"
-	}
-	if err := db.NormalizeNoResultOptions(&db.TaskCreateOptions{NoResultSeconds: req.NoResultSeconds, NoResultMinFindings: req.NoResultMinFindings, NoResultMinSeverity: req.NoResultMinSeverity}); err != nil {
-		writeErr(w, 400, err.Error())
-		return
 	}
 	if len(req.LLMProfileIDs) == 0 && req.LLMProfileID != nil {
 		req.LLMProfileIDs = []int64{*req.LLMProfileID}
 	}
 	if err := s.validateTaskProfileIDs(req.LLMProfileIDs); err != nil {
-		writeErr(w, 400, err.Error())
-		return
+		return nil, &taskCreateError{400, err.Error()}
+	}
+	if err := db.NormalizeNoResultOptions(&db.TaskCreateOptions{NoResultSeconds: req.NoResultSeconds, NoResultMinFindings: req.NoResultMinFindings, NoResultMinSeverity: req.NoResultMinSeverity}); err != nil {
+		return nil, &taskCreateError{400, err.Error()}
 	}
 	if req.TimeoutSeconds < 0 {
 		req.TimeoutSeconds = 0
 	}
 	if len(req.SourceTaskIDs) > db.MaxTaskSourceCount {
-		writeErr(w, 400, fmt.Sprintf("关联任务最多选择 %d 个", db.MaxTaskSourceCount))
-		return
+		return nil, &taskCreateError{400, fmt.Sprintf("关联任务最多选择 %d 个", db.MaxTaskSourceCount)}
 	}
 	sourceIDs := make([]int64, 0, len(req.SourceTaskIDs))
 	seenSources := map[int64]bool{}
 	for _, raw := range req.SourceTaskIDs {
 		id, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 		if err != nil || id <= 0 || seenSources[id] {
-			writeErr(w, 400, "关联任务 id 无效或重复")
-			return
+			return nil, &taskCreateError{400, "关联任务 id 无效或重复"}
 		}
 		if _, ok := s.m.Task(strconv.FormatInt(id, 10)); !ok {
-			writeErr(w, 400, fmt.Sprintf("关联任务 #%d 不存在", id))
-			return
+			return nil, &taskCreateError{400, fmt.Sprintf("关联任务 #%d 不存在", id)}
 		}
 		seenSources[id] = true
 		sourceIDs = append(sourceIDs, id)
 	}
 	companyIDs, err := db.NormalizeTaskCompanyIDs(req.CompanyIDs)
 	if err != nil {
-		writeErr(w, 400, fmt.Sprintf("关联企业无效：最多选择 %d 个有效企业", db.MaxTaskCompanyCount))
-		return
+		return nil, &taskCreateError{400, fmt.Sprintf("关联企业无效：最多选择 %d 个有效企业", db.MaxTaskCompanyCount)}
 	}
 	req.CompanyIDs = companyIDs
 	interceptRules, err := buildTaskInterceptRules(req.InterceptRules)
 	if err != nil {
-		writeErr(w, 400, "任务级拦截规则无效："+err.Error())
-		return
+		return nil, &taskCreateError{400, "任务级拦截规则无效：" + err.Error()}
 	}
 	if req.AuthConfig != nil {
 		if err := req.AuthConfig.Normalize(); err != nil {
-			writeErr(w, 400, "登录配置无效："+err.Error())
-			return
+			return nil, &taskCreateError{400, "登录配置无效：" + err.Error()}
 		}
+	}
+	var schedule *db.TaskScheduleInput
+	if req.Schedule != nil {
+		input := s.scheduleInput(*req.Schedule, nil)
+		input.TaskIDs = nil
+		if err := db.ValidateTaskScheduleInput(input); err != nil {
+			return nil, &taskCreateError{400, err.Error()}
+		}
+		schedule = &input
+	}
+	remark, err := normalizeRemark(req.Remark)
+	if err != nil {
+		return nil, &taskCreateError{400, err.Error()}
+	}
+	if req.WorkerCount < 0 {
+		return nil, &taskCreateError{400, "Worker 运行数量不能为负数"}
+	}
+	if req.WorkerCount > db.MaxTaskWorkerCount {
+		return nil, &taskCreateError{400, fmt.Sprintf("Worker 运行数量最多 %d", db.MaxTaskWorkerCount)}
 	}
 	t, err := s.m.CreateTaskWithOptions(req.Description, req.Goal, db.TaskCreateOptions{
 		Name: strings.TrimSpace(req.Name), CategoryID: req.CategoryID,
+		Remark: remark, WorkerCount: req.WorkerCount,
 		SourceTaskIDs: sourceIDs, CompanyIDs: req.CompanyIDs, LLMProfileIDs: req.LLMProfileIDs,
 		TimeoutSeconds: req.TimeoutSeconds, PlanHeartbeatSeconds: req.PlanHeartbeatSeconds,
 		CoverageEnabled: req.CoverageEnabled,
@@ -1816,21 +1891,22 @@ func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrTaskCategoryInvalid) || errors.Is(err, db.ErrTaskCategoryNotFound) {
-			writeErr(w, 400, "任务分类不存在或无效")
-			return
+			return nil, &taskCreateError{400, "任务分类不存在或无效"}
 		}
 		if errors.Is(err, db.ErrTaskCompanyIDsInvalid) || errors.Is(err, db.ErrTaskCompanyNotFound) {
-			writeErr(w, 400, "关联企业不存在或无效")
-			return
+			return nil, &taskCreateError{400, "关联企业不存在或无效"}
 		}
-		writeErr(w, 500, err.Error())
-		return
+		return nil, &taskCreateError{500, err.Error()}
 	}
 	log.Printf("[task] 新建任务 #%s «%s» 目标: %s", t.ID, req.Description, req.Goal)
 	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
 	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。
-	s.launchTask(t, req.Description+" "+req.Goal, req.SeedFirstIntent != nil && *req.SeedFirstIntent)
-	writeJSON(w, 201, taskDTO(t, s.resolvedTaskStatus(t)))
+	if schedule == nil || schedule.StartImmediately {
+		s.launchTask(t, req.Description+" "+req.Goal, req.SeedFirstIntent != nil && *req.SeedFirstIntent)
+	} else {
+		s.engine.Pause(t.ID, agent.AbortPausedBySchedule)
+	}
+	return t, nil
 }
 
 func (s *Server) validateTaskProfileIDs(ids []int64) error {
@@ -3834,16 +3910,16 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		LLMRecord         *bool `json:"llm_record"` // LLM 录制开关（默认关）；即时生效，无需重建 agent
 		// Web search. WebSearchEnabled/Backend toggle the tool + backend; BraveKey/TavilyKey
 		// are optional — omit (null) to leave a stored key untouched, send "" to clear.
-		WebSearchEnabled *bool   `json:"web_search_enabled"`
-		WebSearchBackend *string `json:"web_search_backend"`
-		BraveKey         *string `json:"brave_search_api_key"`
-		TavilyKey        *string `json:"tavily_search_api_key"`
-		WebSearchProxy   *string `json:"web_search_proxy"`   // 独立出口代理(http/https/socks5)；null=不改，""=清空
-		GlobalProxy      *string `json:"global_proxy"`       // 全局出口代理(http/https/socks5)；null=不改，""=清空(直连)
-		InstallProxy     *string `json:"install_proxy"`      // 装机代理：宿主工具安装用；null=不改，""=清空(直连)。不触发 agent 重建
-		PythonInterp     *string `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
-		Workers          *int    `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
-		WorkerPools      []WorkerPool `json:"worker_pools"` // 分池并发配置（空数组=单池）
+		WebSearchEnabled *bool        `json:"web_search_enabled"`
+		WebSearchBackend *string      `json:"web_search_backend"`
+		BraveKey         *string      `json:"brave_search_api_key"`
+		TavilyKey        *string      `json:"tavily_search_api_key"`
+		WebSearchProxy   *string      `json:"web_search_proxy"`   // 独立出口代理(http/https/socks5)；null=不改，""=清空
+		GlobalProxy      *string      `json:"global_proxy"`       // 全局出口代理(http/https/socks5)；null=不改，""=清空(直连)
+		InstallProxy     *string      `json:"install_proxy"`      // 装机代理：宿主工具安装用；null=不改，""=清空(直连)。不触发 agent 重建
+		PythonInterp     *string      `json:"python_interpreter"` // 自定义脚本工具的 python 解释器路径
+		Workers          *int         `json:"workers"`            // 并发工作 agent 数(>0)；对之后启动的任务生效
+		WorkerPools      []WorkerPool `json:"worker_pools"`       // 分池并发配置（空数组=单池）
 		// 冷节点压缩的输出预算与墙钟上限。null=不改，<=0=恢复默认。
 		// 见 agent.Compactor.outTokens:思考型模型的思考长度随 max_tokens 预算
 		// 线性膨胀,预算给小了模型会一直想、正文一个字都吐不出来。

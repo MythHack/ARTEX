@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Autumn-27/artex/internal/httpidentity"
 )
 
 // Repo 是发布源。
@@ -163,7 +165,7 @@ func fetchRelease(ctx context.Context, c *http.Client, apiURL, what string) (*Re
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "artex-selfupdate")
+	httpidentity.Apply(req)
 
 	resp, err := c.Do(req)
 	if err != nil {
