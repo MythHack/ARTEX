@@ -202,9 +202,9 @@ func TestPinnedRuntimeMissingProfileDoesNotFallback(t *testing.T) {
 	}
 	missing := int64(9223372036854775807)
 	s := &Server{m: m, llmOn: true, llmProv: &scriptedLLMProvider{}}
-	runtime := &taskLLMRuntime{s: s, taskID: task.ID, agentKey: "worker", pinProfileID: &missing}
+	runtime := &taskLLMRuntime{s: s, taskID: task.ID, agentKey: "worker", pin: missing}
 	if _, err := runtime.current(); err == nil {
-		t.Fatal("missing pinned profile silently fell back")
+		t.Fatal("missing pinned profile fell back (pojun B10 语义：回落原链)")
 	}
 	if _, ok := runtime.activeCfg(); ok || runtime.nonStreaming() || runtime.maxTokens() != 0 {
 		t.Fatal("missing pinned profile exposed fallback runtime settings")
@@ -237,7 +237,7 @@ func TestPinnedRuntimeQuotaDoesNotAdvanceTaskFailover(t *testing.T) {
 	provider := &scriptedLLMProvider{err: errors.New("insufficient_quota")}
 	s := &Server{m: m, provByProfile: map[int64]*provEntry{profileID: {prov: provider, cfg: agent.Config{}}}}
 	id := profileID
-	runtime := &taskLLMRuntime{s: s, taskID: task.ID, agentKey: "worker", pinProfileID: &id}
+	runtime := &taskLLMRuntime{s: s, taskID: task.ID, agentKey: "worker", pin: id}
 	if _, _, _, err := runtime.Complete(context.Background(), llm.CompletionRequest{}); err == nil {
 		t.Fatal("pinned quota error unexpectedly succeeded")
 	}

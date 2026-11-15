@@ -87,6 +87,11 @@ const ftsSchema = `CREATE VIRTUAL TABLE IF NOT EXISTS ex_fts USING fts5(
 );`
 
 const (
+	// exchangeMetaCols is the metadata projection shared by Meta/Search/Page/query.
+	// The underlying columns are nullable in SQLite (legacy rows, partial writers);
+	// COALESCE keeps them safe to scan into plain Go strings/ints.
+	exchangeMetaCols           = `id,COALESCE(ts,0),COALESCE(host,''),COALESCE(method,''),COALESCE(url_template,''),COALESCE(url,''),COALESCE(status,0),COALESCE(content_type,''),COALESCE(resp_len,0),COALESCE(path,'')`
+	exchangeMetaColsWithReqLen = `id,COALESCE(ts,0),COALESCE(host,''),COALESCE(method,''),COALESCE(url_template,''),COALESCE(url,''),COALESCE(status,0),COALESCE(content_type,''),COALESCE(req_len,0),COALESCE(resp_len,0),COALESCE(path,'')`
 	// maxInlineBody is the cutoff between a body stored inline (SQLite column) and
 	// one spilled to the content-addressed blob store.
 	maxInlineBody = 256 * 1024
@@ -169,9 +174,7 @@ type Traffic struct {
 	// through (nil = dial targets directly). Both the intercepted and the
 	// transparent-passthrough paths honor it (go-mitmproxy's getUpstreamConn),
 	// so no host escapes it. Hot-swappable at runtime via SetUpstreamProxy.
-	upstream        atomic.Pointer[url.URL]
-	upstreamMu      sync.RWMutex
-	upstreamFailure func(error)
+	upstream atomic.Pointer[url.URL]
 	// pool 非空时代理池优先于 upstream:per-request 按策略轮换上游,
 	// 失败(RequestError)计数熔断。见 pool.go。
 	pool atomic.Pointer[selector]
@@ -330,6 +333,7 @@ func (t *Traffic) ProxyPoolEnabled() bool {
 	return t.pool.Load() != nil
 }
 
+
 // SetUpstreamProxy points every captured request at a global egress proxy
 // (http/https/socks5, optional user:pass in the URL). An empty raw string clears
 // it, restoring direct dialing. The change is atomic and takes effect on the next
@@ -346,27 +350,6 @@ func (t *Traffic) SetUpstreamProxy(raw string) error {
 	}
 	t.upstream.Store(u)
 	return nil
-}
-
-// SetUpstreamFailureHandler observes failures from the configured global
-// upstream proxy. The callback is intentionally best-effort and must not block
-// the MITM request path.
-func (t *Traffic) SetUpstreamFailureHandler(fn func(error)) {
-	t.upstreamMu.Lock()
-	t.upstreamFailure = fn
-	t.upstreamMu.Unlock()
-}
-
-func (t *Traffic) reportUpstreamFailure(err error) {
-	if err == nil || t.upstream.Load() == nil {
-		return
-	}
-	t.upstreamMu.RLock()
-	fn := t.upstreamFailure
-	t.upstreamMu.RUnlock()
-	if fn != nil {
-		go fn(err)
-	}
 }
 
 // ValidateProxyURL parses and checks a proxy URL (http/https/socks5, optional
@@ -503,12 +486,7 @@ func (s *sink) RequestError(f *mproxy.Flow, err error) {
 			pool.ReportResult(raws, false)
 		}
 	}
-	s.t.reportUpstreamFailure(err)
 	s.t.maybePassthrough(f, err)
-}
-
-func (s *sink) HTTPConnectError(_ *mproxy.Flow, err error) {
-	s.t.reportUpstreamFailure(err)
 }
 
 // maybePassthrough marks a host to be tunneled transparently on the next
@@ -876,7 +854,7 @@ func (t *Traffic) Search(host string, page, size int) ([]ExchangeMeta, error) {
 	if size <= 0 || size > 500 {
 		size = 100
 	}
-	q := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path FROM exchanges`
+	q := `SELECT ` + exchangeMetaCols + ` FROM exchanges`
 	args := []any{}
 	if host != "" {
 		q += ` WHERE host=?`
@@ -925,18 +903,45 @@ func ftsQuote(s string) string {
 // newest-first by timestamp.
 type PageQuery struct {
 	Host    string   // host substring
-	Hosts   []string // task-scoped host candidates (exact host or host:port)
-	Method  string   // exact method (case-insensitive)
-	Query   string   // broad search box: metadata columns OR captured text
-	Body    string   // content box: captured request/response text only (full-text)
-	Path    string   // url_template substring — the vulnerability's path
-	Status  string   // exact code ("404") or class bucket ("4xx")
-	RespMin int64    // minimum resp_len, or -1 when unset
-	RespMax int64    // maximum resp_len, or -1 when unset
-	Sort    string   // ts | status | resp_len (default ts)
-	Order   string   // asc | desc (default desc)
+	Hosts   []string // task-scoped host candidates (exact host or host:port) — fork task evidence scope
+	Method  string // exact method (case-insensitive)
+	Query   string // broad search box: metadata columns OR captured text
+	Body    string // content box: captured request/response text only (full-text)
+	Path    string // url_template substring — the vulnerability's path
+	Status  string // exact code ("404") or class bucket ("4xx")
+	RespMin int64  // minimum resp_len, or -1 when unset
+	RespMax int64  // maximum resp_len, or -1 when unset
+	Sort    string // ts | status | resp_len (default ts)
+	Order   string // asc | desc (default desc)
 }
 
+// sortColumns whitelists the columns Page may order by, so the caller-supplied
+// Sort can never reach the SQL as anything but one of these fixed names.
+var sortColumns = map[string]string{"ts": "ts", "status": "status", "resp_len": "resp_len"}
+
+// statusFilter turns a status token into a SQL condition: an exact code ("404")
+// matches that status, an "Nxx" class ("4xx") matches the whole hundreds band.
+// ok is false for an empty or unrecognized token.
+func statusFilter(s string) (cond string, args []any, ok bool) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return "", nil, false
+	}
+	if len(s) == 3 && s[0] >= '1' && s[0] <= '5' && s[1] == 'x' && s[2] == 'x' {
+		base := int(s[0]-'0') * 100
+		return "status>=? AND status<?", []any{base, base + 100}, true
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		return "status=?", []any{n}, true
+	}
+	return "", nil, false
+}
+
+// Page returns one page of exchange metadata for the traffic list, filtered by
+// the criteria in f (all optional, combined with AND) and ordered by the
+// requested column. Query is the broad search box (metadata columns OR, when the
+// term is long enough for the trigram index, captured request/response text);
+// Body narrows to exchanges whose captured text matches, via that same index.
 // hostScopeClause limits traffic to the hosts attached to a task. Captures
 // store the request Host header, which may include a port, while asset rows
 // store normalized hostnames; match both forms without widening to subdomains.
@@ -971,33 +976,6 @@ func hostScopeClause(hosts []string) (string, []any) {
 	return "(" + strings.Join(conditions, " OR ") + ")", args
 }
 
-// sortColumns whitelists the columns Page may order by, so the caller-supplied
-// Sort can never reach the SQL as anything but one of these fixed names.
-var sortColumns = map[string]string{"ts": "ts", "status": "status", "resp_len": "resp_len"}
-
-// statusFilter turns a status token into a SQL condition: an exact code ("404")
-// matches that status, an "Nxx" class ("4xx") matches the whole hundreds band.
-// ok is false for an empty or unrecognized token.
-func statusFilter(s string) (cond string, args []any, ok bool) {
-	s = strings.ToLower(strings.TrimSpace(s))
-	if s == "" {
-		return "", nil, false
-	}
-	if len(s) == 3 && s[0] >= '1' && s[0] <= '5' && s[1] == 'x' && s[2] == 'x' {
-		base := int(s[0]-'0') * 100
-		return "status>=? AND status<?", []any{base, base + 100}, true
-	}
-	if n, err := strconv.Atoi(s); err == nil {
-		return "status=?", []any{n}, true
-	}
-	return "", nil, false
-}
-
-// Page returns one page of exchange metadata for the traffic list, filtered by
-// the criteria in f (all optional, combined with AND) and ordered by the
-// requested column. Query is the broad search box (metadata columns OR, when the
-// term is long enough for the trigram index, captured request/response text);
-// Body narrows to exchanges whose captured text matches, via that same index.
 // Also returns the total number of rows matching the filter (for the UI's
 // pagination). Bodies are never included in the rows.
 func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total int, err error) {
@@ -1041,13 +1019,13 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	}
 	if s := strings.TrimSpace(f.Query); s != "" {
 		like := "%" + s + "%"
-		const meta = "id LIKE ? OR host LIKE ? OR url LIKE ? OR url_template LIKE ? OR method LIKE ? OR content_type LIKE ? OR CAST(status AS TEXT) LIKE ?"
+		const meta = "host LIKE ? OR url LIKE ? OR url_template LIKE ? OR method LIKE ? OR content_type LIKE ? OR CAST(status AS TEXT) LIKE ?"
 		// Metadata match OR full-text match: one search box, widest recall. Terms
 		// too short for trigram silently fall back to metadata only.
 		if cond, arg, ok := t.ftsFilter(s); ok {
-			add("(("+meta+") OR "+cond+")", like, like, like, like, like, like, like, arg)
+			add("(("+meta+") OR "+cond+")", like, like, like, like, like, like, arg)
 		} else {
-			add("("+meta+")", like, like, like, like, like, like, like)
+			add("("+meta+")", like, like, like, like, like, like)
 		}
 	}
 	// Body is the dedicated content box: it only searches captured request/response
@@ -1072,7 +1050,7 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	}
 	// id embeds capture timestamp + sequence, so a trailing id DESC makes the order
 	// total and pagination stable even when the sort column has many ties.
-	sel := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path FROM exchanges` +
+	sel := `SELECT ` + exchangeMetaCols + ` FROM exchanges` +
 		where + ` ORDER BY ` + col + ` ` + dir + `, id DESC LIMIT ? OFFSET ?`
 	qargs := append(append([]any{}, args...), size, page*size)
 	rs, err := t.db.Query(sel, qargs...)
@@ -1099,7 +1077,7 @@ func (t *Traffic) Get(id string) (req, resp string, err error) {
 	var reqBody, respBody []byte
 	var reqBlob, respBlob sql.NullString
 	var reqLen, respLen int
-	err = t.db.QueryRow(`SELECT b.req_head,b.req_body,b.req_blob,b.resp_head,b.resp_body,b.resp_blob,e.req_len,e.resp_len
+	err = t.db.QueryRow(`SELECT b.req_head,b.req_body,b.req_blob,b.resp_head,b.resp_body,b.resp_blob,COALESCE(e.req_len,0),COALESCE(e.resp_len,0)
 FROM exchange_bodies b JOIN exchanges e ON e.id=b.id WHERE b.id=?`, id).
 		Scan(&reqHead, &reqBody, &reqBlob, &respHead, &respBody, &respBlob, &reqLen, &respLen)
 	if err == nil {
@@ -1110,7 +1088,7 @@ FROM exchange_bodies b JOIN exchanges e ON e.id=b.id WHERE b.id=?`, id).
 	}
 
 	var rel string
-	if err = t.db.QueryRow(`SELECT path FROM exchanges WHERE id=?`, id).Scan(&rel); err != nil {
+	if err = t.db.QueryRow(`SELECT COALESCE(path,'') FROM exchanges WHERE id=?`, id).Scan(&rel); err != nil {
 		return "", "", err
 	}
 	if strings.TrimSpace(rel) == "" {
@@ -1144,31 +1122,7 @@ type HostCount struct {
 // Hosts returns distinct recorded hosts with exchange counts, most recent
 // activity first — powers the page's target picker.
 func (t *Traffic) Hosts() ([]HostCount, error) {
-	rows, err := t.db.Query(`SELECT host, COUNT(*) AS n, MAX(ts) AS last FROM exchanges GROUP BY host ORDER BY last DESC`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []HostCount
-	for rows.Next() {
-		var h HostCount
-		var last int64
-		if err := rows.Scan(&h.Host, &h.Count, &last); err != nil {
-			return nil, err
-		}
-		out = append(out, h)
-	}
-	return out, rows.Err()
-}
-
-// HostsForScope returns recorded hosts that belong to a task's normalized host
-// scope. It is used by the task HTTP history picker and never mutates traffic.
-func (t *Traffic) HostsForScope(scope []string) ([]HostCount, error) {
-	cond, args := hostScopeClause(scope)
-	if cond == "" {
-		return []HostCount{}, nil
-	}
-	rows, err := t.db.Query(`SELECT host, COUNT(*) AS n, MAX(ts) AS last FROM exchanges WHERE `+cond+` GROUP BY host ORDER BY last DESC`, args...)
+	rows, err := t.db.Query(`SELECT COALESCE(host,''), COUNT(*) AS n, COALESCE(MAX(ts),0) AS last FROM exchanges GROUP BY host ORDER BY last DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1378,7 +1332,7 @@ func (t *Traffic) deleteWhere(tx *sql.Tx, where string, args ...any) (int64, err
 // already gone can still have an orphaned directory, and deleting the host should
 // take that with it.
 func (t *Traffic) hostTrees(where string, args ...any) ([]string, error) {
-	rows, err := t.db.Query(`SELECT DISTINCT host FROM exchanges WHERE `+where, args...)
+	rows, err := t.db.Query(`SELECT DISTINCT COALESCE(host,'') FROM exchanges WHERE `+where, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2075,7 +2029,7 @@ func (t *Traffic) query(host, contains, bodyContains string, page, limit int) ([
 	if page < 0 {
 		page = 0
 	}
-	q := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path FROM exchanges WHERE 1=1`
+	q := `SELECT ` + exchangeMetaCols + ` FROM exchanges WHERE 1=1`
 	args := []any{}
 	if host != "" {
 		hostName, port, err := normalizeSearchHost(host)
@@ -2227,10 +2181,10 @@ func (t *Traffic) Tools() []actool.CoreTool {
 
 	get := actool.Build(actool.Spec{
 		Name:        "traffic_get",
-		Description: "按 id 取一条已抓流量的请求/响应原文（过大会截断）。id 与流量页面展示的流量 ID、traffic_search 返回的 id 相同，须完整保留，不是列表行号。已知 ID 时直接读取，无需重新搜索或请求目标。",
+		Description: "按 id 取一条已抓流量的请求/响应原文（过大会截断）。配合 traffic_search 用，避免重复 curl。",
 		Schema: map[string]any{
 			"type":       "object",
-			"properties": map[string]any{"id": map[string]any{"type": "string", "description": "流量页面或 traffic_search 返回的完整流量 ID（不是列表行号）"}},
+			"properties": map[string]any{"id": map[string]any{"type": "string", "description": "traffic_search 返回的 id"}},
 			"required":   []any{"id"},
 		},
 		ReadOnly:    ro,
@@ -2298,4 +2252,28 @@ func clip(s string, max int) string {
 		return s
 	}
 	return s[:max] + fmt.Sprintf("\n... [截断，共 %d 字节；完整在流量文件树] ...", len(s))
+}
+
+// HostsForScope returns recorded hosts that belong to a task's normalized host
+// scope. It is used by the task HTTP history picker and never mutates traffic.
+func (t *Traffic) HostsForScope(scope []string) ([]HostCount, error) {
+	cond, args := hostScopeClause(scope)
+	if cond == "" {
+		return []HostCount{}, nil
+	}
+	rows, err := t.db.Query(`SELECT host, COUNT(*) AS n, MAX(ts) AS last FROM exchanges WHERE `+cond+` GROUP BY host ORDER BY last DESC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []HostCount
+	for rows.Next() {
+		var h HostCount
+		var last int64
+		if err := rows.Scan(&h.Host, &h.Count, &last); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
 }

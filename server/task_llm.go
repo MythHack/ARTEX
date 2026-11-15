@@ -12,12 +12,6 @@ import (
 	"strings"
 	"time"
 
-<<<<<<< ours
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/llmrec"
-=======
->>>>>>> theirs
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
 	"github.com/Autumn-27/artex/agent"
@@ -33,7 +27,6 @@ type taskAgentBundle struct {
 	pl             *agent.Planner
 	wk             *agent.Worker
 	main           *agent.MainAgent
-	pinnedWorkers  map[int64]*agent.Worker
 }
 
 type llmAuditProfile struct {
@@ -55,12 +48,6 @@ type llmActivityMetadata struct {
 }
 
 type taskLLMRuntime struct {
-<<<<<<< ours
-	s            *Server
-	taskID       string
-	agentKey     string
-	pinProfileID *int64
-=======
 	s        *Server
 	taskID   string
 	agentKey string
@@ -68,7 +55,6 @@ type taskLLMRuntime struct {
 	// 覆盖 agent 绑定和任务链；profile 失效（被删/无 key）时落回原链继续跑。
 	// 不推进任务链的故障转移状态（绑定语义），也不参与链轮转。
 	pin int64
->>>>>>> theirs
 }
 
 type taskLLMError struct {
@@ -128,25 +114,6 @@ type taskLLMStreamHooks struct {
 	withoutThinking func() (llm.Provider, error)
 }
 
-<<<<<<< ours
-// current resolves the provider this role runs on. Pinned workers use only their
-// assigned profile; legacy task agents use Agent 绑定 → 任务 LLM 配置链 → 全局/环境配置.
-// 绑定优先于任务链：某个角色被显式指定了模型，就一直跑在那个模型上；绑定不存在或
-// 构建失败时才降级到任务链，任务链为空时再降级到全局配置。
-// 返回的 profile id 只有走任务链时才非零 —— streamTaskLLM 以此判断额度错误是否
-// 应该推进任务的故障转移状态（绑定/全局路径不改任务链状态，沿用既有语义）。
-func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
-	if r.pinProfileID != nil {
-		// Pinned worker runtimes are exclusive: resolve their profile before
-		// touching bindings or the task failover state. A missing or invalid
-		// profile is an error, never an invitation to use another model.
-		prov, cfg, ok := r.s.providerForProfile(*r.pinProfileID)
-		if !ok {
-			return taskLLMSelection{}, fmt.Errorf("LLM profile #%d is missing or invalid", *r.pinProfileID)
-		}
-		t, _ := r.s.m.Task(r.taskID)
-		return taskLLMSelection{task: t, provider: prov, retry: cfg.Retry}, nil
-=======
 // current resolves the provider this role runs on, by precedence:
 // pinned profile (B10) → Agent 绑定 → 任务 LLM 配置链 → 全局/环境配置。
 // pin 与绑定同语义：额度错误不推进任务链。绑定优先于任务链：某个角色被显式指定了模型，
@@ -160,7 +127,6 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 		if prov, cfg, ok := r.s.providerForProfile(r.pin); ok {
 			return taskLLMSelection{provider: prov, retry: cfg.Retry}, nil
 		}
->>>>>>> theirs
 	}
 	taskNum, err := parseTaskID(r.taskID)
 	if err != nil {
@@ -206,17 +172,11 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 // the caller. If failover switches profiles, the change takes effect on the next
 // agent run (a fresh Session is built per run in captureRun).
 func (r *taskLLMRuntime) activeCfg() (agent.Config, bool) {
-<<<<<<< ours
-	if r.pinProfileID != nil {
-		_, cfg, ok := r.s.providerForProfile(*r.pinProfileID)
-		return cfg, ok
-=======
 	// pin 方（B10）：与 current() 的 pin 分支一致，优先取钉住的配置。
 	if r.pin > 0 {
 		if _, cfg, ok := r.s.providerForProfile(r.pin); ok {
 			return cfg, true
 		}
->>>>>>> theirs
 	}
 	taskNum, err := parseTaskID(r.taskID)
 	if err != nil {
@@ -631,12 +591,6 @@ func isRetryableStreamError(err error) bool {
 // CompactionWindow mirrors current()'s precedence so the context window always
 // matches the provider the role will actually stream on.
 func (r *taskLLMRuntime) CompactionWindow() int {
-	if r.pinProfileID != nil {
-		if _, cfg, ok := r.s.providerForProfile(*r.pinProfileID); ok {
-			return cfg.CompactionWindow()
-		}
-		return (agent.Config{}).CompactionWindow()
-	}
 	if _, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
 		return cfg.CompactionWindow()
 	}
@@ -763,7 +717,6 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetNoaEnabled(s.m.NoaCompactionEnabled)     // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	wk.SetRunTimeout(time.Duration(s.agentRunSeconds("worker")) * time.Second)
 	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
-	wk.SetProxyProvider(s.m.ProxyAddr)
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
 	// 任务级登录凭据（v0.4.8）：装配时读一次并注入 worker system prompt。
@@ -791,15 +744,9 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	// t.Guard 在 manager.go 建任务时必然创建。
 	pl.SetAttributions(t.Guard.AttributionStats)
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
-	pl.SetProxyProvider(s.m.ProxyAddr)
 	pl.SetWebSearch(s.webSearchFor("planner"))
 	pl.SetConstraintInject(s.constraintInjectPlanner) // 操作约束注入 planner(可配置,默认开)
 	// cold-digest §7: 冷节点后台压缩。引擎经权威解析器实际驱动的就是这套 per-task planner
-<<<<<<< ours
-	// (agentsForTask),Compactor 必须接在这里。走任务路由的 planner provider(§4:与 agent
-	compactor := agent.NewCompactor(plannerRuntime, "task-router")
-	compactor.SetBodyBudget(s.m.CompactionMaxTokens, s.m.CompactionThinking)
-=======
 	// (agentsForTask),Compactor 必须接在这里。压缩用 Complete 一次性生成 body。
 	// B10:压缩器默认与 planner 共用 runtime(同任务链,历史行为);设置了
 	// compactor_profile_id 时给压缩器一个钉住该 profile 的独立 runtime——机械压缩
@@ -814,7 +761,6 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	// 压缩的输出预算与墙钟上限从设置读(0=用包内默认)。这两个值必须给足:
 	// 思考型模型的思考长度随 max_tokens 预算线性膨胀,预算给小了模型会一直想、
 	// 正文一个字都吐不出来(实测 1500/2048/4096/8192 全部正文为空)。
->>>>>>> theirs
 	compactor.SetOutputTokens(s.m.CompactionTokens())
 	if secs := s.m.CompactionTimeout(); secs > 0 {
 		compactor.SetMaxDuration(time.Duration(secs) * time.Second)
@@ -829,59 +775,15 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetMaxTokens(mainRuntime.maxTokens)
 	main.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	main.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
-	main.SetProxyProvider(s.m.ProxyAddr)
 	main.SetWebSearch(s.webSearchFor("mainagent"))
 	main.SetSteerWork(s.engine.SteerWork)          // steer_work：人对运行中 work 实时纠偏
 	main.SetAttributions(t.Guard.AttributionStats) // Guard 归因样本（B6）→ 概览（人在环路同享打回计数与实物）
 	bundle := &taskAgentBundle{
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
-		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main, pinnedWorkers: map[int64]*agent.Worker{},
+		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main,
 	}
 	s.taskAgents[t.ID] = bundle
 	return bundle
-}
-
-func (s *Server) workerForTaskSlot(t *Task, slot WorkerSlot) (*agent.Worker, error) {
-	if slot.ProfileID <= 0 {
-		return nil, errors.New("worker slot is not pinned")
-	}
-	_, cfg, ok := s.providerForProfile(slot.ProfileID)
-	if !ok {
-		return nil, fmt.Errorf("LLM profile #%d is missing or invalid", slot.ProfileID)
-	}
-	s.taskAgentMu.Lock()
-	bundle := s.taskAgents[t.ID]
-	s.taskAgentMu.Unlock()
-	if bundle == nil {
-		bundle = s.agentsForTask(t)
-	}
-	s.taskAgentMu.Lock()
-	defer s.taskAgentMu.Unlock()
-	if current := s.taskAgents[t.ID]; current != nil {
-		bundle = current
-	}
-	if bundle.pinnedWorkers == nil {
-		bundle.pinnedWorkers = make(map[int64]*agent.Worker)
-	}
-	if worker := bundle.pinnedWorkers[slot.ProfileID]; worker != nil {
-		return worker, nil
-	}
-	id := slot.ProfileID
-	runtime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "worker", pinProfileID: &id}
-	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
-	worker := agent.NewWorker(runtime, cfg.Model, s.m.dir, tx, runtime.CompactionWindow(), s.agentMaxTurns("worker"))
-	worker.SetFindingRecorder(s.evidenceStore())
-	worker.SetCompactionWindowResolver(runtime.CompactionWindow)
-	worker.SetNonStreaming(runtime.nonStreaming)
-	worker.SetMaxTokens(runtime.maxTokens)
-	worker.SetNoaEnabled(s.m.NoaCompactionEnabled)
-	worker.SetRunTimeout(time.Duration(s.agentRunSeconds("worker")) * time.Second)
-	worker.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
-	worker.SetProxyProvider(s.m.ProxyAddr)
-	worker.SetWebSearch(s.webSearchFor("worker"))
-	worker.SetConstraintInject(s.constraintInjectWorker)
-	bundle.pinnedWorkers[id] = worker
-	return worker, nil
 }
 
 func (s *Server) syncTaskLLMState(pt *db.Task) {

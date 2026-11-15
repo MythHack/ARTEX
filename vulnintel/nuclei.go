@@ -106,7 +106,6 @@ func verifyTemplates(dir string) error {
 	return nil
 }
 
-<<<<<<< ours
 func hasAnyYAMLTemplate(dir string) bool {
 	if _, err := os.Stat(filepath.Join(dir, ".templates-index")); err == nil {
 		return true

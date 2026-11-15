@@ -134,7 +134,7 @@ func TestNoResultCheckpointAndRevival(t *testing.T) {
 			provider := &scriptedLLMProvider{err: errors.New("test final planner unavailable")}
 			planner := agent.NewPlanner(provider, "test", t.TempDir(), nil, 0, 1)
 			e.SetAuthoritativeAgentResolver(func(*Task) (*agent.Planner, *agent.Worker) { return planner, &agent.Worker{} })
-			e.settleTask(t.Context(), task, db.StopReasonNoResult)
+			e.settleTaskWithReason(t.Context(), task, db.StopReasonNoResult, "无成果止损")
 			state := task.lifecycleSnapshot()
 			if state.Status != "timeout" || state.StopReason != db.StopReasonNoResult || !e.isSettling(task.ID) {
 				t.Fatalf("settled: %+v", state)
@@ -146,7 +146,7 @@ func TestNoResultCheckpointAndRevival(t *testing.T) {
 			if err := m.applyTaskAdmission(task.ID, "timeout", "running", false, "resume", false, nil); err != nil {
 				t.Fatal(err)
 			}
-			e.resetTimeoutRevival(task.ID)
+			e.resetTerminalRevival(task.ID)
 			state = task.lifecycleSnapshot()
 			if state.NoResultCheckedAt != 0 || state.StopReason != "" || state.NoResultBaseSeconds != state.ActiveRunSeconds || noResultRemaining(60, state, time.Now().Unix()) != time.Minute || e.isSettling(task.ID) {
 				t.Fatalf("revived: %+v", state)

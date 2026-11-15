@@ -12,17 +12,11 @@ import (
 	"sync/atomic"
 	"time"
 
-<<<<<<< ours
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
-=======
->>>>>>> theirs
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -956,7 +950,6 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	}
 }
 
-<<<<<<< ours
 // workerSlotsForTask preserves an explicit task concurrency override. Tasks
 // using the global default inherit its model pools and their pinned profiles.
 func workerSlotsForTask(t *Task, pools []WorkerPool, global int) ([]WorkerSlot, error) {
@@ -976,7 +969,6 @@ func workerCountForTask(t *Task, global int) int {
 	return global
 }
 
-=======
 // startAutopilotLoopOnce 保证全进程只有一个看门狗协程（首个任务 Run 时启动）。
 var startAutopilotLoopOnce sync.Once
 
@@ -999,7 +991,6 @@ var startAutopilotLoopOnce sync.Once
 //
 //	15 分钟的由来：实测一轮规划（1M 上下文 + 几十次工具调用）3–5 分钟，15 分钟
 //	给三倍冗余；同时保证「上游卡死」最多浪费 15 分钟就自愈，不会无限期哑火。
->>>>>>> theirs
 const plannerRoundTimeout = 15 * time.Minute
 
 var plannerRoundTimeoutOverride time.Duration
@@ -1237,18 +1228,13 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		}
 		e.stampFirstRun(t) // 首次真正规划 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 		e.touch(t.ID)
-<<<<<<< ours
 		emit := func(r db.Activity) {
 			if r.Kind == "tool_result" && r.IsError && e.proxyFailure != nil && isGlobalProxyDialFailure(errors.New(r.Detail+" "+r.Summary)) {
 				e.proxyFailure(t.ID, errors.New(r.Detail+" "+r.Summary))
 			}
 			e.emitActivity(t, r)
 		}
-		ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
-=======
-		emit := func(r db.Activity) { e.emitActivity(t, r) }
 		ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false, "") // cancellable by Pause; 带任务 deadline
->>>>>>> theirs
 		if ectx.Err() != nil || e.IsDeleting(t.ID) {
 			return
 		}
@@ -1462,18 +1448,13 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	hasChatMessage := message != ""
 	e.stampFirstRun(t) // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 	e.touch(t.ID)
-<<<<<<< ours
 	emit := func(r db.Activity) {
 		if r.Kind == "tool_result" && r.IsError && e.proxyFailure != nil && isGlobalProxyDialFailure(errors.New(r.Detail+" "+r.Summary)) {
 			e.proxyFailure(t.ID, errors.New(r.Detail+" "+r.Summary))
 		}
 		e.emitActivity(t, r)
 	}
-	ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
-=======
-	emit := func(r db.Activity) { e.emitActivity(t, r) }
 	ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false, "") // cancellable by Pause; 带任务 deadline
->>>>>>> theirs
 	if ectx.Err() != nil || e.IsDeleting(t.ID) {
 		if err := transitionIntentState(t.Store, intent.ID, "running", "open"); err != nil {
 			log.Printf("[worker %s] task %s 意图 #%d 领取后回退失败: %v", name, t.ID, intent.ID, err)

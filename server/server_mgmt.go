@@ -28,8 +28,7 @@ import (
 	"github.com/Autumn-27/artex/llmhttp"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/skill"
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db")
+)
 
 // validSkillName checks the agentskills.io name constraints, widened so a skill can
 // also be named in Chinese (or any other script): ASCII must stay lowercase
@@ -681,8 +680,6 @@ func (s *Server) pgResetTaskTimeoutWrapup(w http.ResponseWriter, r *http.Request
 	}
 	writeJSON(w, 200, map[string]any{
 		"ok":                                    true,
-		"task_timeout_wrapup_default":           agent.TaskTimeoutWrapupDefault(a.Key),
-		"task_timeout_wrapup_max_turns_default": agent.WrapupTurnsDefault(a.Key),
 	})
 }
 

@@ -14,13 +14,8 @@
 package hosttools
 
 import (
-<<<<<<< ours
-	"context"
-=======
->>>>>>> theirs
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -170,10 +165,6 @@ type Tool struct {
 	// 现有那些有 CLI 的（wafw00f/netexec/semgrep/pwntools）继续走 pipx：
 	// 隔离环境不会污染系统 Python，正是我们想要的。
 	PipLibrary bool `json:"-"`
-
-	// PyModule 是 PipLibrary=true 时 Python 里真实的 import 模块名（如 paho-mqtt → paho.mqtt）。
-	// 为空时默认用 Name。
-	PyModule string `json:"-"`
 }
 
 // catalog 常用渗透工具目录。安装方式优先选「自包含」的:能用 GitHub Release
@@ -421,32 +412,6 @@ python3 -m pip install --break-system-packages "git+https://github.com/Pennyw0rt
 	//     一键安装会退化成源码编译，很多机器上直接失败）。
 
 	// MQTT：broker 枚举、主题订阅/发布。
-<<<<<<< ours
-	{Name: "gmqtt", Purpose: "MQTT 协议客户端(枚举/订阅/发布 broker)", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "gmqtt", PyModule: "gmqtt"},
-	{Name: "paho-mqtt", Purpose: "MQTT 协议客户端(脚本用,支持 v3.1.1/v5)", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "paho-mqtt", PyModule: "paho.mqtt"},
-	// 消息队列：AMQP / Kafka / 多协议。
-	{Name: "pika", Purpose: "RabbitMQ AMQP 协议客户端(读队列/投递)", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "pika", PyModule: "pika"},
-	{Name: "amqpstorm", Purpose: "RabbitMQ 管理 API + AMQP 客户端", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "amqpstorm", PyModule: "amqpstorm"},
-	{Name: "confluent-kafka", Purpose: "Kafka 协议客户端(读 topic/消费组)", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "confluent-kafka", PyModule: "confluent_kafka"},
-	{Name: "kombu", Purpose: "多协议消息队列客户端(AMQP/Redis/SQS 等)", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "kombu", PyModule: "kombu"},
-	// 数据库协议：直连枚举与数据读取。
-	{Name: "pymongo", Purpose: "MongoDB 协议客户端(枚举库/读集合)", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "pymongo", PyModule: "pymongo"},
-	{Name: "pymysql", Purpose: "MySQL 协议客户端(枚举库/读表)", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "pymysql", PyModule: "pymysql"},
-	{Name: "psycopg2-binary", Purpose: "PostgreSQL 协议客户端(枚举库/读表)", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "psycopg2-binary", PyModule: "psycopg2"},
-	{Name: "redis-py", Bin: "redis", Purpose: "Redis 协议客户端(枚举键/读配置)", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "redis", PyModule: "redis"},
-	// SOAP/XML 中间件：Apache CXF 之类 SOAP 服务的协议客户端。
-	{Name: "zeep", Purpose: "SOAP 客户端(枚举 WSDL/调用接口,适用 CXF 等)", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "zeep", PyModule: "zeep"},
-	// 代码托管平台：GitLab 的 REST/GraphQL API。
-	{Name: "python-gitlab", Purpose: "GitLab API 客户端(枚举项目/用户/流水线)", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "python-gitlab", PyModule: "gitlab"},
-	// 网络设备：交换机/路由器的 CLI 交互与自动化。
-	{Name: "netmiko", Purpose: "网络设备 CLI 交互(多厂商 SSH)", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "netmiko", PyModule: "netmiko"},
-	{Name: "napalm", Purpose: "多厂商网络设备自动化(取配置/路由表)", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "napalm", PyModule: "napalm"},
-	// 日志/SIEM：Splunk 的 REST API。
-	{Name: "splunk-sdk", Purpose: "Splunk API 客户端(检索/枚举)", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "splunk-sdk", PyModule: "splunklib"},
-
-	{Name: "msfconsole", Purpose: "Metasploit 框架(exploit/encoder)", Kind: KindManual, Category: CatExploit,
-		Install: "官方安装包(需交互): https://docs.rapid7.com/metasploit/installing-the-metasploit-framework/"},
-=======
 	{Name: "gmqtt", Purpose: "MQTT 协议客户端(枚举/订阅/发布 broker)", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "gmqtt", Detect: "python:gmqtt"},
 	{Name: "paho-mqtt", Purpose: "MQTT 协议客户端(脚本用,支持 v3.1.1/v5)", Kind: KindPip, Category: CatMiddleware, PipLibrary: true, Pip: "paho-mqtt", Detect: "python:paho"},
 	// 消息队列：AMQP / Kafka / 多协议。
@@ -475,7 +440,6 @@ curl -fsSL --retry 3 --connect-timeout 15 --max-time 600 -o /tmp/msfinstall http
 chmod +x /tmp/msfinstall
 /tmp/msfinstall
 `},
->>>>>>> theirs
 }
 
 // normalize 补齐派生字段并做路径探测。
@@ -530,179 +494,6 @@ func Lookup(id string) (Tool, bool) {
 	return Tool{}, false
 }
 
-<<<<<<< ours
-var (
-	resolverMu        sync.RWMutex
-	pythonResolverFn  func() string
-	dataDirResolverFn func() string
-
-	pyProbeMu      sync.Mutex
-	pyProbeInterp  string
-	pyProbePathEnv string
-	pyProbeAt      time.Time
-	pyProbeMods    map[string]bool
-)
-
-const pyProbeTTL = 5 * time.Second
-
-// SetPythonResolver 注入宿主配置的 Python 解释器解析函数（如 settings.python_interpreter）。
-func SetPythonResolver(fn func() string) {
-	resolverMu.Lock()
-	pythonResolverFn = fn
-	resolverMu.Unlock()
-	InvalidateProbeCache()
-}
-
-// SetDataDirResolver 注入工作数据目录解析函数（用于探测 <dataDir>/tools/SecLists 等本地语料目录）。
-func SetDataDirResolver(fn func() string) {
-	resolverMu.Lock()
-	dataDirResolverFn = fn
-	resolverMu.Unlock()
-}
-
-// InvalidateProbeCache 清空 Python 模块探测缓存（保存 python_interpreter 或装包完成后可立即刷新）。
-func InvalidateProbeCache() {
-	pyProbeMu.Lock()
-	pyProbeAt = time.Time{}
-	pyProbeMods = nil
-	pyProbeMu.Unlock()
-}
-
-func isWindowsStoreStub(p string) bool {
-	return runtime.GOOS == "windows" && strings.Contains(strings.ToLower(p), `\microsoft\windowsapps\`)
-}
-
-func resolvePythonBinary() string {
-	resolverMu.RLock()
-	fn := pythonResolverFn
-	resolverMu.RUnlock()
-	if fn != nil {
-		if p := strings.TrimSpace(fn()); p != "" && !isWindowsStoreStub(p) {
-			if st, err := os.Stat(p); err == nil && !st.IsDir() {
-				return p
-			}
-			if lp, err := exec.LookPath(p); err == nil && !isWindowsStoreStub(lp) {
-				return lp
-			}
-		}
-	}
-	// Windows 上优先 python（python3 常指向 Microsoft Store 假桩），Unix 优先 python3。
-	cands := []string{"python3", "python"}
-	if runtime.GOOS == "windows" {
-		cands = []string{"python", "python3"}
-	}
-	for _, c := range cands {
-		if lp, err := exec.LookPath(c); err == nil && !isWindowsStoreStub(lp) {
-			return lp
-		}
-	}
-	return ""
-}
-
-func (t Tool) pyModuleName() string {
-	if t.PyModule != "" {
-		return t.PyModule
-	}
-	return strings.ReplaceAll(t.Name, "-", "_")
-}
-
-func probePythonModules() map[string]bool {
-	pyBin := resolvePythonBinary()
-	if pyBin == "" {
-		return nil
-	}
-	pathEnv := os.Getenv("PATH")
-	pyProbeMu.Lock()
-	if pyProbeMods != nil && pyProbeInterp == pyBin && pyProbePathEnv == pathEnv && time.Since(pyProbeAt) < pyProbeTTL {
-		res := pyProbeMods
-		pyProbeMu.Unlock()
-		return res
-	}
-	pyProbeMu.Unlock()
-
-	var mods []string
-	seen := map[string]bool{}
-	for _, t := range catalog {
-		if !t.PipLibrary {
-			continue
-		}
-		m := t.pyModuleName()
-		if m != "" && !seen[m] {
-			seen[m] = true
-			mods = append(mods, m)
-		}
-	}
-	if len(mods) == 0 {
-		return nil
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	script := "import importlib.util, sys\nfor m in sys.argv[1:]:\n    try:\n        ok = importlib.util.find_spec(m) is not None\n    except Exception:\n        ok = False\n    if ok:\n        print(m)\n"
-	args := append([]string{"-c", script}, mods...)
-	cmd := exec.CommandContext(ctx, pyBin, args...)
-	out, err := cmd.Output()
-	found := make(map[string]bool, len(mods))
-	if err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			m := strings.TrimSpace(line)
-			if m != "" {
-				found[m] = true
-			}
-		}
-	}
-
-	pyProbeMu.Lock()
-	pyProbeInterp = pyBin
-	pyProbePathEnv = pathEnv
-	pyProbeAt = time.Now()
-	pyProbeMods = found
-	pyProbeMu.Unlock()
-	return found
-}
-
-// ResolveSecListsDir 返回本机已存在的 SecLists 字典根目录（含 Discovery 子目录），不存在返回 ""。
-func ResolveSecListsDir() string {
-	var cands []string
-	resolverMu.RLock()
-	dfn := dataDirResolverFn
-	resolverMu.RUnlock()
-	if dfn != nil {
-		if d := strings.TrimSpace(dfn()); d != "" {
-			cands = append(cands,
-				filepath.Join(d, "tools", "SecLists"),
-				filepath.Join(d, "SecLists"),
-				filepath.Join(filepath.Dir(d), "SecLists"),
-			)
-		}
-	}
-	if runtime.GOOS != "windows" {
-		cands = append(cands, "/opt/SecLists", "/usr/share/seclists")
-	}
-	for _, dir := range cands {
-		if st, err := os.Stat(filepath.Join(dir, "Discovery")); err == nil && st.IsDir() {
-			return dir
-		}
-	}
-	return ""
-}
-
-// AvailableInPath 该工具当前是否已就绪（CLI 查 PATH，PipLibrary 查 Python import，seclists 查字典目录）。
-func (t Tool) AvailableInPath() bool {
-	n := normalize(t)
-	if n.Name == "seclists" {
-		return ResolveSecListsDir() != ""
-	}
-	if n.PipLibrary {
-		mods := probePythonModules()
-		return mods[n.pyModuleName()]
-	}
-	if n.Bin == "python3" {
-		return resolvePythonBinary() != ""
-	}
-	p, err := exec.LookPath(n.Bin)
-	return err == nil && !isWindowsStoreStub(p)
-=======
 // AvailableInPath 该工具当前是否可用。优先按 Detect 判定（文件/目录/Python 模块），
 // 否则走 PATH 查找。
 //
@@ -726,7 +517,6 @@ func (t Tool) AvailableInPath() bool {
 	}
 	_, err := exec.LookPath(t.Bin)
 	return err == nil
->>>>>>> theirs
 }
 
 // detectOne 判断单个探测表达式（path:/dir:/python:）。
@@ -777,47 +567,12 @@ func pythonModuleAvailable(module string) bool {
 
 // Inventory 探测全部目录项(顺序与 catalog 一致)。
 func Inventory() []Tool {
-	var pyMods map[string]bool
-	pyModsLoaded := false
-	secListsDir := ResolveSecListsDir()
-	pyBin := resolvePythonBinary()
-
 	out := make([]Tool, len(catalog))
 	for i, t := range catalog {
 		n := normalize(t)
-<<<<<<< ours
-		avail := false
-		switch {
-		case n.Name == "seclists":
-			if secListsDir != "" {
-				avail = true
-				n.Bin = secListsDir
-			}
-		case n.PipLibrary:
-			if !pyModsLoaded {
-				pyMods = probePythonModules()
-				pyModsLoaded = true
-			}
-			avail = pyMods[n.pyModuleName()]
-		case n.Bin == "python3":
-			if pyBin != "" {
-				avail = true
-				if runtime.GOOS == "windows" {
-					n.Bin = filepath.Base(pyBin)
-				}
-			}
-		default:
-			if p, err := exec.LookPath(n.Bin); err == nil && !isWindowsStoreStub(p) {
-				avail = true
-			}
-		}
-		n.Available = avail
-		if avail {
-=======
 		n.Available = false
 		if n.AvailableInPath() {
 			n.Available = true
->>>>>>> theirs
 			n.Install = ""
 		} else {
 			n.Install = humanInstall(n)
@@ -828,91 +583,67 @@ func Inventory() []Tool {
 }
 
 // Summary 注入 graph_overview / API 的紧凑形态:
-// available 包含可直接调用的命令、Python 协议库(py:<module>)与字典路径;missing 为缺失工具名清单。
+// available 是可直接调用的二进制名清单;missing 带安装提示;
+// hint 给模型一句话用法约定。
+//
+// available 里每项都带**用途**（"name: 用途"），不只给名字。
+// 理由很实际：目录里现在有 30+ 个工具，模型只看到名字（chisel / dalfox /
+// feroxbuster…）根本判断不出该在什么场景调哪一个，只能瞎试或者干脆不用。
+// 带上用途后"派意图选手段以家底为准"才真正成立。
 func Summary() map[string]any {
 	inv := Inventory()
 	avail := make([]string, 0, len(inv))
 	missing := make([]string, 0, len(inv))
 	for _, t := range inv {
 		if t.Available {
-			label := t.Bin
-			if t.PipLibrary {
-				label = "python import " + t.pyModuleName()
-			} else if t.Name == "seclists" {
-				label = "seclists(" + t.Bin + ")"
-			}
 			if t.Purpose != "" {
-				avail = append(avail, label+": "+t.Purpose)
+				avail = append(avail, t.Bin+": "+t.Purpose)
 			} else {
-				avail = append(avail, label)
+				avail = append(avail, t.Bin)
 			}
 		} else {
+			// 缺失项只给名字——安装提示是给人看的（宿主环境页），模型既不能装
+			// 也不需要知道怎么装，给它 27 条安装命令只是每轮都在烧上下文。
 			missing = append(missing, t.Name)
 		}
 	}
 	return map[string]any{
 		"available": avail,
 		"missing":   missing,
-		"hint":      "available 含本机可直接经 Bash 调用的命令、可直接 import 的 Python 协议库（标注为 python import <模块名>）及本地字典路径——派意图选手段时按用途挑；missing 是本机未安装项，不要臆测存在或自行安装。",
+		"hint":      "available 是本机 PATH 里可直接经 Bash 调用的工具，格式为「命令名: 用途」——派意图选手段时按用途挑，别只认得名字；missing 是本机没有的工具，不要臆测它们的存在。需要缺失工具时在意图/小结里向用户提示安装命令，不要自行安装。",
 	}
 }
 
-// SummaryText 纯文本形态（提示词注入用）：按「CLI 命令 / Python 协议库 / 本地字典」清晰分组，
-// 让 Worker 既知道哪些命令可直接敲、又知道哪些中间件协议库在 Python 脚本里直接 import、字典在哪。
+// SummaryText 纯文本形态（提示词注入用）：一行一个可用工具，带用途。
+//
+// 只列【可用】的：缺失的工具模型既不能调，也不该在提示里占位置（一次
+// worker 运行的 system prompt 里放几十条「未安装」纯属浪费上下文）。
+// 用途必须带上——只给名字的话模型判断不出该在什么场景调哪个
+// （chisel / dalfox / feroxbuster 这类尤其明显）。
+//
+// 曾经这个函数定义了却没有调用方：工具清单只进了 planner 的唤醒提示，
+// 而真正动手的 worker 看不到它——于是新装的一批工具一次都没被用起来。
 func SummaryText() string {
-	var cliBuf, pyBuf, matBuf strings.Builder
-	cliCnt, pyCnt, matCnt := 0, 0, 0
+	var b strings.Builder
+	avail := 0
 	for _, t := range Inventory() {
 		if !t.Available {
 			continue
 		}
-		switch {
-		case t.PipLibrary:
-			pyCnt++
-			mod := t.pyModuleName()
-			if t.Purpose != "" {
-				pyBuf.WriteString("✓ import " + mod + " —— " + t.Purpose + "\n")
-			} else {
-				pyBuf.WriteString("✓ import " + mod + "\n")
-			}
-		case t.Category == CatMaterial:
-			matCnt++
-			if t.Purpose != "" {
-				matBuf.WriteString("✓ " + t.Name + " (" + t.Bin + ") —— " + t.Purpose + "\n")
-			} else {
-				matBuf.WriteString("✓ " + t.Name + " (" + t.Bin + ")\n")
-			}
-		default:
-			cliCnt++
-			if t.Purpose != "" {
-				cliBuf.WriteString("✓ " + t.Bin + " —— " + t.Purpose + "\n")
-			} else {
-				cliBuf.WriteString("✓ " + t.Bin + "\n")
-			}
+		avail++
+		if t.Purpose != "" {
+			b.WriteString("✓ " + t.Bin + " —— " + t.Purpose + "\n")
+		} else {
+			b.WriteString("✓ " + t.Bin + "\n")
 		}
 	}
-	total := cliCnt + pyCnt + matCnt
-	if total == 0 {
+	if avail == 0 {
 		return ""
 	}
-	var b strings.Builder
-	if cliCnt > 0 {
-		b.WriteString("可直接在 Bash 调用的命令（" + strconv.Itoa(cliCnt) + " 个）：\n" + cliBuf.String())
-	}
-	if pyCnt > 0 {
-		if b.Len() > 0 {
-			b.WriteString("\n")
-		}
-		b.WriteString("已安装的 Python 中间件协议库（" + strconv.Itoa(pyCnt) + " 个，非命令行程序，写 python 脚本直接 import 调用）：\n" + pyBuf.String())
-	}
-	if matCnt > 0 {
-		if b.Len() > 0 {
-			b.WriteString("\n")
-		}
-		b.WriteString("本机字典/语料目录：\n" + matBuf.String())
-	}
-	b.WriteString("\n动手前优先复用上述命令、Python 协议库与本地字典路径——别从零手写底层协议，也别把 Python 库当成命令行直接敲。确实需要缺失工具时在小结里提示，不要自行安装。")
-	return b.String()
+	return "可用工具 " + strconv.Itoa(avail) + " 个（都是本机 PATH 里可直接经 Bash 调用的命令）：\n" + b.String() +
+		"\n动手前先想一下这些工具能不能直接解决问题——别用 python3 从头造轮子，" +
+		"也别因为不认得某个工具的名字就忽略它。确实需要本机没有的工具时，" +
+		"在意图/小结里写清楚要装什么，不要自行安装。"
 }
 
 // Arch 归一化为 Release 资产里用的架构名。
@@ -978,4 +709,16 @@ func ArchX64() string {
 	default:
 		return runtime.GOARCH
 	}
+}
+
+var (
+	resolverMu         sync.RWMutex
+	dataDirResolverFn  func() string
+)
+
+// SetDataDirResolver 注入工作数据目录解析函数（用于探测 <dataDir>/tools/SecLists 等本地语料目录）。
+func SetDataDirResolver(fn func() string) {
+	resolverMu.Lock()
+	dataDirResolverFn = fn
+	resolverMu.Unlock()
 }

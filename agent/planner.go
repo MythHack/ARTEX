@@ -14,11 +14,6 @@ import (
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
-<<<<<<< ours
-=======
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/intercept"
->>>>>>> theirs
 )
 
 // Planner is the event-driven LLM planner (docs §4.3): each time the asset or
@@ -26,30 +21,8 @@ import (
 // assets, judges whether the task goal is met, and emits 0..N exploration intents
 // into the frontier. It is the sole intent generator.
 type Planner struct {
-<<<<<<< ours
-	findingRecorder   FindingRecorder
-	prov              llm.Provider
-	model             string
-	tx                *transcript.Store                      // raw LLM conversation persistence (nil = off)
-	window            int                                    // context window in tokens (for compaction)
-	windowFn          func() int                             // optional dynamic task-chain minimum
-	maxTurns          int                                    // max agent turns per run (0 = unlimited)
-	killWork          func(intentID int64) error             // engine callback to terminate a running work (nil = off)
-	steerWork         func(intentID int64, msg string) error // engine callback to steer a running work mid-run (nil = off)
-	attributions      func() map[string]int                  // Guard 归因读取（nil = 概览不带 guard_attributions 块）
-	proxyAddr         string                                 // recording proxy for WebFetch (empty = direct)
-	proxyAddrFn       func() string
-	proxyCACert       string        // recording proxy's CA cert path (HTTPS verify)
-	webSearch         WebSearchOpts // web_search tool backend selection (off by default)
-	workDir           string        // shared work dir (surfaced in prompt as artifact-output target)
-	injectConstraints func() bool   // resolver: inject task operation constraints into system prompt? (nil = yes)
-	nonStreamingFn    func() bool   // resolver: use non-streaming (Complete) path? (nil = streaming)
-	noaEnabledFn      func() bool   // resolver: use experimental noa compaction? (nil = off)
-	maxTokensFn       func() int    // resolver: per-reply output cap (nil/0 = send no cap)
-	compactor         *Compactor    // cold-node compaction (§7); nil = disabled
-=======
 	// intentQueue 返回 (派发阈值, worker 数)；nil = 不限制。
-	intentQueue func() (int, int)
+	intentQueue     func() (int, int)
 	findingRecorder FindingRecorder
 	// 授权边界守卫开关（v0.4.63）：装配时从设置读取，传到 ToolSet。
 	scopeGuard           bool
@@ -65,6 +38,7 @@ type Planner struct {
 	steerWork            func(intentID int64, msg string) error // engine callback to steer a running work mid-run (nil = off)
 	attributions         func() map[string]any                  // Guard 归因读取（nil = 概览不带 guard_attributions 块）
 	proxyAddr            string                                 // recording proxy for WebFetch (empty = direct)
+	proxyAddrFn          func() string                          // fork: 动态代理地址（轮询时重读设置）
 	proxyCACert          string                                 // recording proxy's CA cert path (HTTPS verify)
 	webSearch            WebSearchOpts                          // web_search tool backend selection (off by default)
 	workDir              string                                 // shared work dir (surfaced in prompt as artifact-output target)
@@ -73,7 +47,6 @@ type Planner struct {
 	noaEnabledFn         func() bool                            // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn          func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
 	compactor            *Compactor                             // cold-node compaction (§7); nil = disabled
->>>>>>> theirs
 
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
 	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
@@ -385,12 +358,8 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 1. **完整态势已附在本提示下方**（就是 graph_overview 的返回，无需再调它）：task（原始标题+目标/根节点）、资产计数、goals+状态、open/running/recent_done 意图、frontier_open、sites_without_endpoints（无端点的站点，提示可能待探的方向）、facts（探索事实数，与漏洞是两类）、findings_total、recent_facts（{id,summary,confidence?}）、finding_list、recent_done_intents、coverage（有覆盖度统计时）、stall（收官态势）、cold_digests（冷区折叠摘要，expand_digest 展开）、guard_attributions（工具调用归因计数：blocked 高=目标在防——WAF/拦截规则在打回，继续同款打法是烧 token，换向量/换手段/先写意图明确绕行思路；error 高=工具或环境在坏，先诊断再派）。
    - **范围**：探索节点（goals/意图/facts/findings）只含本任务；**资产默认按任务隔离**（仅本任务及明确关联任务；用户开启「共享全局资产」后可查询全库，资产计数也随之反映共享范围）——出现非本任务相关的资产时忽略。
 2. **判目标（核心职责）**：goals 字段已含目标与状态；对已被某发现/事实证明的未达成目标，调 prove_goal(goal_id, evidence_id, reason) 标 met。**当你标记的恰是最后一个未完成目标时，系统自动判定整个任务完成**——收官只由逐个 prove_goal 驱动，没有别的"一键完成"手段。
-<<<<<<< ours
    - ⚠️ **量化验收核对（严禁提前盖章）**：目标含可量化条件（覆盖度达 X%、达到指定数量/拿 N 个 flag、获得某权限）时，prove_goal 前【必须】核对上方 graph_overview 的实测值（coverage.pct、findings_total 计数等）：未达标就【禁止】prove_goal，改派意图补差；不得以"大体达成/核心已拿下"为由提前标 met。例：要求覆盖度 100% 而实测 coverage.pct=40% → 未达成，继续派补测意图。
-=======
-   - ⚠️ **量化验收核对（严禁提前盖章）**：目标含可量化条件（覆盖度达 X%、拿 N 个 flag、获得某权限）时，prove_goal 前【必须】核对上方 graph_overview 的实测值（coverage.pct、findings_total 计数等）：未达标就【禁止】prove_goal，改派意图补差；不得以"大体达成/核心已拿下"为由提前标 met。例：要求覆盖度 100% 而实测 coverage.pct=40% → 未达成，继续派补测意图。
    - **独立复现（critical/high 必配，借鉴 pentest-ai 的 machine oracle）**：recent_facts/漏洞里出现 critical/high、但证据仅来自单一 worker、**没有独立复验事实**（换入口/换参数/换会话/换身份重新触发一次并写回 fact）时，派一条**只做复现、不扩大**的验证意图；已有独立复验事实的不重复派。复现失败 → 把严重性降级并写清原因，不许保留 critical/high。
->>>>>>> theirs
    - **边际收益收官(目标模糊型任务)**：态势里 stall.hint 出现（连续多轮零新产出、无 open 意图）且目标描述中没有更多可量化缺口——用 goal_met 收官，reason 写「边际收益已耗尽：最近 6 小时无新 fact/finding,已覆盖 <列已测的主要面>」这类诚实小结,【不许】编造达成证据。收官比无产出空转更负责——空转每轮都在烧 token。
 
 3. **（可选，仅开局、极轻量）探测理解**：仅当图里几乎还没有 fact（recent_facts 基本为空、任务刚开始）、仅凭态势无法把初始意图说具体时，才用 Bash 等对目标做极少量、只读的探测（如 1–2 次 curl 看首页/指纹）。**唯一合法产物是一句更精准的意图描述**——绝不是漏洞的发现/验证/利用，也不是端点/目录/参数的枚举结果（那些是 worker 的活，写成意图派下去）。三条硬边界：

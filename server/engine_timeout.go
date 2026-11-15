@@ -153,11 +153,18 @@ func (e *Engine) clockCtx(base context.Context, t *Task, final bool, reason stri
 
 // ---------- 协调器 ----------
 
+// needsNoResultCoordinator（fork 无成果止损）：即使没有 deadline，
+// 只要配了 no_result 且尚未检查/未止损，也需要协调器盯守。
+func needsNoResultCoordinator(t *Task) bool {
+	state := t.lifecycleSnapshot()
+	return t.NoResultSeconds > 0 && (state.NoResultCheckedAt == 0 || state.StopReason == db.StopReasonNoResult)
+}
+
 // startDeadlineCoordinator launches the per-task deadline timer once (idempotent).
 // Called from Run() and from the restart reload path, so non-active timeout tasks
 // still get settled after their deadline even without live planner/worker loops.
 func (e *Engine) startDeadlineCoordinator(ctx context.Context, t *Task) {
-	if t == nil || t.TimeoutSeconds <= 0 {
+	if t == nil || (t.TimeoutSeconds <= 0 && !needsNoResultCoordinator(t)) {
 		return
 	}
 	e.deleteMu.RLock()

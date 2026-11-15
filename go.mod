@@ -1,8 +1,4 @@
-<<<<<<< ours
 module github.com/Autumn-27/artex
-=======
-module github.com/chu0119/pojun
->>>>>>> theirs
 
 go 1.26.10
 

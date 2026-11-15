@@ -13,8 +13,7 @@ import (
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
-	"github.com/Autumn-27/artex/agent"
-	"github.com/Autumn-27/artex/db")
+)
 
 // jsonResult marshals v to a JSON tool result.
 func jsonResult(v any) (actool.Result, error) {
@@ -934,9 +933,6 @@ func (s *Server) repairReporterAgent(a *db.Agent) {
 	}
 	// 工具绑定同理：缺哪个补哪个，已绑的不动。
 	for _, key := range []string{
-		"update_finding_report", "get_task_node_detail", "list_task_findings",
-		"get_task_worker_trace", "list_task_worker_traces", "search_task_worker_traces",
-		"get_task_graph",
 	} {
 		if err := s.m.pg.AddAgentToToolBinding("reporter", []string{key}); err != nil {
 			log.Printf("[reporter] 补绑工具 %s 失败: %v", key, err)

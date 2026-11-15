@@ -11,22 +11,16 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/hosttools"
 	acperm "github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
-<<<<<<< ours
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/hosttools"
-=======
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/hosttools"
->>>>>>> theirs
 )
 
 // compactIntents distills intents to {id, summary, state, asset_ids, parents,
 // yields} so the planner sees both the direction and its LINEAGE — parents (the
 // upstream nodes it derived from: facts/intents/findings) and yields (the facts/
 // findings it produced) — without pulling full payloads. parentsOf/yieldsOf are
-<<<<<<< ours
 // built from the exploration edges in graph_overview.
 const (
 	overviewIntentSummaryMax  = 220
@@ -48,26 +42,19 @@ func clipOverviewRunes(v any, maxRunes int) any {
 	return s
 }
 
-func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[string]any {
-=======
 // built from the exploration edges in graph_overview. tokens (B7, optional) maps
 // intent id → llm_usage 总 token, 给每条意图标「这个方向烧了多少」; nil = 不标。
 func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64, tokens map[int64]int64) []map[string]any {
->>>>>>> theirs
 	out := make([]map[string]any, 0, len(ns))
 	for _, n := range ns {
 		var p map[string]any
 		_ = json.Unmarshal(n.Payload, &p)
-<<<<<<< ours
-		m := map[string]any{"id": n.ID, "summary": clipOverviewRunes(p["summary"], overviewIntentSummaryMax), "state": n.State}
-=======
 		m := map[string]any{"id": n.ID, "summary": p["summary"], "state": n.State}
 		if len(tokens) > 0 {
 			if tok, ok := tokens[n.ID]; ok && tok > 0 {
 				m["tokens"] = tok
 			}
 		}
->>>>>>> theirs
 		// stop_reason（B1）：终态意图「为什么停」。planner 提示词要求用它区分
 		// 「接续 vs 换方向」（exhausted=手段穷尽可接续 / blocked=传输故障可重试 /
 		// stopped=被 kill），此前该字段在 DB 列里但态势从不携带。
@@ -1309,21 +1296,13 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 
 // intentItem 是 add_intent 批量/单条的一条探索方向。
 type intentItem struct {
-<<<<<<< ours
-	Summary         string            `json:"summary"`
-	AssetIDs        []json.RawMessage `json:"asset_ids"`
-	ParentIDs       []json.RawMessage `json:"parent_ids"`
-	Priority        int               `json:"priority"`
-	IdentityID      int64             `json:"identity_id"` // optional: bind this intent to a configured task identity; 0 = anonymous
-	Continues       []json.RawMessage `json:"continues"`
-	Hypothesis      string            `json:"hypothesis"`
-	SuccessCriteria string            `json:"success_criteria"`
-=======
 	Summary   string            `json:"summary"`
 	Dimension string            `json:"dimension,omitempty"` // 攻击链续跳：继任意图的维度（injection/authz/…）
 	AssetIDs  []json.RawMessage `json:"asset_ids"`
 	ParentIDs []json.RawMessage `json:"parent_ids"`
 	Priority  int               `json:"priority"`
+	// IdentityID 是 fork 的任务身份绑定（identity_id）；0 = 匿名执行。
+	IdentityID int64 `json:"identity_id"`
 	// Continues 是本意图【接续】的上游意图 id（0/1/多个）。
 	//
 	// 为什么需要它：接续链此前只存在于 summary 的**自然语言**里（「接续被预算
@@ -1347,7 +1326,6 @@ type intentItem struct {
 	SuccessCriteria string `json:"success_criteria"`
 	// RequiresIntents 是严格串行链的先决意图 id（平台开关关闭时仅作记录）。
 	RequiresIntents []json.RawMessage `json:"requires_intents"`
->>>>>>> theirs
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1494,15 +1472,11 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		payload["continues"] = continues
 		payload["continuation_depth"] = depth
 	}
-<<<<<<< ours
-	// 派发去重：同任务里已有高度相似的 open/running 意图就不再重复下发。
-=======
 	if len(requires) > 0 {
 		payload["requires_intents"] = requires
 	}
 	// 派发去重：同任务里已有高度相似的 open/running 意图就不再重复下发——两条并行
 	// worker 干同一件事纯属浪费；planner 能看到提示并改写差异。
->>>>>>> theirs
 	if existID, existSum, similar, err := t.ts.FindSimilarOpenIntent(summary); err == nil && similar {
 		return 0, fmt.Errorf("已存在高度相似的未完成意图 #%d「%s」，未重复下发；若确实要做不同的事，请在 summary 里写清区别",
 			existID, firstLine(existSum, 60))
@@ -1586,11 +1560,7 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			"parent_ids":       map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
 			"continues":        map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "【仅当本方向是接续某条旧方向时填】上游【意图】节点 id（0/1/多个）——即本方向要接着哪条被掐断/被收口的意图继续做。**只在 summary 里明说「接续/继续 #NNN」时才填**，且必须与 summary 里提到的意图 id 一致。接续代数有上限（最多接 3 次），超了会被拒绝——到那时请换一种本质不同的打法或转向别的方向，别再接。顶层全新方向留空。"},
 			"priority":         intp("优先级 0-10，默认5。直接逼近目标的利用链步=8-10；新入口面首次探明=6-7；补覆盖/复核=3-4；纯情报=1-2。同轮多意图按价值区分，别全默认 5。"),
-<<<<<<< ours
-			"identity_id":      intp("可选：绑定本任务已配置的测试身份 id（task_identities.id）。0=匿名（默认）。配置了身份也不能不做匿名测试——匿名意图与带身份意图应并行派发。"),
-=======
 			"requires_intents": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "【仅严格串行链使用】本方向依赖的先决意图 id：这些意图跑出结果前，本意图不会被 worker 领取（平台开关关闭时仅作记录）。只在上一步的**实际产出**是下一步输入时填；平行覆盖类方向不要填，否则会白白等待。"},
->>>>>>> theirs
 			"hypothesis":       str("【建议填】本方向的假设：依据哪条 fact 的什么推测（引用 fact id）。worker 会以它为验证目标，你下轮判「有没有产出」也有对照锚。"),
 			"success_criteria": str("【建议填】怎么算成了/没成：期望拿到的 fact/finding 形态（如「拿到 admin cookie 的请求响应」/「证实参数 X 不可注入的输出」）。"),
 		}),
@@ -1944,28 +1914,6 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if t.ts == nil {
 			return actool.Errorf("report_finding 需要任务上下文；平台对话请通过 add_task_hint 向对应任务交接漏洞，并在提示中携带已有的 traffic_refs，由任务 Agent 登记。已登记漏洞可用 bind_finding_traffic 补绑。"), nil
 		}
-<<<<<<< ours
-		score, calcSev, normVec, cwe, cvssErr := EvaluateFindingSeverity(a.Severity, a.CWEID, a.CVSSVector, a.VulnClass, a.Name, a.Summary, a.Evidence)
-		if cvssErr != nil {
-			return actool.Errorf(fmt.Sprintf("cvss_vector 格式错误: %v（示例：CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N）", cvssErr)), nil
-		}
-		if calcSev == "none" || score <= 0 {
-			return actool.Errorf(fmt.Sprintf("CVSS 向量 %s 算分为 0.0（C:N/I:N/A:N，无实质已证实危害），不构成独立漏洞；请改用 record_fact 记录为探索事实或前置原语", normVec)), nil
-		}
-		if CVSSEnabled() {
-			a.Severity = calcSev
-		}
-		// Only prefix the human-facing CVSS/CWE badge when the caller explicitly
-		// supplied cvss_vector or cwe_id, or when calibration downgraded an inflated
-		// severity, so legacy test fixtures expecting exact summary strings stay intact.
-		if strings.TrimSpace(a.CVSSVector) != "" || cwe != "" {
-			tag := fmt.Sprintf("[CVSS %.1f %s]", score, normVec)
-			if cwe != "" {
-				tag = fmt.Sprintf("[%s | CVSS %.1f %s]", cwe, score, normVec)
-			}
-			if !strings.Contains(a.Summary, normVec) {
-				a.Summary = tag + " " + strings.TrimSpace(a.Summary)
-=======
 		// 证据门槛（v0.4.5）：critical/high 需要足量可核验证据；不足时打回，
 		// 模型可补证据或降级后重试，而不是让"一句话高危"进入报告。
 		if msg := validateFindingEvidence(a.Severity, a.Evidence); msg != "" {
@@ -1993,7 +1941,6 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 				verifyNote = fmt.Sprintf("⚠️ 证据出处核对：0/%d 行可在本次工具输出中逐字找到——报告读者将无法复核，建议补粘命令与输出原文。", total)
 			case "partial":
 				verifyNote = fmt.Sprintf("⚠️ 证据出处核对：仅 %d/%d 行可在本次工具输出中逐字找到，其余为转述；关键结论请引用原文。", matched, total)
->>>>>>> theirs
 			}
 		}
 		// Auto-binding off: ignore the evidence params instead of rejecting the call.

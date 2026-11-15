@@ -19,12 +19,6 @@ import (
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
-<<<<<<< ours
-=======
-	"github.com/Autumn-27/artex/db"
-	"github.com/Autumn-27/artex/hosttools"
-	"github.com/Autumn-27/artex/intercept"
->>>>>>> theirs
 )
 
 // Worker is an LLM work agent (docs §4.4): it claims ONE intent, completes it
@@ -46,23 +40,13 @@ type WebSearchOpts struct {
 	TavilyKey      string
 	Proxy          string
 	DeepSeekAPIKey string
+	// fork: DeepSeek 搜索通道（openai-responses 网关直连版）配置。
+	DeepSeekBaseURL string
+	DeepSeekModel   string
 }
 
 type Worker struct {
 	findingRecorder FindingRecorder
-<<<<<<< ours
-	prov            llm.Provider
-	model           string
-	workDir         string
-	proxyAddr       string
-	proxyAddrFn     func() string
-	proxyCACert     string            // recording proxy's CA cert path (for WebFetch HTTPS verify)
-	webSearch       WebSearchOpts     // web_search tool backend selection (off by default)
-	tx              *transcript.Store // raw LLM conversation persistence (nil = off)
-	window          int               // context window in tokens (for compaction)
-	windowFn        func() int        // optional dynamic task-chain minimum
-	maxTurns        int               // max agent turns per run (0 = unlimited)
-=======
 	// artifactRecorder 由 host 注入：证据附件（截图/样本/日志）落盘登记。
 	artifactRecorder ArtifactRecorder
 	// 授权边界守卫开关（v0.4.63）：装配时从设置读取，传到 ToolSet。
@@ -73,13 +57,13 @@ type Worker struct {
 	model                string
 	workDir              string
 	proxyAddr            string
+	proxyAddrFn          func() string     // fork: 动态代理地址（轮询时重读设置）
 	proxyCACert          string            // recording proxy's CA cert path (for WebFetch HTTPS verify)
 	webSearch            WebSearchOpts     // web_search tool backend selection (off by default)
 	tx                   *transcript.Store // raw LLM conversation persistence (nil = off)
 	window               int               // context window in tokens (for compaction)
 	windowFn             func() int        // optional dynamic task-chain minimum
 	maxTurns             int               // max agent turns per run (0 = unlimited)
->>>>>>> theirs
 	// runTimeout is the wall-clock budget for the main exploration of one intent
 	// (0 = unlimited). When it fires, the run is cut and a settlement round is
 	// forced so already-identified facts get written back instead of being lost.
@@ -594,20 +578,15 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// The run-wide intent is not the current tool action. Do not forward it or
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
-<<<<<<< ours
-	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
+	// v0.4.27：worker 用瘦身版态势（workerOverviewData）——规划专用字段（冷图折叠、
+	// 血缘、意图 token 台账、coverage、related_tasks 等）不进 worker 视图，省掉每次
+	// 启动的重建计算与注入前缀。worker 只需要「别人发现了什么」做去重与联想。
+	overview := renderWorkerGraphOverview(tsx.workerOverviewData())
 	proxyAddr := w.proxyAddr
 	if w.proxyAddrFn != nil {
 		proxyAddr = w.proxyAddrFn()
 	}
 	sysBody := workerSystem(proxyAddr, w.proxyCACert, w.workDir, runDir)
-=======
-	// v0.4.27：worker 用瘦身版态势（workerOverviewData）——规划专用字段（冷图折叠、
-	// 血缘、意图 token 台账、coverage、related_tasks 等）不进 worker 视图，省掉每次
-	// 启动的重建计算与注入前缀。worker 只需要「别人发现了什么」做去重与联想。
-	overview := renderWorkerGraphOverview(tsx.workerOverviewData())
-	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
->>>>>>> theirs
 	if w.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,worker 执行时严格遵守
 	}
@@ -686,27 +665,18 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		// 因步数=夹逼窗口内步数先耗尽→回落 per-run 词。非 clamped 维持纯 per-run。
 		Settlement: settle,
 		// large tool output spills to cmd-output/ with a head + pointer (SDK tool.Capture);
-<<<<<<< ours
-		// full output preserved on disk. 单次返回头设为 16000 字符（完整原文落盘随时可 Read）。
-		ToolOutputDir:      cmdOutDir(runDir),
-		MaxToolOutputChars: 16000,
-=======
 		// full output preserved on disk. 单次上限收到 12000 字符（v0.4.29，同行对比 P0b）：
 		// 任务 5 实测 Bash 6833 次、单意图均 300 万 input——单条 30k(≈7.5k token) 的
 		// 工具回显是主要放大源；12000 仍容纳一次 sqlmap/httpx 的关键输出，超长部分
 		// SDK 自动落盘并在回显里给绝对路径指针，模型需要时自行 grep/sed 回读。
 		ToolOutputDir:      cmdOutDir(runDir),
 		MaxToolOutputChars: workerToolOutputChars,
->>>>>>> theirs
 		Compaction:         compactionConfig(w.compactionWindow()), // long tool-heavy runs stay within the window
 		Todos:              actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
 		NonStreaming:       w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:          w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
 	}
-<<<<<<< ours
 	var baseHooks harness.HookRunner
-	if hooks != nil {
-=======
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		// 工具调用可观测：worker 的工具调用此前完全不可观测——journal 里只有 planner
 		// 心跳，worker 死活要靠翻 transcripts/*.jsonl 的 mtime 才确认得到。日志层套在
@@ -715,7 +685,6 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		// 最外层再套一层 idleStop：连续多轮无写回就要求收场。判据是产出率而不是
 		// 时长——持续产出的 worker 不会被它打断（深度探索不受影响），空转的会被收。
 		// 详见 agent/idlestop.go 的注释。
->>>>>>> theirs
 		logged := wrapToolLog(hooks, KindWorker, fmt.Sprintf("%s · #%d", name, intent.ID))
 		baseHooks = wrapIdleStop(logged, tsx.Writes, func(reason string) {
 			logIdleStop(name, taskID, intent.ID, reason)

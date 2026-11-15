@@ -2931,3 +2931,14 @@ func (t *Task) canCoalesceTriggers(maxDoneBatch int) bool {
 	}
 	return true
 }
+
+// deepSeekSearchCreds（RuoJi6 #121-125 deepseek 搜索通道）：deepseek 网络搜索的
+// 凭据直接取当前激活的 LLM 配置（openai-responses 网关），不单独存 key。
+// 配置不可用时返回空串，由搜索侧按普通后端错误反馈。
+func (m *Manager) deepSeekSearchCreds() (baseURL, apiKey, model string) {
+	p, err := m.pg.ActiveProfile()
+	if err != nil || p == nil {
+		return "", "", ""
+	}
+	return p.BaseURL, p.APIKey, p.Model
+}
