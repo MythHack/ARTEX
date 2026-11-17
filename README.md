@@ -10,7 +10,7 @@ Go 单体后端（内嵌 Next.js 前端）· PostgreSQL · 多 Agent 自主推�
 
 </div>
 
-本仓库为独立维护的 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)，保留 https://github.com/Autumn-27/ARTEX 的原始提交历史与 AGPL-3.0 许可证。程序发布包从本仓库 Releases 下载，Docker 镜像 [ruoji6/artex](https://hub.docker.com/r/ruoji6/artex) 由本仓库 GitHub Actions 构建并发布。
+本仓库为独立维护的 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX) 分支（持续跟踪上游并融合 [chu0119/Pojun](https://github.com/chu0119/Pojun) 引擎增强），保留 https://github.com/Autumn-27/ARTEX 的原始提交历史与 AGPL-3.0 许可证。程序发布包从本仓库 Releases 下载，Docker 镜像 [ruoji6/artex](https://hub.docker.com/r/ruoji6/artex) 由本仓库 GitHub Actions 构建并发布。
 
 ---
 ## 致谢 
@@ -33,11 +33,15 @@ git 历史里作为起点，v0.3.16 以来的 **160+ 提交、约 4 万行新增
 
 | 能力线 | 本版本做了什么 |
 |---|---|
-| **漏洞情报运营** | NVD / CISA KEV / GitHub Advisory / PoC 聚合 / nuclei 模板联动 / 资产指纹→CVE 反向匹配 / **近期高危快通道**（30 分钟一轮）——原作者版本完全没有情报层 |
-| **红队作战** | TCP 回连接收器（接住反弹 shell 并留证）/ **C2 出口三形态**（direct / SSH 中继托管 / manual）/ redteam-ops 后渗透方法论 skill / 9 件后渗透工具（socat/proxychains/ligolo/linpeas/pspy/evil-winrm…） |
-| **安全与合规** | 登录防爆破（IP 锁定+全局限流）/ 探活端点去指纹 / 改密码即吊销全部会话 / 安全响应头 / 认证面无产品名——**公网部署基线** |
-| **工程可靠性** | LLM 三通道轮询（熔断+故障转移+用量归因）/ 拆解墙钟 / planner 双保险 / 任务收官 / 一键更新（校验+回滚） |
-| **工具与交付** | 宿主工具 54+ 件**一键装齐** / 漏洞 19 类标准枚举 / Word 报告导出 / 证据版本化+sha256 校验 / 手机端适配 |
+| **自主推进（Autopilot）** | 60s 看门狗（停滞自动唤醒重规划）/ deadline 到点自动延长 / 目标全达成后自动续派下一层目标——长任务无人值守跑完 |
+| **派发节流与积压治理** | 意图队列上限（防积压空转烧 token）/ 心跳轮跳过 / `retire_intent` 退役过时意图 / 排队超时强制裁决 |
+| **漏洞情报运营** | NVD / CISA KEV / GitHub Advisory / PoC 聚合 / nuclei 模板联动 / 资产指纹→CVE 反向匹配 / **近期高危快通道**（30 分钟一轮） |
+| **红队作战** | TCP 回连接收器（接住反弹 shell 并留证）/ **C2 出口三形态**（direct / SSH 中继托管 / manual）/ redteam-ops 后渗透方法论 skill / 移动端逆向·内网穿透·二进制利用分类工具 |
+| **MCP 服务端** | 把 ARTEX 自身暴露为 MCP Server（`spawn_task` 等工具 + API token 源白名单）——外部智能体可直接编排任务 |
+| **安全与合规** | 登录防爆破（IP 锁定+全局限流）/ 探活端点去指纹 / 改密码即吊销全部会话 / 安全响应头 / OPSEC 硬约束 / 浏览器 UA 池随机轮换 / 认证面无产品名——**公网部署基线** |
+| **工程可靠性** | LLM 三通道轮询（熔断+故障转移+用量归因+**per-profile 限流**）/ 终局判定收紧（半途显示「未完成」）/ 拆解墙钟 / planner 双保险 / 一键更新（校验+回滚） |
+| **Token 效率** | 冷图压缩事务性切换（稳定图不再重复压缩）/ 压缩子块成功缓存 / Anthropic 显式缓存边界全角色覆盖 / api_contract 索引引用（-71% 体积）/ 裁判重试去重（5 次→3 次） |
+| **工具与交付** | 宿主工具 90 件**一键装齐**（script/apt/github 三安装形态）/ 任务级登录凭据（TOTP/账号密码自动登录自检）/ 漏洞 19 类标准枚举 / Word 报告导出（中文字体内嵌）/ 证据版本化+sha256 校验 / 手机端适配 |
 
 原作者版本有的核心（双图架构、planner/worker 编排、MITM 流量代理、审批门）全部
 保留并在其上加固；下文详述。
@@ -119,6 +123,9 @@ sequenceDiagram
 - **worker** 做完一条意图即停；结果写回双图后自动唤醒 planner。
 - **空转收场 / 拆解墙钟 / 规划轮超时 / model_error 重跑** 多层韧性：免费限流
   通道也能稳定跑完任务（三通道轮询 + 故障转移 + 熔断实测）。
+- **Autopilot 自主推进**：全进程唯一看门狗每 60s 扫描——任务停滞自动唤醒
+  重规划、deadline 临近自动延长、目标全部证明达成后自动判定收官并续派下一层
+  目标；终局判定收紧到「目标全证明达成才记 done，做了一半显示未完成」。
 - **人在环路**：对话纠偏 / 意图暂停取消 / 人工审批 / `steer_work` 实时纠偏，
   每步 activity 在 UI 内联可见。
 
@@ -159,7 +166,7 @@ flowchart LR
   agent 直接填 payload，无需自行判断网络形态。
 - **redteam-ops skill**：后渗透六阶段方法论（落地稳定化→提权→权限保持→凭据
   获取→横向移动→数据获取回传→收尾）+ 证据纪律。
-- **后渗透工具 54+**：impacket/netexec/evil-winrm/chisel/ligolo-ng/proxychains/
+- **后渗透工具（宿主目录 90 件，按攻击面分类）**：impacket/netexec/evil-winrm/chisel/ligolo-ng/proxychains/
   socat/linpeas/pspy/responder/sqlmap/hydra/hashcat/nuclei/ffuf…全部可在
   「宿主环境」页**一键装齐**（特权助手 artex-hostd 串行排队执行）。
 
@@ -504,7 +511,7 @@ guard/          工具调用审批门（把裁决接进 agent 执行链）
 listener/       回连接收器：接住反弹 shell / OOB 回连并留证
 traffic/        MITM 流量记录代理 + 出口代理池
 vulnintel/      漏洞情报：NVD/KEV/GHSA/PoC/快通道/资产联动/限速闸门
-hosttools/      宿主工具目录（54+ 件，按攻击面分类）
+hosttools/      宿主工具目录（90 件，含移动端逆向/内网穿透/二进制利用分类）
 hostd/          特权助手：root 常驻 unix socket，装工具/特权操作
 llmpool/        LLM 多通道轮询池：熔断/故障转移
 llmrec/         LLM 请求录制与 token 计量
