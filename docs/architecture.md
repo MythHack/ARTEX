@@ -324,6 +324,67 @@ flowchart TD
 6. 新研究的适配以已核验模块及 API/部署条件为基础；已有压缩、去重、记录、工具接入或报告不重复作为“从无到有”的建议。
 7. 更新范围为架构与能力文档。每个运行验证结论需记录环境、时间和来源；静态审阅不替代部署测试。
 
+
+## 2026-11-17 当前 main 增量核验（Asia/Shanghai）
+
+**核验日期：** 2026-11-17（Asia/Shanghai）。**当前源码：** [`c80301da7cfdfd56291550c07940606a50420744`](https://github.com/MythHack/ARTEX/commit/c80301da7cfdfd56291550c07940606a50420744)。**上一轮核验：** `ca3b706669c035bb48398221861de8e7af9b602c`。GitHub compare 显示 main 前进 **26 个提交**；compare 接口返回 300 条文件路径，结果可能截断，不把 300 解释为完整文件总数。本轮对新增和修改的核心模块、关键调用方及服务端注册路径做分组静态核验；没有逐行审计全部变化文件，也没有读取部署数据库、运行配置或生产实例。
+
+### 本轮新增或显著调整的产品能力
+
+| 能力 | 实现与实际接线 | 配置、依赖和边界 | CI / 运行状态 |
+| --- | --- | --- | --- |
+| **ARTEX 对外 MCP 服务端** | 新增 `server/mcp_server.go`、`mcp_server_access.go`、`mcp_server_tools.go` 与 `db/api_tokens.go`。独立顶层路由将 `/mcp` 指向 `serveMCP`，不经过 Web 根路由的 HTTP Basic Auth；管理 API 注册令牌、设置和审计入口。实现无状态 Streamable HTTP JSON-RPC，仅支持 initialize、ping、tools/list、tools/call；外部工具为显式白名单。 | `mcp_server_enabled` 默认关闭；仅接受 `Authorization: Bearer` 访问令牌，不接受管理员 JWT、Basic Auth、Cookie 或 URL 参数。令牌明文只在创建时返回，数据库保存 SHA-256 哈希；权限分为 `read`、`task:create`、`task:control`，可限制企业、未结束任务数、每小时创建数、有效期及吊销。另有来源 IP/CIDR 白名单、可信代理解析和 Origin 检查。开启后外部调用可创建真实任务，必须只向可信客户端发放最小权限令牌。 | 源码、API 路由、白名单和令牌存储实现已确认；有 MCP 服务端测试文件。当前 HEAD 未取得可核对的 CI run/attempt；未创建令牌、未调用端点，外部接入和运行未验证。 |
+| **MCP 调用审计** | `mcp_server.go` 在外部工具调用路径记录令牌、工具、参数摘要、结果状态、来源地址和时间；数据库保留有界审计记录。 | 依赖 PostgreSQL、MCP 服务端开关、有效令牌和访问策略；审计参数/结果有长度上限，不应理解为完整原始会话录制。 | 实现与调用路径已见；未验证部署中的审计保留、权限和实际请求。 |
+| **自主推进 Autopilot** | 新增 `agent/autopilot.go` 的 Planner/Worker 条件提示尾巴；`server/autopilot.go` 在 Engine 启动后运行独立看门狗，周期性检查任务进度；`server/autopilot_extend.go` 在满足条件时追加后续目标。相关上下文通过拦截器注入，`agent/chain.go` 的 `dispatchChainIntent` 由 finding 上报路径调用：仅新建的 critical/high finding 才可能按漏洞维度生成继任意图，重复上报不续跳。 | 任务级 Autopilot 开关与全局默认/停滞时间/延长次数共同影响行为；看门狗进度状态有进程内部分，重启后重新建立。目标续杯有波数上限与进度判断。Auto-finish 对 Autopilot 任务采用不同收尾条件。提示词约束不等于强制执行保证，也不绕过 Guard 或人工审批。 | 相关实现、Engine 启动及 finding 上报调用路径已确认；设置值和任务开关是否在用户部署启用未知。未执行长任务验证、未验证重启后的真实行为。 |
+| **原生 HTTP 请求与登录会话** | `agent/tools_http.go` 提供 `http_request` 与 `session_login`；Worker 的基础工具装配使用 `ToolSet.WorkerTools()`，并通过本地执行工具权限集合约束能动目标的工具。Go HTTP 客户端可复用任务级 Cookie Jar；Cookie 采用 Netscape 文件格式，可与 curl 的 `-b/-c` 共享。 | 依赖任务工作目录、网络出口代理及必要的代理 CA；属于有网络副作用的本地执行工具，受 `local_exec` 等执行权限条件限制。Cookie Jar 文件存于任务共享目录，不是 PostgreSQL 会话主数据。 | 实现及 Worker 工具装配已确认；未在用户环境执行登录或请求，代理捕获和 Cookie 持久化运行未验证。 |
+| **任务级后台作业** | `agent/tools_jobs.go` 提供 `job_start/job_status/job_output/job_stop`；脚本、日志、退出码和 JSON 元数据写入任务共享目录，后续意图可读取作业状态和输出。 | 依赖 Bash、任务共享目录及本地执行权限。作业通过进程 PID、退出码文件推断状态；这不是数据库队列、分布式 Worker 或 exactly-once 任务系统。进程管理和宿主重启后的状态需要区分。 | 工具实现存在并进入 Worker 工具集；未验证跨进程重启、PID 复用或部署环境中的作业恢复。 |
+| **任务共享脚本** | `agent/tools_script.go` 提供 `save_script/run_script`，脚本保存到任务级 `shared/scripts`，可由后续意图复用；执行仍交给 Bash，保留既有拦截/审计路径。 | 文件写入受任务目录、名称清理、大小上限和执行权限约束；脚本内容本身不等于安全或正确，运行仍依赖宿主解释器。 | 实现与工具封装已见；未验证跨意图文件权限及不同操作系统环境。 |
+| **HTTP 批量探活与前端 JS 审计工具** | `agent/tools_probe.go` 的 `http_probe` 生成批量探测脚本和紧凑结构化结果；`agent/tools_jsaudit.go` 的 `js_audit` 生成脚本，检查入口 HTML、JS bundle、Source Map、端点和源码材料。 | 两者主要生成/执行本地脚本，不应误记为 Go 服务端内置的网络分析引擎。JS 审计脚本有自身 urllib/TLS 处理逻辑，不能假定其证书验证语义与原生 HTTP 工具相同；所有结果仍需人工/Agent 复核。 | 实现和对应测试文件已见；未在目标或用户部署执行，未验证实际流量捕获、误报和完整性。 |
+| **PoC 脚手架与工具输出证据** | `agent/poc_scaffold.go` 提供按漏洞类别生成验证脚本骨架；`agent/tool_outputs.go` 及 Worker 相关路径提供工具输出留存/核对能力。 | 骨架生成不等于 PoC 已执行或漏洞已复现；工具输出与模型撰写的摘要必须区分。工具输出存在也不能单独证明外部事实真实性。 | 源码及测试存在；本轮未执行生成脚本或验证输出证据链。 |
+| **漏洞证据门槛与等级** | `agent/finding_recorder.go` 实现高严重度证据长度和机械信号检查；`agent/finding_workflow.go` 为不同 Agent 注入证据分级说明，区分观察与推断、影响证明和未验证范围。 | 当前机械检查使用 HTTP/命令/工具输出等启发式信号，L1-L4 级别是平台证据纪律，不是形式化证明。满足字符串/长度门槛不保证证据真实，仍需核对原始工具输出和流量。 | 实现及测试存在；未验证实际模型遵循程度、误报率或报告质量。 |
+| **证据附件与文件交付** | `agent/tools_artifacts.go` 将工作目录文件交给 host 注入的 `ArtifactRecorder`；`server/artifacts.go` 校验任务目录边界、解析符号链接、计算 SHA-256、同任务内容去重并复制到任务附件目录；`server/server.go` 注册列表、下载、预览、自动关联和导出 API。 | 单文件上限 20 MiB、每任务最多 300 个附件、总量 500 MiB；元数据保存在 PostgreSQL，正文文件保存在任务数据目录。附件与工作区文件、流量 blob、报告正文是不同对象。 | Agent/Server/DB 路径和 API 注册已确认；预览可能依赖外部渲染工具。未验证文件系统权限、归档完整性及各格式报告的端到端包含范围。 |
+| **登录凭据自检** | `server/authcheck.go` 实现任务登录配置的一次性真实请求检查，支持配置的 GET/POST、表单/JSON 字段和可选 TOTP；`POST /api/tasks/{id}/auth-check` 已注册。响应不返回密码、TOTP 或正文。 | 依赖任务登录配置、目标网络可达及成功判定条件；调用会真实发送登录请求，不是纯静态校验。 | 实现、API 路由和测试文件已见；未发送请求，部署配置和实际判定未知。 |
+| **多键漏洞去重数据模型** | 新增 `db/finding_keys.go`，生成 root/CVE/endpoint/param/legacy 等强键，以及 asset_class/name 弱候选键；弱键设计为候选提示，不应仅凭名称/资产类别自动合并。 | 主要键生成与事务写入辅助函数已确认；本轮未完整追完所有 finding 写入、迁移、查询和归并入口，故不能把“键算法存在”写成所有报告均已完成多键自动归并。 | 实现存在；端到端使用范围和部署数据迁移状态待进一步核对。 |
+| **安全研究 Skill 与参考材料扩展** | 新增多个 Skill 目录及 SRC 参考材料/规则文件，包含源码研究、二进制/移动端、API 安全、浏览器/前端和报告规范等内容。Server 的 Skill 装配根据 PostgreSQL 中 Agent 的 Skill 绑定清单加载可见目录，并通过 Skill 元工具提供内容。 | 文件存在不代表所有 Agent 默认可见或已绑定；具体可用性取决于目录、数据库绑定、Agent 装配和配置。Skill 内容是方法材料，不是经过验证的分析引擎。 | 文件与装配实现已确认；未读取用户部署中的 Agent-Skill 绑定，不推断全部新 Skill 已启用。 |
+
+### 新增外部 MCP 服务端的调用边界图
+
+该端点与“ARTEX Agent 调用外部 MCP”是两个方向相反的集成面。它不应与 `wireAgentAugment` 的外部 MCP 客户端装配混为一谈。
+
+```mermaid
+flowchart LR
+  C[外部 MCP 客户端] --> M[/POST `/mcp`/]
+  M --> F{服务端开关}
+  F -->|关闭| N[404]
+  F -->|开启| A[来源白名单 / 可信代理 / Origin]
+  A --> T[Bearer Token 校验]
+  T --> S[Scope 与企业/任务限额]
+  S --> W[显式 MCP 工具白名单]
+  W --> D[任务/漏洞/探索图读取]
+  W --> X[受权限约束的任务创建与控制]
+  W --> L[调用审计]
+```
+
+### 本轮重要边界与未验证项
+
+1. **外部 MCP 服务端与内部 MCP 客户端分离。** `/mcp` 是 ARTEX 对外提供的无状态 Streamable HTTP JSON-RPC；`wireAgentAugment` 是 ARTEX Agent 装配并调用外部 MCP。二者有不同开关、认证、权限和生命周期。
+2. **Autopilot 不等于自动放行审批。** 自动推进提示、看门狗唤醒、目标续杯和漏洞后续意图均不替代 Guard、拦截策略和人工审批；任务开关、全局设置及运行预算仍影响行为。
+3. **后台作业不等于持久化队列。** 作业元数据/日志/退出码写入文件，但运行进程本身不由数据库队列托管；不能宣称分布式恢复或恰好一次执行。
+4. **工具输出证据门槛不是证明系统。** 长度、关键字、HTTP 状态或命令片段只能作为机械信号；真实结论仍需来源、上下文、原始响应及独立复核。
+5. **多键 finding 辅助逻辑与现有归并功能不能混为一谈。** 强键/弱键语义已在 DB 实现中表达，但本轮未完整审计所有写入和合并路径，端到端范围保留待核。
+6. **新增 Skill 文件不等于全 Agent 可见。** 可见性仍由数据库绑定、装配逻辑和具体 Agent 决定。
+7. **MCP Token 是独立凭据。** `/mcp` 不受 HTTP Basic Auth 保护，必须按 Bearer Token、来源白名单、可信代理及最小 scope 管理；端点默认关闭不等于用户部署配置已核实。
+8. **外部 SDK 边界：** `go.mod` 中 Norma SDK 的工具执行、转录和模型内部语义未在本轮做完整源码审计；只记录 ARTEX 自身可见的调用与注入点。
+
+### 当前 HEAD 的 CI 与验证状态
+
+- 对当前 SHA `c80301da7cfdfd56291550c07940606a50420744` 查询 GitHub PR workflow runs，返回空列表；combined commit statuses 也未返回状态。
+- workflow-run 查询接口仅覆盖其说明中的 PR 触发工作流和第一页；因此准确记录为 **“本次未取得与当前 SHA 匹配的可核验 run/attempt 或 status”**，不推断没有其他 Actions 事件，也不标记 CI 通过或失败。
+- 本轮未重跑 CI、未运行 ARTEX、未创建 MCP Token、未访问部署数据库或外部模型服务。Build/Vet/Test/前端构建的当前 SHA 状态均为未知；实际部署与运行可用性未知。
+- 原四张 Mermaid 图保留不变；本节新增一张外部 MCP 服务端边界图。原有存储边界继续有效：PostgreSQL 主数据、SQLite 流量索引及本地正文/证据/转录/附件文件各自独立。
+
+**当前源码固定链接：** [Engine](https://github.com/MythHack/ARTEX/blob/c80301da7cfdfd56291550c07940606a50420744/server/engine.go) · [Autopilot 看门狗](https://github.com/MythHack/ARTEX/blob/c80301da7cfdfd56291550c07940606a50420744/server/autopilot.go) · [MCP 服务端](https://github.com/MythHack/ARTEX/blob/c80301da7cfdfd56291550c07940606a50420744/server/mcp_server.go) · [MCP 工具白名单](https://github.com/MythHack/ARTEX/blob/c80301da7cfdfd56291550c07940606a50420744/server/mcp_server_tools.go) · [API Token](https://github.com/MythHack/ARTEX/blob/c80301da7cfdfd56291550c07940606a50420744/db/api_tokens.go) · [原生 HTTP](https://github.com/MythHack/ARTEX/blob/c80301da7cfdfd56291550c07940606a50420744/agent/tools_http.go) · [后台作业](https://github.com/MythHack/ARTEX/blob/c80301da7cfdfd56291550c07940606a50420744/agent/tools_jobs.go) · [证据附件](https://github.com/MythHack/ARTEX/blob/c80301da7cfdfd56291550c07940606a50420744/server/artifacts.go) · [证据门槛](https://github.com/MythHack/ARTEX/blob/c80301da7cfdfd56291550c07940606a50420744/agent/finding_recorder.go) · [Skill 装配](https://github.com/MythHack/ARTEX/blob/c80301da7cfdfd56291550c07940606a50420744/server/assembly.go)。
+
 ## 本次维护记录
 
 - **2026-11-01**：建立 `675479c8` 的架构与能力基线，记录 LLM/上下文、数据/证据/交付、外围服务的图与矩阵。
