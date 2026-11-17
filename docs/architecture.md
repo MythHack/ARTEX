@@ -353,7 +353,7 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-  C[外部 MCP 客户端] --> M[/POST `/mcp`/]
+  C[外部 MCP 客户端] --> M["POST /mcp"]
   M --> F{服务端开关}
   F -->|关闭| N[404]
   F -->|开启| A[来源白名单 / 可信代理 / Origin]
